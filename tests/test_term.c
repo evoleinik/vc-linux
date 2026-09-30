@@ -87,6 +87,7 @@ static void clear_input(void)
     put_word(0x41c, 0x1e);
     mem[0x417] = mem[0x418] = 0;
     term_reset_input();
+    term_clear_pending();
 }
 
 static void reset(void)
@@ -592,6 +593,26 @@ static void test_keyboard_ring(void)
     (void)read_key(0x12);
     check_number(cpu.a.l, 0x5b, "extended modifier flags low byte");
     check_number(cpu.a.h & 3, 3, "extended modifier flags left Ctrl/Alt");
+}
+
+/* Keys beyond the 15-slot BIOS ring wait in the terminal layer, in order. */
+static void test_typeahead_survives_full_ring(void)
+{
+    reset();
+    clear_input();
+    static const char text[] = "echo made by vc > made.txt";
+    term_feed_input((const uint8_t *)text, sizeof text - 1, 0);
+    char got[64];
+    size_t n = 0;
+    for (;;) {
+        unsigned word = read_key(0x11);
+        if (cpu.zf) break;
+        (void)read_key(0x10);
+        got[n++] = (char)(word & 0xff);
+        if (n == sizeof got - 1) break;
+    }
+    got[n] = 0;
+    CHECK(strcmp(got, text) == 0, "every typed key arrives, in order");
 }
 
 static void test_legacy_keyboard(void)
@@ -1760,6 +1781,7 @@ int main(void)
     RUN(test_streaming_and_escape);
     RUN(test_kitty_modifiers);
     RUN(test_keyboard_ring);
+    RUN(test_typeahead_survives_full_ring);
     RUN(test_legacy_keyboard);
     RUN(test_video_functions);
     RUN(test_font_switches);

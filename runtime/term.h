@@ -16,6 +16,8 @@ void term_bell(void);
 /* Streaming parser entry points. Times are monotonic milliseconds; an Esc is
  * resolved only after 30 ms without another input byte. */
 void term_reset_input(void);
+/* Drop keys still waiting for room in the BIOS ring. */
+void term_clear_pending(void);
 void term_flush_input(void);
 void term_feed_input(const uint8_t *data, size_t n, uint64_t now_ms);
 void term_expire_input(uint64_t now_ms);

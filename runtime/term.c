@@ -501,9 +501,31 @@ static unsigned ascii_scan(unsigned code)
     }
 }
 
+/* Keys wait here until the 15-key BIOS ring has room, so pasted text or fast
+ * typing is never dropped. A real BIOS drops them, but a real keyboard is slow. */
+static uint16_t pending[4096];
+static size_t pending_head, pending_count;
+
+static void feed_ring(void)
+{
+    while (pending_count && bios_key_push(pending[pending_head])) {
+        pending_head = (pending_head + 1) % (sizeof pending / sizeof pending[0]);
+        --pending_count;
+    }
+}
+
+void term_clear_pending(void)
+{
+    pending_head = pending_count = 0;
+}
+
 static void queue_word(unsigned scan, unsigned ascii)
 {
-    (void)bios_key_push((uint16_t)((scan << 8) | ascii));
+    const size_t cap = sizeof pending / sizeof pending[0];
+    if (pending_count == cap)
+        return;
+    pending[(pending_head + pending_count++) % cap] = (uint16_t)((scan << 8) | ascii);
+    feed_ring();
 }
 
 static unsigned shifted_ascii(unsigned code, unsigned modifiers)
@@ -1107,6 +1129,7 @@ void term_idle(int timeout_ms)
         timeout_ms = 0;
     uint64_t deadline = monotonic_ms() + (unsigned)timeout_ms;
     term_render();
+    feed_ring();
     for (;;) {
         uint64_t now = monotonic_ms();
         term_expire_input(now);

@@ -408,7 +408,13 @@ static void do_exec(void) {
     uint16_t tail_off = rd16(pb_seg, (uint16_t)(pb + 2)), tail_seg = rd16(pb_seg, (uint16_t)(pb + 4));
     uint8_t tail[128];
     for (int i = 0; i < 128; i++) tail[i] = rd8(tail_seg, (uint16_t)(tail_off + i));
-    rt_log("exec %s tail[%u]", dos_prog, tail[0]);
+    char shown[160];
+    int n = 0;
+    for (int i = 1; i < 128 && tail[i] != 0x0D && n < 150; i++)
+        n += tail[i] >= 32 && tail[i] < 127 ? snprintf(shown + n, sizeof shown - n, "%c", tail[i])
+                                            : snprintf(shown + n, sizeof shown - n, "\\x%02X", tail[i]);
+    shown[n] = 0;
+    rt_log("exec %s tail[%u] \"%s\"", dos_prog, tail[0], shown);
 
     const Image *img = known_image(dos_prog);
     if (!img) {
