@@ -59,3 +59,29 @@ test-fs-sanitize: $(B)/test_dos_fs-sanitize
 	./$(B)/test_dos_fs-sanitize
 
 .PHONY: test-fs test-fs-sanitize
+
+# ---- the native binary -----------------------------------------------------
+RT_SRC := runtime/rt.c runtime/dos_core.c runtime/main.c runtime/cpu.c runtime/dos_fs.c \
+          runtime/cp866.c runtime/bios.c runtime/term.c
+GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/files.c
+
+$(B)/gen/files.c: $(B)/VC.COM $(B)/VC.OVL data/VC.INI data/VC.EXT data/VC.HLP tools/embed.py
+	@mkdir -p $(B)/gen
+	$(PY) tools/embed.py $@ VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL VC.INI=data/VC.INI VC.EXT=data/VC.EXT VC.HLP=data/VC.HLP
+
+$(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h runtime/rt.h
+	@mkdir -p $(B)/obj
+	$(CC) $(CFLAGS) -Iruntime -c $< -o $@
+
+$(B)/vc: $(RT_SRC) $(wildcard runtime/*.h) $(B)/obj/vc_com.o $(B)/obj/vc_ovl.o $(B)/obj/files.o
+	$(CC) $(CFLAGS) -std=gnu11 -Iruntime -o $@ $(RT_SRC) $(B)/obj/vc_com.o $(B)/obj/vc_ovl.o $(B)/obj/files.o
+
+test-e2e: $(B)/vc
+	$(PY) -m pytest -q tests/test_e2e.py
+
+test: test-translator test-fs test-term test-e2e
+
+clean:
+	rm -rf $(B)
+
+.PHONY: test-e2e
