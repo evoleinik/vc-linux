@@ -43,3 +43,19 @@ test-term-sanitize: $(B)/test_term_sanitize
 	./$(B)/test_term_sanitize
 
 .PHONY: test-term test-term-sanitize
+
+$(B)/test_dos_fs: tests/test_dos_fs.c runtime/dos_fs.c runtime/dos_fs.h runtime/cp866.c runtime/cp866.h runtime/cpu.h runtime/hle.h
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -std=c11 -Wextra -Iruntime tests/test_dos_fs.c runtime/dos_fs.c runtime/cp866.c -o $@
+
+test-fs: $(B)/test_dos_fs
+	./$(B)/test_dos_fs
+
+$(B)/test_dos_fs-sanitize: tests/test_dos_fs.c runtime/dos_fs.c runtime/dos_fs.h runtime/cp866.c runtime/cp866.h runtime/cpu.h runtime/hle.h
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -std=c11 -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -Iruntime tests/test_dos_fs.c runtime/dos_fs.c runtime/cp866.c -o $@
+
+test-fs-sanitize: $(B)/test_dos_fs-sanitize
+	./$(B)/test_dos_fs-sanitize
+
+.PHONY: test-fs test-fs-sanitize
