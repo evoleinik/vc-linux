@@ -26,6 +26,34 @@ $(B)/VC.OVL: $(ASM)
 
 .PHONY: all images gen test clean
 
+# -Sg exposes PROC/USES/LOCAL prologues and RET epilogues omitted from the
+# original image listings. Keep the images target untouched, and prove that
+# requesting a richer listing does not change either linked image.
+$(B)/gen/VC.COM.lst: $(B)/VC.COM $(ASM)
+	@mkdir -p $(B)/gen
+	cd asm && ../$(JWASM) $(JFLAGS) -Sg -bin -Fl=../$(B)/gen/VC.COM.lst.tmp -Fo ../$(B)/gen/VC.COM VC.ASM
+	cmp $(B)/VC.COM $(B)/gen/VC.COM
+	mv $(B)/gen/VC.COM.lst.tmp $(B)/gen/VC.COM.lst
+
+$(B)/gen/VC.OVL.lst: $(B)/VC.OVL $(ASM)
+	@mkdir -p $(B)/gen
+	cd asm && ../$(JWASM) $(JFLAGS) -Sg -mz -Fl=../$(B)/gen/VC.OVL.lst.tmp -Fo ../$(B)/gen/VC.OVL VCOVL.ASM
+	cmp $(B)/VC.OVL $(B)/gen/VC.OVL
+	mv $(B)/gen/VC.OVL.lst.tmp $(B)/gen/VC.OVL.lst
+
+$(B)/gen/vc_com.c: $(B)/VC.COM $(B)/gen/VC.COM.lst $(wildcard translator/*.py)
+	$(PY) -m translator $(B)/VC.COM $(B)/gen/VC.COM.lst --name VC.COM --symbol image_vc_com -o $@
+
+$(B)/gen/vc_ovl.c: $(B)/VC.OVL $(B)/gen/VC.OVL.lst $(wildcard translator/*.py)
+	$(PY) -m translator $(B)/VC.OVL $(B)/gen/VC.OVL.lst --name VC.OVL --symbol image_vc_ovl -o $@
+
+gen: $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c
+
+test-translator: gen
+	$(PY) -m pytest -q tests/test_translator_*.py
+
+.PHONY: test-translator
+
 # The terminal gate deliberately supplies its own Cpu and memory; CPU and DOS
 # file-system implementations are independent work and must not be linked here.
 $(B)/test_term: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h
