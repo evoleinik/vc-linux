@@ -30,14 +30,14 @@ $(B)/VC.OVL: $(ASM)
 # file-system implementations are independent work and must not be linked here.
 $(B)/test_term: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h
 	@mkdir -p $(B)
-	$(CC) $(CFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Iruntime runtime/bios.c runtime/term.c tests/test_term.c -o $@
+	$(CC) $(CFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Iruntime runtime/bios.c runtime/term.c runtime/cp866.c tests/test_term.c -o $@
 
 test-term: $(B)/test_term
 	./$(B)/test_term
 
 $(B)/test_term_sanitize: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h
 	@mkdir -p $(B)
-	$(CC) -std=c11 -O1 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer -Iruntime runtime/bios.c runtime/term.c tests/test_term.c -o $@
+	$(CC) -std=c11 -O1 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer -Iruntime runtime/bios.c runtime/term.c runtime/cp866.c tests/test_term.c -o $@
 
 test-term-sanitize: $(B)/test_term_sanitize
 	./$(B)/test_term_sanitize
