@@ -44,16 +44,23 @@ def status(s: VcSession) -> str:
 
 def select(s: VcSession, name: str) -> None:
     """Move the active panel's cursor onto `name`. The status line shows a
-    long name by its last characters after a left arrow, so match the tail."""
+    long name by its last characters after a left arrow, so match the tail.
+    Each key waits for the status line to change, so load cannot outrun it."""
+    import time
     tail = name[-10:]
     s.send("home")
-    seen = []
+    s.pump(0.3)
+    seen = [status(s)]
     for _ in range(12):
-        s.pump(0.3)
-        seen.append(status(s))
         if tail in seen[-1]:
             return
         s.send("down")
+        end = time.time() + 3
+        while time.time() < end:
+            s.pump(0.05)
+            if status(s) != seen[-1]:
+                break
+        seen.append(status(s))
     raise AssertionError(f"{name!r} not reachable\n" + "\n".join(seen) + "\n" + s.text())
 
 
@@ -157,6 +164,34 @@ def test_delete(vc, work):
     vc.send("enter")
     until(vc, lambda: not (work / "hello.txt").exists())
     assert not (work / "hello.txt").exists()
+
+
+def test_f4_opens_the_editor_from_EDITOR(work, tmp_path):
+    # VC 4.99.09's own editor is switched off in its source (VCEDIT.INC jumps
+    # straight to "Can't find the file"), so F4 must go through VCEDIT.EXT.
+    editor = tmp_path / "fake-editor"
+    editor.write_text('#!/bin/sh\necho "edited by $0" >> "$1"\n')
+    editor.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home, extra_env={"EDITOR": str(editor)})
+    try:
+        s.wait_for("10Quit", timeout=15)
+        select(s, "a long file name.markdown")
+        s.send("f4")
+        until(s, lambda: "edited by" in (work / "a long file name.markdown").read_text())
+        s.wait_for("10Quit", timeout=5)
+    finally:
+        s.close()
+
+
+def test_mouse_click_moves_the_cursor(vc):
+    vc.pump(1.0)  # VC resets the mouse late in start-up; an earlier click is lost, as in DOS
+    lines = vc.text().splitlines()
+    y = next(i for i, line in enumerate(lines) if "subdir" in line[40:])
+    x = lines[y].index("subdir", 40)
+    vc.send(f"\x1b[<0;{x + 2};{y + 1}M\x1b[<0;{x + 2};{y + 1}m".encode())  # SGR press, release
+    until(vc, lambda: "subdir" in status(vc)[40:])
 
 
 def test_f10_quits(vc):

@@ -1,6 +1,7 @@
 /* Text-mode BIOS and DOS CON, sharing the actual BDA and video memory with
  * translated code. No private queue or screen buffer can go stale when VC
  * updates either region directly. */
+#define _POSIX_C_SOURCE 200809L /* clock_gettime */
 #include "bios.h"
 #include "cpu.h"
 #include "hle.h"
@@ -10,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     BDA = 0x40,
@@ -26,6 +28,7 @@ static uint8_t console_scan;
 typedef struct {
     int show;
     unsigned x, y, xmin, xmax, ymin, ymax, buttons;
+    uint64_t pressed_ms[3]; /* when each button last went down */
     uint16_t dx, dy;
     uint16_t presses[3], releases[3];
     uint16_t press_x[3], press_y[3], release_x[3], release_y[3];
@@ -452,6 +455,27 @@ static unsigned bounded_coordinate(unsigned value, unsigned low, unsigned high)
     return value & ~7u; /* INT 33h text coordinates are character-cell aligned. */
 }
 
+static uint64_t mouse_now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+
+/* A terminal may deliver a click's press and release in one read. VC polls
+ * the buttons, several times per pass of its input loop, so a button is
+ * reported down for at least as long as a physical click lasts. */
+enum { MIN_CLICK_MS = 80 };
+static unsigned mouse_held(void)
+{
+    unsigned held = mouse.buttons;
+    uint64_t now = mouse_now_ms();
+    for (unsigned i = 0; i < 3; ++i)
+        if (mouse.presses[i] && now - mouse.pressed_ms[i] < MIN_CLICK_MS)
+            held |= 1u << i;
+    return held;
+}
+
 void bios_mouse_event(unsigned column, unsigned row, unsigned buttons)
 {
     if (column >= bios_columns())
@@ -471,6 +495,7 @@ void bios_mouse_event(unsigned column, unsigned row, unsigned buttons)
         unsigned mask = 1u << i;
         if ((buttons & mask) != 0 && (mouse.buttons & mask) == 0) {
             ++mouse.presses[i];
+            mouse.pressed_ms[i] = mouse_now_ms();
             mouse.press_x[i] = (uint16_t)x;
             mouse.press_y[i] = (uint16_t)y;
         } else if ((buttons & mask) == 0 && (mouse.buttons & mask) != 0) {
@@ -508,7 +533,7 @@ void bios_int33(void)
             --mouse.show;
         break;
     case 0x03:
-        cpu.b.x = (uint16_t)mouse.buttons;
+        cpu.b.x = (uint16_t)mouse_held();
         cpu.c.x = (uint16_t)mouse.x;
         cpu.d.x = (uint16_t)mouse.y;
         break;

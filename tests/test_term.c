@@ -926,6 +926,32 @@ static void test_renderer_mouse_and_blink(void)
           "disabling blink redraws bit-7 attribute as bright background");
 }
 
+/* A click delivered in one read (press then release) must still show the
+ * button down to one function 03h poll, then up. */
+/* A press stays reported down for a minimum click time; wait it out. */
+static void click_settles(void)
+{
+    struct timespec wait = {0, 100 * 1000000L};
+    nanosleep(&wait, NULL);
+}
+
+static void test_mouse_quick_click(void)
+{
+    reset();
+    cpu.a.x = 0; bios_int33();
+    bios_mouse_event(5, 3, 1);
+    bios_mouse_event(5, 3, 0);
+    cpu.a.x = 3; bios_int33();
+    check_number(cpu.b.x, 1, "quick click is seen by a poll");
+    check_number(cpu.c.x, 40, "click column");
+    cpu.a.x = 3; bios_int33();
+    check_number(cpu.b.x, 1, "and by the next poll in the same pass");
+    struct timespec wait = {0, 120 * 1000000L};
+    nanosleep(&wait, NULL);
+    cpu.a.x = 3; bios_int33();
+    check_number(cpu.b.x, 0, "then the button is up");
+}
+
 static void test_mouse(void)
 {
     unsigned column = 99, row = 99;
@@ -1001,6 +1027,7 @@ static void test_sgr_mouse_input(void)
     check_number(cpu.b.x, 1, "SGR drag preserves pressed button");
     check_number(cpu.c.x, 64, "SGR drag updates X");
     feed("\033[<0;9;13m", 102);
+    click_settles();
     mouse(3, 0, 0, 0);
     check_number(cpu.b.x, 0, "SGR release clears button");
     feed("\033[<2;10;14M", 103);
@@ -1012,6 +1039,7 @@ static void test_sgr_mouse_input(void)
     feed("\033[<2;10;", 200);
     check_number(pop_raw(), 0x10000, "split mouse sequence queues no key");
     feed("14m", 210);
+    click_settles();
     mouse(3, 0, 0, 0);
     check_number(cpu.b.x, 0, "split SGR release completes");
 }
@@ -1790,6 +1818,7 @@ int main(void)
     RUN(test_renderer_palette);
     RUN(test_renderer_diffs_and_glyphs);
     RUN(test_renderer_mouse_and_blink);
+    RUN(test_mouse_quick_click);
     RUN(test_mouse);
     RUN(test_sgr_mouse_input);
     RUN(test_console_io);

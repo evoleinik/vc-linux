@@ -93,9 +93,9 @@ RT_SRC := runtime/rt.c runtime/dos_core.c runtime/main.c runtime/cpu.c runtime/d
           runtime/cp866.c runtime/bios.c runtime/term.c
 GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/files.c
 
-$(B)/gen/files.c: $(B)/VC.COM $(B)/VC.OVL data/VC.INI data/VC.EXT data/VC.HLP tools/embed.py
+$(B)/gen/files.c: $(B)/VC.COM $(B)/VC.OVL data/VC.INI data/VC.EXT data/VCEDIT.EXT data/VC.HLP tools/embed.py
 	@mkdir -p $(B)/gen
-	$(PY) tools/embed.py $@ VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL VC.INI=data/VC.INI VC.EXT=data/VC.EXT VC.HLP=data/VC.HLP
+	$(PY) tools/embed.py $@ VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT VC.HLP=data/VC.HLP
 
 $(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h runtime/rt.h
 	@mkdir -p $(B)/obj
