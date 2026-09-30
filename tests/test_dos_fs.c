@@ -7,6 +7,7 @@
 #include "hle.h"
 #include "dos_fs.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -348,7 +349,8 @@ static void test_names_and_finds(void)
         CHECK(p != NULL, "classic find still names plain.txt by its alias PLAIN.TXT");
     }
     check_alias(list, n, "\x92\xa5\xe1\xe2.txt", "\x92\x85\x91\x92.TXT");
-    CHECK(found_name(list, n, "face-\xfe.txt") != NULL, "unrepresentable emoji becomes one CP866 FEh square");
+    CHECK(found_name(list, n, "face-\xfe~0791.txt") != NULL,
+          "unrepresentable emoji gets one CP866 FEh square and its own FNV hash suffix");
     CHECK(found_name(list, n, ".") && found_name(list, n, ".."), "LFN directories contain dot and dot-dot");
     const Found *ent = found_name(list, n, "dangling");
     CHECK(ent && ent->size == 0 && ent->attrs == A_ARCHIVE, "dangling symlink is regular zero-length file");
@@ -401,8 +403,8 @@ static void test_names_and_finds(void)
     CHECK(n == 1 && !strcmp(list[0].name, "PLAIN.TXT"), "classic '?' also matches space padding in8.3 fields");
     n = find_entries(0, "README.???", 0, 0, list, 128);
     CHECK(n == 1 && !strcmp(list[0].name, "README"), "classic extension wildcards match padded empty extension");
-    n = find_entries(1, "face-?.txt", 0, 1, list, 128);
-    CHECK(n == 1 && !strcmp(list[0].name, "face-\xfe.txt"), "LFN wildcard over lossy CP866 name");
+    n = find_entries(1, "face-?~????.txt", 0, 1, list, 128);
+    CHECK(n == 1 && !strcmp(list[0].name, "face-\xfe~0791.txt"), "LFN wildcard over lossy CP866 name");
     CHECK(find_entries(0, "NOSUCH.*", 0, 0, list, 128) == 0, "classic no-match error18");
     CHECK(find_entries(1, "NOSUCH.*", 0, 1, list, 128) == 0, "LFN no-match error18");
 
@@ -418,7 +420,7 @@ static void test_names_and_finds(void)
     close_file(handle);
     handle = open_file("\xe2\xa5\xe1\xe2.TxT", 0);
     read_equals(handle, "Cyrillic", "CP866 Cyrillic case-insensitive open"); close_file(handle);
-    handle = open_file("face-\xfe.txt", 0);
+    handle = open_file("face-\xfe~0791.txt", 0);
     read_equals(handle, "emoji", "lossy CP866 FEh name opens host emoji file"); close_file(handle);
     path_begin(0x3d00, "face-?.txt"); error(2, "non-wildcard open treats question mark literally");
     host_file("face-?.txt", "literal question", 0644);
@@ -427,7 +429,7 @@ static void test_names_and_finds(void)
     path_begin(0x7141, "face-?.txt"); cpu.si = 0;
     ok("LFN literal unlink distinguishes real question mark from wildcard mode");
     path_begin(0x3d00, "face-?.txt"); error(2, "removed literal question mark does not match emoji");
-    handle = open_file("face-\xfe.txt", 0);
+    handle = open_file("face-\xfe~0791.txt", 0);
     read_equals(handle, "emoji", "lossy emoji file survives exact-name deletion"); close_file(handle);
     handle = open_file("link.txt", 0);
     read_equals(handle, "plain-data", "symlink open follows target"); close_file(handle);
@@ -627,84 +629,210 @@ static void check_name_roundtrip(const char *dir, const char *dos_name,
     }
 }
 
+/* Independent test oracle: FNV-1a hashes every unsigned byte of the entire
+ * host basename, including the extension, and XOR-folds the result to 16 bits. */
+static uint16_t name_hash16(const char *host)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    for (const unsigned char *p = (const unsigned char *)host; *p; ++p)
+        hash = (hash ^ *p) * UINT32_C(16777619);
+    return (uint16_t)(hash ^ (hash >> 16));
+}
+
 static void test_converted_name_collisions(void)
 {
     const uint16_t deletions[] = {0x4100, 0x7141};
-    const char *host_names[] = {"face-\xf0\x9f\x98\x80.txt", "face-\xf0\x9f\x98\x83.txt"};
-    const char *dos_names[] = {"face-\xfe.txt", "face-\xfe~1.txt"};
-    const char *contents[] = {"first emoji", "second emoji"};
+    const struct { const char *host, *dos, *contents; uint16_t hash; } names[] = {
+        {"face-\xf0\x9f\x98\x80.txt", "face-\xfe~0791.txt", "first emoji", 0x0791},
+        {"face-\xf0\x9f\x98\x83.txt", "face-\xfe~911A.txt", "second emoji", 0x911a},
+        {"face-\xf0\x9f\x98\x84.txt", "face-\xfe~0E94.txt", "third emoji", 0x0e94},
+    };
+    for (size_t i = 0; i < 3; ++i)
+        CHECK(name_hash16(names[i].host) == names[i].hash,
+              "STABLE LOSSY NAME: fixed FNV-1a32 folded16 test vector %zu", i);
     char dir[40], path[PATH_MAX], relative[PATH_MAX], pattern[80];
     struct stat st;
     for (size_t call = 0; call < sizeof deletions / sizeof deletions[0]; ++call) {
-        snprintf(dir, sizeof dir, "Emoji names %zu", call);
+        for (size_t removed = 0; removed < 3; ++removed) {
+            snprintf(dir, sizeof dir, "Emoji names %zu %zu", call, removed);
+            host_path(path, sizeof path, dir);
+            host_require(mkdir(path, 0755) == 0, "mkdir emoji stability fixture");
+            /* Neither creation order, directory name, nor the surviving
+             * neighbors may contribute to the displayed long name. */
+            for (int i = 2; i >= 0; --i) {
+                snprintf(relative, sizeof relative, "%s/%s", dir, names[i].host);
+                host_file(relative, names[i].contents, 0644);
+            }
+            Found list[8], again[8];
+            snprintf(pattern, sizeof pattern, "%s\\*", dir);
+            size_t n = find_entries(1, pattern, 0, 1, list, 8);
+            size_t m = find_entries(1, pattern, 0, 1, again, 8);
+            CHECK(n == 3 && m == 3, "STABLE LOSSY NAME: all three emoji entries are listed");
+            if (n != 3 || m != 3) continue;
+            for (size_t i = 0; i < 3; ++i) {
+                CHECK(!strcmp(list[i].name, names[i].dos),
+                      "STABLE LOSSY NAME: entry %zu gets its own ~%04X suffix", i, names[i].hash);
+                CHECK(!strcmp(list[i].name, again[i].name) && !strcmp(list[i].alias, again[i].alias),
+                      "STABLE LOSSY NAME: repeated enumeration yields deterministic names and aliases");
+                CHECK(!strpbrk(list[i].name, "*?"), "STABLE LOSSY NAME: display contains no wildcard");
+                check_name_roundtrip(dir, list[i].name, names[i].host, names[i].contents);
+                snprintf(path, sizeof path, "%s\\%s", dir, list[i].name);
+                rename_file(0x7156, path, path, 0);
+                snprintf(relative, sizeof relative, "%s/%s", dir, names[i].host);
+                CHECK(host_stat(relative, &st) == 0, "STABLE LOSSY NAME: rename-to-self preserves the host spelling");
+            }
+            snprintf(path, sizeof path, "%s\\%s", dir, list[removed].name);
+            path_begin(deletions[call], path); cpu.si = 0;
+            ok("STABLE LOSSY NAME: delete one saved displayed name");
+            snprintf(relative, sizeof relative, "%s/%s", dir, names[removed].host);
+            CHECK(host_stat(relative, &st) < 0 && errno == ENOENT,
+                  "STABLE LOSSY NAME: deletion removes exactly its host file");
+            m = find_entries(1, pattern, 0, 1, again, 8);
+            CHECK(m == 2, "STABLE LOSSY NAME: exactly two files survive");
+            for (size_t i = 0; i < 3; ++i) if (i != removed) {
+                CHECK(found_name(again, m, list[i].name) != NULL &&
+                      found_name(again, m, names[i].dos) != NULL,
+                      "STABLE LOSSY NAME: deleting entry %zu must not rename survivor %zu", removed, i);
+                check_name_roundtrip(dir, list[i].name, names[i].host, names[i].contents);
+            }
+            path_begin(deletions[call], path); cpu.si = 0;
+            error(2, "STABLE LOSSY NAME: deleted name cannot select another file");
+        }
+
+        /* VC saves two selected long names from one find snapshot. Do not
+         * refresh that snapshot between the first and second deletion. */
+        snprintf(dir, sizeof dir, "Emoji selection %zu", call);
         host_path(path, sizeof path, dir);
-        host_require(mkdir(path, 0755) == 0, "mkdir emoji collision fixture");
-        /* Reverse creation order: suffixes must follow bytewise host order. */
-        for (int i = 1; i >= 0; --i) {
-            snprintf(relative, sizeof relative, "%s/%s", dir, host_names[i]);
-            host_file(relative, contents[i], 0644);
+        host_require(mkdir(path, 0755) == 0, "mkdir saved-selection fixture");
+        for (size_t i = 0; i < 3; ++i) {
+            snprintf(relative, sizeof relative, "%s/%s", dir, names[i].host);
+            host_file(relative, names[i].contents, 0644);
         }
-        Found list[8], again[8];
+        Found selected[8];
         snprintf(pattern, sizeof pattern, "%s\\*", dir);
-        size_t n = find_entries(1, pattern, 0, 1, list, 8);
-        size_t m = find_entries(1, pattern, 0, 1, again, 8);
-        CHECK(n == 2 && m == 2, "NAME COLLISION: both emoji entries are listed");
-        if (n != 2 || m != 2) continue;
-        CHECK(strcmp(list[0].name, list[1].name) != 0,
-              "NAME COLLISION: two emoji names must have distinct DOS names");
+        size_t n = find_entries(1, pattern, 0, 1, selected, 8);
+        CHECK(n == 3, "SAVED SELECTION: find returns the three emoji files");
+        if (n != 3) continue;
         for (size_t i = 0; i < 2; ++i) {
-            CHECK(!strcmp(list[i].name, dos_names[i]),
-                  "NAME COLLISION: bytewise host order assigns unsuffixed name then ~1");
-            CHECK(!strcmp(list[i].name, again[i].name) && !strcmp(list[i].alias, again[i].alias),
-                  "NAME COLLISION: repeated enumeration yields deterministic names and aliases");
-            CHECK(!strpbrk(list[i].name, "*?"), "NAME COLLISION: substituted names contain no wildcard");
-            check_name_roundtrip(dir, list[i].name, host_names[i], contents[i]);
-            snprintf(path, sizeof path, "%s\\%s", dir, list[i].name);
-            rename_file(0x7156, path, path, 0);
-            snprintf(relative, sizeof relative, "%s/%s", dir, host_names[i]);
-            CHECK(host_stat(relative, &st) == 0, "NAME COLLISION: rename-to-self preserves the host emoji spelling");
+            snprintf(path, sizeof path, "%s\\%s", dir, selected[i].name);
+            path_begin(deletions[call], path); cpu.si = 0;
+            ok("SAVED SELECTION: delete the next saved long name");
+            for (size_t j = 0; j < 3; ++j) {
+                snprintf(relative, sizeof relative, "%s/%s", dir, names[j].host);
+                int present = host_stat(relative, &st) == 0;
+                CHECK(j <= i ? !present && errno == ENOENT : present,
+                      "SAVED SELECTION: after deletion %zu, host file %zu has the intended existence", i, j);
+            }
         }
-        snprintf(path, sizeof path, "%s\\%s", dir, list[1].name);
-        path_begin(deletions[call], path); cpu.si = 0;
-        ok("NAME COLLISION: delete the second displayed emoji entry only");
-        snprintf(relative, sizeof relative, "%s/%s", dir, host_names[1]);
-        CHECK(host_stat(relative, &st) < 0 && errno == ENOENT,
-              "NAME COLLISION: deleting the second DOS name removes the second host file");
-        snprintf(relative, sizeof relative, "%s/%s", dir, host_names[0]);
-        CHECK(host_stat(relative, &st) == 0,
-              "NAME COLLISION: deleting the second DOS name preserves the first host file");
-        check_name_roundtrip(dir, dos_names[0], host_names[0], contents[0]);
-        path_begin(deletions[call], path); cpu.si = 0;
-        error(2, "NAME COLLISION: deleted suffixed name cannot select another entry");
+        check_name_roundtrip(dir, selected[2].name, names[2].host, names[2].contents);
     }
 
     strcpy(dir, "Name priority");
     host_path(path, sizeof path, dir);
     host_require(mkdir(path, 0755) == 0, "mkdir native-name priority fixture");
-    const struct { const char *host, *dos, *contents; } priority[] = {
-        {"Face-\xf0\x9f\x98\x80.txt", "Face-\xfe~4.txt", "first converted"},
-        {"face-\xf0\x9f\x98\x83.txt", "face-\xfe~5.txt", "second converted"},
-        {"face-\xe2\x96\xa0.txt", "face-\xfe.txt", "native square"},
-        {"FACE-\xe2\x96\xa0~1.TXT", "FACE-\xfe~1.TXT", "native suffix one"},
-        {"face-\xe2\x96\xa0~3.txt", "face-\xfe~3.txt", "native suffix three"},
-        {"face-\xf0\x9f\x98\x81~2.txt", "face-\xfe~2.txt", "converted suffix two"},
+    const struct { const char *host, *dos, *contents; int ambiguous; } priority[] = {
+        {"Face-\xf0\x9f\x98\x80.txt", "Face-\xfe~AEB1.txt", "first converted", 1},
+        {"face-\xf0\x9f\x98\x83.txt", "face-\xfe~911A.txt", "second converted", 1},
+        {"face-\xe2\x96\xa0~AEB1.txt", "face-\xfe~AEB1.txt", "native after converted", 0},
+        {"FACE-\xe2\x96\xa0~911A.TXT", "FACE-\xfe~911A.TXT", "native before converted", 0},
+        {"face-\xe2\x96\xa0.txt", "face-\xfe.txt", "native square", 0},
+        {"FACE-\xe2\x96\xa0~1.TXT", "FACE-\xfe~1.TXT", "native suffix one", 0},
+        {"face-\xf0\x9f\x98\x81~2.txt", "face-\xfe~2~DEFB.txt", "converted suffix two", 0},
     };
-    /* The first lossy host name sorts before the native lower-case square.
-     * Native and converted ~1/~2/~3 names must all be reserved in advance. */
+    /* Both host sort directions are deliberate: real names keep their exact
+     * spelling even when a lossy name has the same case-folded hash spelling. */
     for (size_t i = 0; i < sizeof priority / sizeof priority[0]; ++i) {
         snprintf(relative, sizeof relative, "%s/%s", dir, priority[i].host);
         host_file(relative, priority[i].contents, 0644);
     }
     Found list[12];
     size_t n = find_entries(1, "Name priority\\*", 0, 1, list, 12);
-    CHECK(n == 6, "NAME COLLISION: native and converted collision fixture is complete");
+    CHECK(n == 7, "NAME COLLISION: native and converted collision fixture is complete");
     for (size_t i = 0; i < sizeof priority / sizeof priority[0]; ++i) {
         CHECK(found_name(list, n, priority[i].dos) != NULL,
-              "NAME COLLISION: native names win and converted names use lowest free suffix");
-        check_name_roundtrip(dir, priority[i].dos, priority[i].host, priority[i].contents);
+              "NAME COLLISION: neither real nor hash-suffixed colliding name may be renamed");
+        if (!priority[i].ambiguous)
+            check_name_roundtrip(dir, priority[i].dos, priority[i].host, priority[i].contents);
     }
-    uint16_t h = open_file("Name priority\\FACE-\xfe.TXT", 0);
-    read_equals(h, "native square", "NAME COLLISION: native priority is case insensitive"); close_file(h);
+    const char *case_inputs[] = {"Name priority\\FACE-\xfe~aeb1.TXT", "Name priority\\face-\xfe~911a.txt"};
+    for (size_t i = 0; i < 2; ++i) {
+        char resolved[PATH_MAX], expected[PATH_MAX];
+        snprintf(relative, sizeof relative, "%s/%s", dir, priority[i + 2].host);
+        host_path(expected, sizeof expected, relative);
+        putstr(DS, ARG, case_inputs[i]);
+        CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) == 0 && !strcmp(resolved, expected),
+              "NAME COLLISION: case-insensitive real-name priority selects the native host spelling");
+        uint16_t h = open_file(case_inputs[i], 0);
+        read_equals(h, priority[i + 2].contents, "NAME COLLISION: real name wins even for a case-insensitive path");
+        close_file(h);
+    }
+    path_begin(0x7141, case_inputs[0]); cpu.si = 1;
+    ok("NAME COLLISION: wildcard-mode literal delete selects the native entry only");
+    snprintf(relative, sizeof relative, "%s/%s", dir, priority[2].host);
+    CHECK(host_stat(relative, &st) < 0 && errno == ENOENT,
+          "NAME COLLISION: wildcard-mode literal delete removes the real entry");
+    snprintf(relative, sizeof relative, "%s/%s", dir, priority[0].host);
+    CHECK(host_stat(relative, &st) == 0, "NAME COLLISION: wildcard-mode literal delete preserves the lossy entry");
+    check_name_roundtrip(dir, priority[0].dos, priority[0].host, priority[0].contents);
+}
+
+static void test_lossy_hash_collision(void)
+{
+    /* These distinct one-emoji basenames have different 32-bit FNV hashes
+     * (CD009184 and 7D0C2188), both folding to 5C84. Their entire converted
+     * DOS names, not merely their suffixes, therefore collide. */
+    const char *hosts[] = {"face-\xf0\x9f\x8d\x8b.txt", "face-\xf0\x9f\x90\x8c.txt"};
+    const char *contents[] = {"lemon must survive", "snail must survive"};
+    const char *dos = "face-\xfe~5C84.txt";
+    char path[PATH_MAX], relative[PATH_MAX], resolved[PATH_MAX];
+    host_path(path, sizeof path, "Hash collision");
+    host_require(mkdir(path, 0755) == 0, "mkdir forced full-name hash collision");
+    struct stat before[2], st;
+    for (size_t i = 0; i < 2; ++i) {
+        CHECK(name_hash16(hosts[i]) == 0x5c84, "HASH COLLISION: fixture has the intended folded FNV value");
+        snprintf(relative, sizeof relative, "Hash collision/%s", hosts[i]);
+        host_file(relative, contents[i], 0644);
+        host_require(host_stat(relative, &before[i]) == 0, "stat hash-collision fixture");
+    }
+    Found list[4];
+    size_t n = find_entries(1, "Hash collision\\*", 0, 1, list, 4);
+    CHECK(n == 2 && !strcmp(list[0].name, dos) && !strcmp(list[1].name, dos),
+          "HASH COLLISION: both ambiguous entries retain the same own-host-derived displayed name");
+    const char *inputs[] = {"Hash collision\\face-\xfe~5C84.txt", "Hash collision\\FACE-\xfe~5c84.TXT"};
+    for (size_t i = 0; i < 2; ++i) {
+        putstr(DS, ARG, inputs[i]);
+        CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) < 0 && errno == ENOENT,
+              "HASH COLLISION: allow-missing public resolution must reject ambiguous names");
+        path_begin(0x3d00, inputs[i]); error(2, "HASH COLLISION: classic open never selects either file");
+        path_begin(0x716c, inputs[i]); cpu.b.x = 0; cpu.d.x = 1;
+        error(2, "HASH COLLISION: LFN open never selects either file");
+        path_begin(0x3c00, inputs[i]); error(2, "HASH COLLISION: create cannot turn ambiguity into a real name");
+        path_begin(0x716c, inputs[i]); cpu.b.x = 2; cpu.d.x = 0x11;
+        error(2, "HASH COLLISION: LFN open-or-create must preserve ambiguity");
+        path_begin(0x7160, inputs[i]); cpu.c.x = 2;
+        error(2, "HASH COLLISION: long truename must not select either file");
+        path_begin(0x4100, inputs[i]); error(2, "HASH COLLISION: classic unlink never removes either file");
+        path_begin(0x7141, inputs[i]); cpu.si = 0;
+        error(2, "HASH COLLISION: LFN literal unlink never removes either file");
+        path_begin(0x7141, inputs[i]); cpu.si = 1;
+        error(2, "HASH COLLISION: wildcard-mode literal unlink must not bypass ambiguity");
+    }
+    n = find_entries(1, "Hash collision\\*", 0, 1, list, 4);
+    CHECK(n == 2, "HASH COLLISION: rejected creates/deletes preserve exactly the two original entries");
+    for (size_t i = 0; i < 2; ++i) {
+        snprintf(relative, sizeof relative, "Hash collision/%s", hosts[i]);
+        CHECK(host_stat(relative, &st) == 0 && st.st_dev == before[i].st_dev &&
+              st.st_ino == before[i].st_ino && st.st_size == before[i].st_size,
+              "HASH COLLISION: rejected operations preserve each original inode and size");
+        host_path(path, sizeof path, relative);
+        int fd = open(path, O_RDONLY);
+        host_require(fd >= 0, "open guarded hash-collision fixture");
+        char buffer[64] = {0};
+        ssize_t got = read(fd, buffer, sizeof buffer);
+        CHECK(got == (ssize_t)strlen(contents[i]) && !memcmp(buffer, contents[i], strlen(contents[i])),
+              "HASH COLLISION: neither payload is truncated or replaced");
+        host_require(close(fd) == 0, "close guarded hash-collision fixture");
+    }
 }
 
 static void test_literal_wildcard_names(void)
@@ -744,14 +872,14 @@ static void test_name_boundaries(void)
     host_path(path, sizeof path, "Name edges");
     host_require(mkdir(path, 0755) == 0, "mkdir name-boundary fixture");
     const struct { const char *host, *dos, *contents; } cases[] = {
-        {"bad-\xff.txt", "bad-\xfe~1.txt", "invalid later byte"},
-        {"bad-\xfe.txt", "bad-\xfe.txt", "invalid earlier byte"},
-        {"bad-\xff" "a.txt", "bad-\xfe" "a.txt", "ASCII after invalid byte"},
-        {"accent-\xc3\xa9.txt", "accent-\xfe.txt", "unrepresentable accent"},
+        {"bad-\xff.txt", "bad-\xfe~059A.txt", "invalid later byte"},
+        {"bad-\xfe.txt", "bad-\xfe~D0D3.txt", "invalid earlier byte"},
+        {"bad-\xff" "a.txt", "bad-\xfe" "a~F1E9.txt", "ASCII after invalid byte"},
+        {"accent-\xc3\xa9.txt", "accent-\xfe~FF3E.txt", "unrepresentable accent"},
         {"Case.txt", "Case.txt", "upper native name"},
-        {"case.txt", "case~1.txt", "lower native name"},
+        {"case.txt", "case.txt", "lower native name"},
         {"\xd0\x96.txt", "\x86.txt", "upper Cyrillic name"},
-        {"\xd0\xb6.txt", "\xa6~1.txt", "lower Cyrillic name"},
+        {"\xd0\xb6.txt", "\xa6.txt", "lower Cyrillic name"},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
         snprintf(relative, sizeof relative, "Name edges/%s", cases[i].host);
@@ -765,17 +893,16 @@ static void test_name_boundaries(void)
         check_name_roundtrip("Name edges", cases[i].dos, cases[i].host, cases[i].contents);
     }
 
-    /* Both a full-length base and a full-length extension must make room
-     * for the suffix without overflowing the 255-byte DOS name buffer. */
+    /* Even at the 255-byte limit, case-only lossless neighbors keep their
+     * own spelling and remain reachable by an exact native path. */
     for (unsigned extension = 0; extension < 2; ++extension) {
         char host[256], upper[256], dos[256];
         if (!extension) {
             memset(host, 'q', 251); memcpy(host + 251, ".txt", 5);
-            memset(dos, 'q', 249); memcpy(dos + 249, "~1.txt", 7);
         } else {
             memcpy(host, "r.", 2); memset(host + 2, 'x', 253); host[255] = 0;
-            memcpy(dos, "r~1.", 4); memset(dos + 4, 'x', 251); dos[255] = 0;
         }
+        strcpy(dos, host);
         strcpy(upper, host); upper[0] = (char)(host[0] - ('a' - 'A'));
         snprintf(relative, sizeof relative, "Name edges/%s", host);
         host_file(relative, "lower boundary name", 0644);
@@ -784,19 +911,48 @@ static void test_name_boundaries(void)
         host_file(relative, "upper boundary name", 0644);
         n = find_entries(1, "Name edges\\*", 0, 1, list, 16);
         const Found *entry = found_name(list, n, dos);
-        CHECK(entry && strlen(entry->name) == 255,
-              "NAME COLLISION: suffixed maximum-length name stays within 255 bytes");
+        CHECK(entry && strlen(entry->name) == 255 && found_name(list, n, upper),
+              "NAME COLLISION: maximum-length lossless case neighbors retain both complete spellings");
         snprintf(path, sizeof path, "Name edges\\%s", dos);
         putstr(DS, ARG, path);
         CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) == 0 && !strcmp(resolved, expected),
-              "NAME COLLISION: truncated suffixed name resolves to the original full-length host name");
+              "NAME COLLISION: full-length lossless name resolves to its exact host spelling");
         uint16_t h = open_file(path, 0);
         read_equals(h, "lower boundary name", "NAME COLLISION: full-length collision opens the correct file"); close_file(h);
     }
+    /* Lossy names at the same limit still need all five suffix characters,
+     * including when an unusually long extension consumes the entire name. */
+    for (unsigned extension = 0; extension < 2; ++extension) {
+        char host[256], dos[256], suffix[6];
+        if (!extension) {
+            memset(host, 'q', 250); host[250] = (char)0xff; memcpy(host + 251, ".txt", 5);
+        } else {
+            memcpy(host, "r.", 2); memset(host + 2, 'x', 252); host[254] = (char)0xff; host[255] = 0;
+        }
+        snprintf(suffix, sizeof suffix, "~%04X", name_hash16(host));
+        if (!extension) {
+            memset(dos, 'q', 246); memcpy(dos + 246, suffix, 5); memcpy(dos + 251, ".txt", 5);
+        } else {
+            dos[0] = 'r'; memcpy(dos + 1, suffix, 5); dos[6] = '.';
+            memset(dos + 7, 'x', 248); dos[255] = 0;
+        }
+        snprintf(relative, sizeof relative, "Name edges/%s", host);
+        host_file(relative, "lossy boundary name", 0644);
+        host_path(expected, sizeof expected, relative);
+        n = find_entries(1, "Name edges\\*", 0, 1, list, 16);
+        const Found *entry = found_name(list, n, dos);
+        CHECK(entry && strlen(entry->name) == 255,
+              "STABLE LOSSY NAME: full-length base/extension retains its complete hash within 255 bytes");
+        snprintf(path, sizeof path, "Name edges\\%s", dos);
+        putstr(DS, ARG, path);
+        CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) == 0 && !strcmp(resolved, expected),
+              "STABLE LOSSY NAME: bounded hash spelling resolves to the full-length host name");
+        uint16_t h = open_file(path, 0);
+        read_equals(h, "lossy boundary name", "STABLE LOSSY NAME: full-length hash spelling opens its own file");
+        close_file(h);
+    }
 }
 
-/* A name that exists exactly as spelled opens without listing its directory,
- * so it works inside an execute-only directory. */
 /* A symlink to an ancestor directory lists as a file, so a recursive walk
  * cannot loop through it. A symlink elsewhere stays a directory. */
 static void test_ancestor_symlink_lists_as_file(void)
@@ -817,15 +973,96 @@ static void test_ancestor_symlink_lists_as_file(void)
 
 static void test_execute_only_directory(void)
 {
-    char path[PATH_MAX];
+    char path[PATH_MAX], output[PATH_MAX], expected[PATH_MAX + 40], dos_fixture[PATH_MAX + 3];
     host_path(path, sizeof path, "xonly");
     host_require(mkdir(path, 0755) == 0, "mkdir execute-only directory");
     host_file("xonly/known.txt", "reachable by name", 0644);
+    host_path(path, sizeof path, "xonly/\xd0\xa2\xd0\xb5\xd1\x81\xd1\x82 child");
+    host_require(mkdir(path, 0755) == 0, "mkdir lossless Cyrillic child of execute-only parent");
+    host_file("xonly/\xd0\xa2\xd0\xb5\xd1\x81\xd1\x82 child/known.txt", "reachable child", 0644);
+    host_path(path, sizeof path, "xonly");
     host_require(chmod(path, 0111) == 0, "make directory execute-only");
+    errno = 0;
+    DIR *dir = opendir(path);
+    int saved_errno = errno;
+    CHECK(dir == NULL && saved_errno == EACCES,
+          "EXECUTE-ONLY: listing really fails with EACCES (euid=%lu); run without permission bypass",
+          (unsigned long)geteuid());
+    if (dir) host_require(closedir(dir) == 0, "close unexpected execute-only listing");
+    struct stat st;
+    CHECK(host_stat("xonly/known.txt", &st) == 0, "EXECUTE-ONLY: exact child remains reachable by name");
     path_begin(0x3d00, "xonly\\known.txt");
     if (ok("open a file by exact name in an execute-only directory"))
         close_file(cpu.a.x);
+
+    const char *inputs[] = {"xonly\\known.txt", "xonly\\\x92\xa5\xe1\xe2 child\\known.txt"};
+    for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; ++i) {
+        path_begin(0x7160, inputs[i]); cpu.c.x = 2;
+        if (ok("EXECUTE-ONLY: long truename must not list a lossless component's parent")) {
+            getstr(ES, OUT, output, sizeof output);
+            snprintf(expected, sizeof expected, "C:%s\\%s", fixture, inputs[i]);
+            for (char *p = expected; *p; ++p) if (*p == '/') *p = '\\';
+            CHECK(!strcmp(output, expected), "EXECUTE-ONLY: long truename preserves lossless ASCII/Cyrillic spelling");
+        }
+    }
+    path_begin(0x713b, "xonly\\\x92\xa5\xe1\xe2 child");
+    ok("EXECUTE-ONLY: chdir to a reachable child of the unreadable parent");
+    begin(0x7147); cpu.d.l = 3; cpu.si = OUT;
+    if (ok("EXECUTE-ONLY: LFN getcwd must not list lossless parents")) {
+        getstr(DS, OUT, output, sizeof output);
+        snprintf(expected, sizeof expected, "%s\\xonly\\\x92\xa5\xe1\xe2 child", fixture + 1);
+        for (char *p = expected; *p; ++p) if (*p == '/') *p = '\\';
+        CHECK(!strcmp(output, expected), "EXECUTE-ONLY: LFN getcwd returns the complete lossless CP866 path");
+    }
+    snprintf(dos_fixture, sizeof dos_fixture, "C:%s", fixture);
+    path_begin(0x713b, dos_fixture); ok("restore DOS cwd after execute-only conversion");
     host_require(chmod(path, 0755) == 0, "restore execute-only directory");
+}
+
+static void test_unlink_directory_symlinks(void)
+{
+    const uint16_t calls[] = {0x4100, 0x7141};
+    const char *targets[] = {".", "unlink-target"};
+    const char *links[] = {"..", "../unlink-target"};
+    const char *guards[] = {"unlink-ancestor-keep.txt", "unlink-target/keep.txt"};
+    char path[PATH_MAX], name[100], pattern[100];
+    host_path(path, sizeof path, "unlink-target");
+    host_require(mkdir(path, 0755) == 0, "mkdir unlink symlink target");
+    host_path(path, sizeof path, "unlink-links");
+    host_require(mkdir(path, 0755) == 0, "mkdir unlink symlink parent");
+    host_file(guards[0], "untouched unlink target", 0644);
+    host_file(guards[1], "untouched unlink target", 0644);
+    struct stat target_before[2], guard_before[2], st;
+    for (size_t kind = 0; kind < 2; ++kind) {
+        host_require(host_stat(targets[kind], &target_before[kind]) == 0, "stat unlink directory target");
+        host_require(host_stat(guards[kind], &guard_before[kind]) == 0, "stat unlink target guard");
+        for (size_t call = 0; call < sizeof calls / sizeof calls[0]; ++call) {
+            snprintf(name, sizeof name, "unlink-links/link-%zu-%zu", kind, call);
+            host_path(path, sizeof path, name);
+            host_require(symlink(links[kind], path) == 0, "make unlink directory symlink");
+            snprintf(pattern, sizeof pattern, "unlink-links\\link-%zu-%zu", kind, call);
+            Found list[4];
+            size_t n = find_entries(1, pattern, A_DIR, 1, list, 4);
+            CHECK(n == 1 && !!(list[0].attrs & A_DIR) == (kind == 1),
+                  "SYMLINK UNLINK: ancestor is listed as a file; ordinary directory link remains a directory");
+            path_begin(calls[call], pattern); cpu.si = 0;
+            ok("SYMLINK UNLINK: 41h/7141h removes the final directory symlink itself");
+            CHECK(lstat(path, &st) < 0 && errno == ENOENT, "SYMLINK UNLINK: only the link itself is gone");
+            CHECK(host_stat(targets[kind], &st) == 0 && S_ISDIR(st.st_mode) &&
+                  st.st_dev == target_before[kind].st_dev && st.st_ino == target_before[kind].st_ino &&
+                  st.st_mtim.tv_sec == target_before[kind].st_mtim.tv_sec &&
+                  st.st_mtim.tv_nsec == target_before[kind].st_mtim.tv_nsec,
+                  "SYMLINK UNLINK: target directory inode and contents timestamp remain intact");
+            CHECK(host_stat(guards[kind], &st) == 0 && st.st_dev == guard_before[kind].st_dev &&
+                  st.st_ino == guard_before[kind].st_ino && st.st_size == guard_before[kind].st_size,
+                  "SYMLINK UNLINK: target's guard file inode and size remain intact");
+            uint16_t h = open_file(guards[kind], 0);
+            read_equals(h, "untouched unlink target", "SYMLINK UNLINK: target file contents are unchanged");
+            close_file(h);
+            path_begin(calls[call], pattern); cpu.si = 0;
+            error(2, "SYMLINK UNLINK: repeated deletion cannot remove the target");
+        }
+    }
 }
 
 static void test_rmdir_symlinks(void)
@@ -951,6 +1188,22 @@ static void test_paths_and_mutations(void)
     error(2, "no-match wildcard unlink");
     host_file("delete-exact.tmp", "exact", 0644);
     path_begin(0x7141, "delete-exact.tmp"); cpu.si = 0; ok("LFN literal unlink");
+    host_file(".delete-literal.tmp", "hidden literal", 0644);
+    path_begin(0x7141, ".delete-literal.tmp"); cpu.si = 1; cpu.c.x = 0;
+    error(2, "wildcard-mode literal deletion still excludes hidden files without a mask");
+    CHECK(host_stat(".delete-literal.tmp", &st) == 0, "wildcard-mode literal hidden exclusion preserves the file");
+    path_begin(0x7141, ".delete-literal.tmp"); cpu.si = 1; cpu.c.x = A_HIDDEN;
+    ok("wildcard-mode literal deletion honors the explicit hidden mask");
+    CHECK(host_stat(".delete-literal.tmp", &st) < 0 && errno == ENOENT,
+          "wildcard-mode literal deletion removes the included hidden file");
+    host_file("delete-extensionless", "extensionless", 0644);
+    host_file("delete-extensionless.txt", "extension guard", 0644);
+    path_begin(0x7141, "delete-extensionless."); cpu.si = 1; cpu.c.x = 0;
+    ok("wildcard-mode literal trailing dot still matches the extensionless file");
+    CHECK(host_stat("delete-extensionless", &st) < 0 && errno == ENOENT,
+          "trailing-dot literal deletion removes the extensionless file");
+    CHECK(host_stat("delete-extensionless.txt", &st) == 0,
+          "trailing-dot literal deletion preserves a neighbor with an extension");
 
     /* 5A appends its generated name to an input directory path. */
     path_begin(0x5a00, "subdir\\"); cpu.c.x = 0;
@@ -1682,8 +1935,10 @@ int main(void)
     test_io_and_handles();
     test_paths_and_mutations();
     test_converted_name_collisions();
+    test_lossy_hash_collision();
     test_literal_wildcard_names();
     test_name_boundaries();
+    test_unlink_directory_symlinks();
     test_rmdir_symlinks();
     test_execute_only_directory();
     test_ancestor_symlink_lists_as_file();

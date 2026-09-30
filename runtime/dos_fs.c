@@ -47,7 +47,7 @@ typedef struct {
     struct stat st;
     struct timespec birth;
     unsigned attr;
-    bool have_stat, lossless, name_assigned;
+    bool have_stat, lossless, ambiguous;
 } Entry;
 
 typedef struct {
@@ -290,22 +290,22 @@ static bool alias_used(const Entry *entries, size_t count, const char *alias)
     return false;
 }
 
-static bool dos_name_used(const Entry *entries, size_t count, const char *name)
+static void hashed_name(const char *host, const char *name, char out[DOS_NAME_MAX + 1])
 {
-    for (size_t i = 0; i < count; ++i)
-        if (entries[i].name_assigned && cp_equal(entries[i].dos, name)) return true;
-    return false;
-}
-
-static void numbered_name(const char *name, unsigned number, char out[DOS_NAME_MAX + 1])
-{
+    /* FNV-1a over the host basename's bytes, XOR-folded to 16 bits. The
+     * suffix must not depend on which other entries happen to exist. */
+    uint32_t hash = UINT32_C(2166136261);
+    for (const unsigned char *p = (const unsigned char *)host; *p; ++p) {
+        hash ^= *p;
+        hash *= UINT32_C(16777619);
+    }
     const char *dot = strrchr(name, '.');
     if (dot == name) dot = NULL; /* A leading dot alone is not an extension. */
-    char tail[12];
-    snprintf(tail, sizeof(tail), "~%u", number);
+    char tail[6];
+    snprintf(tail, sizeof(tail), "~%04X", (unsigned)((hash ^ (hash >> 16)) & 0xffff));
     size_t suffix = strlen(tail), ext = dot ? strlen(dot) : 0;
     size_t base = dot ? (size_t)(dot - name) : strlen(name);
-    /* Keep the extension when possible, with room for a base byte and ~N.
+    /* Keep the extension when possible, with room for a base byte and ~XXXX.
      * CP866 is single-byte, so truncation cannot split a character. */
     if (ext > DOS_NAME_MAX - suffix - 1) ext = DOS_NAME_MAX - suffix - 1;
     if (base > DOS_NAME_MAX - suffix - ext) base = DOS_NAME_MAX - suffix - ext;
@@ -315,28 +315,25 @@ static void numbered_name(const char *name, unsigned number, char out[DOS_NAME_M
     out[base + suffix + ext] = 0;
 }
 
-static int assign_dos_names(Entry *entries, size_t count)
+static void assign_dos_names(Entry *entries, size_t count)
 {
-    /* Reserve native names first, even ones sorting after a lossy name.
-     * Reserve other original converted names before allocating any suffix,
-     * so a generated ~N cannot steal another entry's original spelling. */
-    for (unsigned lossy = 0; lossy < 2; ++lossy)
-        for (size_t i = 0; i < count; ++i)
-            if (entries[i].lossless == !lossy && !dos_name_used(entries, count, entries[i].dos))
-                entries[i].name_assigned = true;
     for (size_t i = 0; i < count; ++i) {
-        if (entries[i].name_assigned) continue;
+        if (entries[i].lossless) continue;
         char candidate[DOS_NAME_MAX + 1];
-        unsigned n;
-        for (n = 1; n <= 9999999; ++n) {
-            numbered_name(entries[i].dos, n, candidate);
-            if (!dos_name_used(entries, count, candidate)) break;
-        }
-        if (n > 9999999) return 4;
+        hashed_name(entries[i].host, entries[i].dos, candidate);
         strcpy(entries[i].dos, candidate);
-        entries[i].name_assigned = true;
     }
-    return 0;
+    /* A hash collision must never move either name onto a saved selection's
+     * spelling. Keep listing both, but refuse the ambiguous lossy spelling.
+     * Native names retain priority, even over case-insensitive collisions. */
+    for (size_t i = 0; i < count; ++i) {
+        if (entries[i].lossless) continue;
+        for (size_t j = 0; j < count; ++j)
+            if (i != j && cp_equal(entries[i].dos, entries[j].dos)) {
+                entries[i].ambiguous = true;
+                break;
+            }
+    }
 }
 
 /* Count distinct matching entries, not spellings: one entry can match both
@@ -344,6 +341,26 @@ static int assign_dos_names(Entry *entries, size_t count)
 static unsigned matching_entry(const Entry *entries, size_t count, const char *name, size_t *index)
 {
     unsigned matches = 0;
+    /* Preserve exact native spelling here too: short-name conversion calls
+     * this helper without going through resolve_name's exact-host check. */
+    for (size_t i = 0; i < count; ++i)
+        if (entries[i].lossless && !strcmp(name, entries[i].dos)) {
+            *index = i;
+            return 1;
+        }
+    /* Real long names win over generated spellings. Native case twins keep
+     * their existing unique short alias as a tie-break for nonexact input. */
+    for (size_t i = 0; i < count; ++i) {
+        if (!entries[i].lossless || !cp_equal(name, entries[i].dos)) continue;
+        *index = i;
+        if (cp_equal(name, entries[i].alias)) return 1;
+        ++matches;
+    }
+    if (matches) return matches;
+    /* Do not let a blocked long name fall through to an unrelated alias or
+     * to allow_missing creation of a literal replacement-character name. */
+    for (size_t i = 0; i < count; ++i)
+        if (entries[i].ambiguous && cp_equal(name, entries[i].dos)) return 2;
     for (size_t i = 0; i < count; ++i) {
         if (!cp_equal(name, entries[i].dos) && !cp_equal(name, entries[i].alias)) continue;
         if (++matches > 1) return matches;
@@ -402,8 +419,7 @@ static int list_directory(const char *dir, Entry **out, size_t *out_count)
     closedir(dp);
     if (error) { free_entries(entries, count); return error; }
     if (count) qsort(entries, count, sizeof(*entries), entry_cmp);
-    error = assign_dos_names(entries, count);
-    if (error) { free_entries(entries, count); return error; }
+    assign_dos_names(entries, count);
     /* Reserve every real 8.3 name first, including lexically later names.
      * Case-colliding native short names after the first also need an alias. */
     for (size_t i = 0; i < count; ++i) {
@@ -585,8 +601,8 @@ static int host_to_dos(const char *host, bool short_names, char *out, size_t cap
         char part[NAME_MAX + 1], dos[DOS_NAME_MAX + 1];
         if (n > NAME_MAX) return 3;
         memcpy(part, start, n); part[n] = 0;
-        utf8_to_cp(part, dos, sizeof(dos));
-        {
+        bool lossless = utf8_to_cp(part, dos, sizeof(dos));
+        if (short_names || !lossless) {
             Entry *entries;
             size_t count;
             int error = list_directory(dir, &entries, &count);
@@ -1367,11 +1383,13 @@ static int get_directory(bool lfn)
 
 static int unlink_path(const char *path)
 {
-    struct stat st, link_st;
-    int error = file_stat(path, &st);
-    if (error) return error;
-    if (S_ISDIR(st.st_mode) || !(st.st_mode & S_IWUSR)) return 5;
+    struct stat link_st;
     if (lstat(path, &link_st) < 0) return dos_errno(errno);
+    /* A final symlink is the entry being deleted, regardless of its target's
+     * type, permissions or existence. In particular, ancestor links are
+     * deliberately listed as files and arrive here through 41h/7141h. */
+    if (!S_ISLNK(link_st.st_mode) &&
+        (S_ISDIR(link_st.st_mode) || !(link_st.st_mode & S_IWUSR))) return 5;
     if (unlink(path) < 0) return dos_errno(errno);
     /* Removing a symlink never removes the followed target's inode. */
     if (link_st.st_nlink <= 1 && !inode_is_open(&link_st)) forget_birth(&link_st);
@@ -1395,10 +1413,26 @@ static int delete_file(bool lfn)
     size_t count, removed = 0;
     error = snapshot(path, &entries, &count);
     if (error) return error;
+    size_t selected = count;
+    if (!strpbrk(pattern, "*?")) {
+        /* Wildcard mode can still receive one literal long name. Apply the
+         * same ambiguity and native-priority rules as ordinary resolution. */
+        unsigned matches = matching_entry(entries, count, pattern, &selected);
+        size_t n = strlen(pattern);
+        if (!matches && n > 1 && strchr(pattern, '.') == pattern + n - 1) {
+            /* Like long_match, a trailing dot can mean no extension, but an
+             * ambiguous literal name must never fall through to this case. */
+            pattern[n - 1] = 0;
+            matches = matching_entry(entries, count, pattern, &selected);
+            pattern[n - 1] = '.';
+        }
+        if (matches != 1) { free_entries(entries, count); return 2; }
+    }
     for (size_t i = 0; i < count; ++i) {
         Entry *e = entries + i;
         if (!strcmp(e->host, ".") || !strcmp(e->host, "..")) continue;
-        if (!e->have_stat || !attributes_match(e->attr, cpu.c.x, true) ||
+        if (!e->have_stat || !attributes_match(e->attr, cpu.c.x, true)) continue;
+        if (selected < count ? i != selected :
             !(long_match(pattern, e->dos) || long_match(pattern, e->alias))) continue;
         char file[PATH_MAX];
         error = join_path(path, e->host, file, sizeof(file));
