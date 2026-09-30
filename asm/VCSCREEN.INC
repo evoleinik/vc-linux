@@ -1,0 +1,903 @@
+;---------------------------------------------------------------
+;		Screen interface
+;
+;		Version:	31.12.1998
+;---------------------------------------------------------------
+
+;---------------------------------------------------------------
+;	Set screen parameters
+;---------------------------------------------------------------
+;
+;#define BDA_vpage_ofs MK_FP(0x40, 0x4E)
+;#define SYNC_MODE 0 // CGA snow workaround
+;#define ASYNC_MODE 1
+;#define AUTO_MODE 2
+;
+; MonoMode = (ScrMod == 7) ? true : false
+; if (TstEGA) MonoMode = GetEGAInfo()
+;
+; if (MonoMode || SnowMod == ASYNC_MODE ||
+;      (SnowMod == AUTO_MODE && TstEGA)) {
+;     SkipCGASnowFix = true
+; } else { // SYNC_MODE (CGA snow workaround)
+;     // assume CRT monitor if display disabled (in retrace) for 7 test cycles.
+;     // Laptops with CGA compatible cards and LCD monitors have short blank periods.
+;     for (i = 32768; i > 0; i--) {
+;          _disable()
+;          for (c = 7; c > 0 && inp(0x3DA) & 1; c--) ;
+;          _enable()
+;          if (c == 0) break
+;     }
+;     SkipCGASnowFix = (c != 0) ? true : false
+; }
+;
+; GetVideoMode(&mode, &vpage, &cols)
+; Screen.Offs = (vpage == 0) ? 0 : BDA_vpage_ofs
+; Screen.Segm = (MonoMode) ? 0xB000 : 0xB800
+;
+; TopView = false
+; if (TopView_GetShadowBuf(Screen.Segm) != Screen.Segm) {
+;     Screen.Segm = TopView_GetShadowBuf()
+;     TopView = true
+;     SkipCGASnowFix = true
+; }
+;
+		.CODE	Subs
+ScreenParms	PROC	FAR
+		MOV	BH,0			; Color mode
+		CMP	DS:ScrMod,7
+		JNE	@@MonoEGA
+		MOV	BH,1
+
+  @@MonoEGA:
+		CMP	DS:TstEGA,0
+		JZ	@@ColorMono
+		MOV	BL,10h
+		MOV	AH,12h
+		INT	10h			; GetEGAInfo()
+
+  @@ColorMono:
+		MOV	DS:MonoMode,BH
+		MOV	AH,1			; no Snow workaround
+		CMP	DS:MonoMode,0
+		JNZ	@@SetSnowMode
+		CMP	DS:SnowMod,1
+		JE	@@SetSnowMode
+		MOV	DX,03DAh
+		MOV	BX,8000h
+		JB	@@RetraceNext
+		CMP	DS:TstEGA,BL
+		JNE	@@SetSnowMode
+
+  @@RetraceNext:
+		STI
+		DEC	BX
+		JE	@@SetSnowMode
+		MOV	CX,7			; Const2_1 ???
+		CLI
+
+  @@RetraceEndWait:
+		IN	AL,DX
+		TEST	AL,1
+		JZ	@@RetraceNext
+		LOOP	@@RetraceEndWait	; test cycle ~30 clocks on 8086
+		MOV	AH,0			; enable Snow workaround
+
+  @@SetSnowMode:
+		STI
+		MOV	DS:SkipCGASnowFix,AH
+		XOR	DI,DI			; Screen Offset
+		MOV	AH,0Fh
+		INT	10h
+		OR	BH,BH
+		JE	@@ScrOffs		; video page 0
+		PUSH	DS
+		MOV	DS,DI
+		MOV	DI,DS:[44Eh]		; BDA.vpage_ofs
+		POP	DS
+
+  @@ScrOffs:
+		MOV	DS:Screen.Offs,DI
+		MOV	BX,0B800h		; Screen Segment
+		CMP	DS:MonoMode,0
+		JZ	@@TopView
+		MOV	BH,0B0h
+
+  @@TopView:
+		MOV	ES,BX			; Virtual screen buffer
+		MOV	AH,0FEh
+		INT	10h			; TopView_GetShadowBuf()
+		MOV	CX,ES
+		PUSH	DS
+		POP	ES
+		MOV	AL,0
+		CMP	CX,BX
+		JE	@@SetSegm
+		MOV	AL,1
+		MOV	DS:SkipCGASnowFix,AL
+
+  @@SetSegm:
+		MOV	DS:Screen.Segm,CX
+		MOV	DS:TopView,AL
+		RET
+ScreenParms	ENDP
+
+;---------------------------------------------------------------
+;	Print string
+;		DS:SI - string
+;---------------------------------------------------------------
+PrintStr	PROC	FAR
+  @@GetChar:	LODSB
+		CMP	AL,0
+		JE	@@Exit
+		MOV	BL,7			; gray on black (not needed for text modes)
+		MOV	AH,0Eh
+		INT	10h
+		JMP	@@GetChar
+  @@Exit:	RET
+PrintStr	ENDP
+
+;---------------------------------------------------------------
+;	Set cursor position
+;		   AL - column, AH - line
+;---------------------------------------------------------------
+gotoxy		PROC	FAR	USES	AX BX DX
+		MOV	DX,AX
+		MOV	AH,0Fh
+		INT	10h			; GetVideoMode(&mode, &vpage, &cols)
+		MOV	AH,2
+		INT	10h			; SetCurPos(vpage, x, y)
+		RET
+gotoxy		ENDP
+
+;---------------------------------------------------------------
+;	Set cursor on command prompt
+;---------------------------------------------------------------
+Cursor1		PROC	FAR	USES	AX
+		MOV	AL,ES:DosCol
+		SUB	AL,ES:OutCol
+		ADD	AL,ES:BegCol
+		MOV	AH,ES:DosLin
+		CALL	gotoxy
+		RET
+Cursor1		ENDP
+
+;---------------------------------------------------------------
+;	Adjust cursor size depending on video mode and display type(LCD)
+;	Return:	CX - cursor size
+;---------------------------------------------------------------
+;
+; GetCurPos(0/*vpage*/, &cursor)
+; if (ScrMod == 7) {
+;     cursor.start = 11
+;     cursor.end = 12
+; } else {
+;     cursor.start = 6
+;     cursor.end = 7
+; }
+; // make cursor more visible on LCD monitor
+; if (DispType == d_LCD) cursor.start = 0
+;
+; SetCurSize(&cursor)
+;
+AdjustCursorSize	PROC	FAR	USES	BX DX BP
+		MOV	BH,0
+		MOV	AH,3
+		INT	10h			; GetCurPos()
+		PUSH	CX
+		MOV	CX,0607h
+		CMP	ES:ScrMod,7
+		JNE	@@CheckLCD
+		MOV	CX,0B0Ch
+
+  @@CheckLCD:
+		CMP	ES:DispType,d_LCD
+		JNE	@@SetCur
+		MOV	CH,0
+
+  @@SetCur:
+		MOV	AH,1
+		INT	10h			; SetCurSize()
+		POP	CX
+		RET
+AdjustCursorSize	ENDP
+
+;---------------------------------------------------------------
+;	Hide cursor - move cursor to row outside screen
+;---------------------------------------------------------------
+HidCur		PROC	FAR	USES	AX
+		MOV	AX,7F00h
+		IFDEF	OFFICIAL
+		CALL	gotoxy
+		ENDIF
+		RET
+HidCur		ENDP
+
+;---------------------------------------------------------------
+;	Beep sound
+;---------------------------------------------------------------
+Beep		PROC	FAR	USES	AX BP DS
+		MOV	DS,CS:DataSegment
+		CMP	DS:ErrSnd,0
+		JE	@@Exit
+		MOV	AX,0E07h
+		INT	10h
+  @@Exit:	RET
+Beep		ENDP
+
+;---------------------------------------------------------------
+;	INT 10h with mouse
+;---------------------------------------------------------------
+Int10m		PROC	FAR	USES	BP
+		PUSH	AX
+		MOV	AL,0
+		CALL	ShowMouse
+		POP	AX
+		INT	10h
+		PUSH	AX
+		MOV	AL,1
+		CALL	ShowMouse
+		POP	AX
+		RET
+Int10m		ENDP
+
+;---------------------------------------------------------------
+;	Convert coordinates to address
+;		BH,BL - y,x coordinates
+;	Return:	ES:DI - address
+;---------------------------------------------------------------
+;
+; return MK_FP(ScreenBuf, (y * Columns + x) * 2)
+;
+BasAdr		PROC	FAR	USES	AX BX
+		MOV	ES,CS:DataSegment
+		MOV	AL,ES:Columns
+		MUL	BH
+		MOV	BH,0
+		ADD	AX,BX
+		ADD	AX,AX
+		MOV	DI,AX
+		MOV	ES,ES:ScreenBuf
+		RET
+BasAdr		ENDP
+
+;---------------------------------------------------------------
+;	Shift windows in EGA lines
+;		   BH - line number
+;	Return:	   BH - corrected line number
+;---------------------------------------------------------------
+SftEGA		PROC	FAR	USES	AX
+		MOV	AL,ES:Lines
+		SUB	AL,25
+		JBE	@@Exit
+		SHR	AL,1
+		ADD	BH,AL
+  @@Exit:	RET
+SftEGA		ENDP
+
+;---------------------------------------------------------------
+;	Save window
+;		BH,BL - begin
+;		DH,DL - size
+;---------------------------------------------------------------
+SavWin		PROC	FAR	USES	AX CX DX SI DI ES DS
+		CLD
+		MOV	DS,CS:DataSegment
+		MOV	DS:Quote,0
+		MOV	AL,DL
+		MUL	DH
+		INC	AX
+		ADD	AX,AX
+		INC	AX
+		MOV	CL,4
+		SHR	AX,CL
+		INC	AX
+		MOV	CX,DS:WindowsPoint
+		SUB	CX,AX			; ???
+		MOV	DS:WindowsPoint,CX
+		MOV	AL,DS:Columns
+		MOV	AH,0
+		ADD	AX,AX
+		CALL	BasAdr
+		PUSH	ES
+		POP	DS
+		MOV	SI,DI
+		MOV	ES,CX
+		MOV	ES:[0],BX
+		MOV	ES:[2],DX
+		MOV	DI,4
+		MOV	CL,DH
+		MOV	CH,0
+		MOV	DH,0
+  @@NextLine:	PUSH	CX
+		PUSH	SI
+		MOV	CX,DX
+		REP	MOVSW
+		POP	SI
+		POP	CX
+		ADD	SI,AX
+		LOOP	@@NextLine
+		RET
+SavWin		ENDP
+
+;---------------------------------------------------------------
+;	Restore window
+;	Return:	BH,BL - begin
+;		DH,DL - size
+;---------------------------------------------------------------
+ResWin		PROC	FAR	USES	AX CX SI DI DS ES
+		CLD
+		MOV	ES,CS:DataSegment
+		MOV	DS,ES:WindowsPoint
+		MOV	ES:Quote,0
+		MOV	BX,DS:[0]
+		MOV	AX,DS:[2]
+		PUSH	AX
+		MUL	AH
+		INC	AX
+		ADD	AX,AX
+		INC	AX
+		MOV	CL,4
+		SHR	AX,CL
+		INC	AX
+		ADD	ES:WindowsPoint,AX
+		MOV	AL,ES:Columns
+		MOV	AH,0
+		ADD	AX,AX
+		MOV	DL,DS:[2]
+		MOV	DH,0
+		MOV	CL,DS:[3]
+		MOV	CH,0
+		CALL	BasAdr
+		MOV	SI,4
+  @@NextLine:	PUSH	CX
+		PUSH	DI
+		MOV	CX,DX
+		REP	MOVSW
+		POP	DI
+		POP	CX
+		ADD	DI,AX
+		LOOP	@@NextLine
+		POP	DX
+		RET
+ResWin		ENDP
+
+;---------------------------------------------------------------
+;	Restore user screen
+;		BH,BL - begin
+;		DH,DL - size
+;---------------------------------------------------------------
+ResUser		PROC	FAR	USES	AX CX DX SI DI DS ES
+		MOV	AL,ES:Columns
+		MOV	AH,0
+		ADD	AX,AX
+		MOV	DS,ES:UserScreen
+		CALL	BasAdr
+		MOV	SI,DI
+		MOV	CL,DH
+		MOV	CH,0
+		MOV	DH,0
+  @@Next:	PUSH	SI
+		PUSH	DI
+		PUSH	CX
+		MOV	CX,DX
+		REP	MOVSW
+		POP	CX
+		POP	DI
+		POP	SI
+		ADD	SI,AX
+		ADD	DI,AX
+		LOOP	@@Next
+		RET
+ResUser		ENDP
+
+;---------------------------------------------------------------
+;	Output window
+;		BH - start y, BL - start x
+;		DH - height, DL - width
+;---------------------------------------------------------------
+;
+; ShowMouse(false)
+; from = BasAdr(x, y)
+; to = MK_FP(FP_SEG(Screen), FP_OFF(Screen) + FP_OFF(from))
+;
+; if (h > 1) {
+;     // copy full rows (set x = 0). Equivalent of BasAdr(0, y)
+;     from = MK_FP(FP_SEG(from), FP_OFF(from) - x * 2)
+;     to = MK_FP(FP_SEG(Screen), FP_OFF(Screen) - x * 2)
+;     MovScr(to, from, Columns/*w*/, h, SkipCGASnowFix)
+; } else { // inlined for single line
+;     for (i = 0; i < w; i += 2) {
+;          if (SkipCGASnowFix == false) {
+;              for (; inp(0x3DA) & 1; ) ; // wait for end of retrace
+;              _disable()
+;              for (; inp(0x3DA) & 1 == 0; ) ; // wait for start of retrace
+;          }
+;          (short)to[i] = (short)from[i]
+;          _enable()
+;     }
+; }
+;
+; if (TopView) TopView_ShadowBuf2Scr(to, w * h)
+; ShowMouse(true)
+;
+Window		PROC	FAR	USES	AX BX CX DX SI DI DS ES
+		MOV	ES,CS:DataSegment
+		PUSH	ES
+		MOV	AL,0
+		CALL	ShowMouse
+		PUSH	ES
+		CALL	BasAdr
+		MOV	SI,DI
+		PUSH	ES
+		POP	DS
+		POP	ES
+		MOV	AL,ES:SkipCGASnowFix
+		MOV	CL,DL			; real_w
+		MOV	DL,ES:Columns		; w = Columns
+		LES	DI,ES:Screen		; to = Screen[0]
+		ADD	DI,SI
+		CMP	DH,1
+		JE	@@OneLine
+		MOV	BH,0
+		ADD	BX,BX
+		SUB	SI,BX
+		SUB	DI,BX			; x = 0 -> copy full rows
+		PUSH	DI			; FP_OFF(to)
+		PUSH	DX			; w, h
+		CALL	MovScr
+		POP	AX
+		MUL	AH
+		MOV	CX,AX			; w * h
+		POP	DI			; FP_OFF(to)
+		JMP	@@ShadowBuf
+
+  @@OneLine:
+		MOV	CH,0
+		PUSH	DI
+		PUSH	CX
+		MOV	AH,AL
+		MOV	DX,03DAh
+
+  @@Next:
+		OR	AH,AH
+		JNZ	@@Move			; SkipCGASnowFix = true
+
+  @@RetraceEndWait:
+		IN	AL,DX
+		TEST	AL,1
+		JNZ	@@RetraceEndWait
+		CLI
+
+  @@RetraceStartWait:
+		IN	AL,DX
+		TEST	AL,1
+		JZ	@@RetraceStartWait
+
+  @@Move:
+		MOVSW
+		STI
+		LOOP	@@Next
+		POP	CX			; w * h
+		POP	DI			; FP_OFF(to)
+
+  @@ShadowBuf:
+		POP	ES
+		CMP	ES:TopView,0
+		JZ	@@MouseOn
+		MOV	AH,0FFh
+		INT	10h			; TopView_ShadowBuf2Scr(to, w * h)
+
+  @@MouseOn:
+		MOV	AL,1
+		CALL	ShowMouse
+		RET
+Window		ENDP
+
+;---------------------------------------------------------------
+;	Save screen
+;---------------------------------------------------------------
+;
+; MovScr(ScreenBuf, Screen, Columns/*w*/, Lines/*h*/, SkipCGASnowFix)
+;
+SavScr		PROC	FAR	USES	AX BX CX DX SI DI DS ES
+		MOV	DS,ES:Screen.Segm
+		MOV	SI,ES:Screen.Offs
+		MOV	DH,ES:Lines
+		MOV	DL,ES:Columns
+		MOV	AL,ES:SkipCGASnowFix
+		MOV	ES,ES:ScreenBuf
+		XOR	DI,DI
+		CALL	MovScr
+		RET
+SavScr		ENDP
+
+;---------------------------------------------------------------
+;	Move screen bytes
+;		   DH - number of lines
+;		   DL - width of screen
+;		   AL - SkipCGASnowFix flag
+;		DS:SI => ES:DI
+;---------------------------------------------------------------
+;
+; while (h > 0) {
+;    rows = (h < 7) ? h : 7 // transfer up to 7 rows in one vertical retrace
+;    scrsize = w * rows
+;    if (SkipCGASnowFix == false) {
+;        for (; inp(0x3DA) & 1; ) ; // wait for end of retrace
+;        for (;;) {
+;             _enable()
+;             _disable()
+;             // wait for start of retrace
+;             if (inp(0x3DA) & 1 == 0) continue
+;             // make sure it's vertical retrace on CRT monitor
+;             for (c = 10; c > 0 && inp(0x3DA) & 1; c--) ;
+;             if (c == 0) break
+;        }
+;    }
+;    memcpy(to, from, scrsize)
+;    _enable()
+;    h -= rows
+; }
+;
+MovScr		PROC	NEAR
+		CLD
+		MOV	BL,AL
+		MOV	BH,7			; Const1 ???
+
+  @@NextBlock:
+		CMP	DH,BH
+		JAE	@@BlockSize
+		MOV	BH,DH
+
+  @@BlockSize:
+		MOV	AL,DL
+		MUL	BH
+		PUSH	AX
+		OR	BL,BL
+		JNZ	@@MoveBlock		; no Snow workaround
+		PUSH	DX
+		MOV	DX,03DAh
+
+  @@RetraceEndWait:
+		IN	AL,DX
+		TEST	AL,1
+		JNZ	@@RetraceEndWait
+
+  @@RetraceStartWait:
+		STI
+		MOV	CX,10			; Const2 ???
+		CLI
+
+  @@InRetrace:
+		IN	AL,DX
+		TEST	AL,1
+		JZ	@@RetraceStartWait
+		LOOP	@@InRetrace
+
+  @@VRetrace:					; display disabled set for too long for horiz. retrace
+		POP	DX
+
+  @@MoveBlock:
+		POP	CX
+		REP	MOVSW
+		STI
+		SUB	DH,BH
+		JNE	@@NextBlock
+		RET
+MovScr		ENDP
+
+;---------------------------------------------------------------
+;	Get color of ui element
+;		   AH - ui element
+;	Return:	   AH - color
+;---------------------------------------------------------------
+Color		PROC	FAR	USES	DI ES
+		MOV	ES,CS:DataSegment
+		CALL	GetColorAddr
+		MOV	AH,ES:[DI]
+		RET
+Color		ENDP
+
+;---------------------------------------------------------------
+;	Get pointer to color of ui element using current palette
+;		   AH - ui element
+;	Return:	   ES:DI - pointer to color
+;---------------------------------------------------------------
+;
+; if (DispType > d_LCD) pal = d_Color
+;
+; // palettes: 0 - Mono(16gray), 1 == 3 - MonoMode, 2 - Color, 4 == 5 - LCD
+; return &ColTab[colorname][pal * 2 + MonoMode]
+;
+GetColorAddr	PROC	FAR	USES	AX
+		MOV	AL,6
+		MUL	AH			; colorname *= 6
+		MOV	DI,AX
+		MOV	AL,ES:DispType
+		CMP	AL,3
+		JB	@@ColOffs
+		MOV	AL,d_Color
+
+  @@ColOffs:
+		CBW
+		ADD	AX,AX			; pal = DispType * 2
+		CMP	ES:MonoMode,0
+		JZ	@@ColAdr
+		INC	AX
+
+  @@ColAdr:
+		ADD	DI,AX
+		ADD	DI,OFFSET ColTab
+		RET
+GetColorAddr	ENDP
+
+;---------------------------------------------------------------
+;	Shadow
+;		ES:DI - address of screen buffer
+;---------------------------------------------------------------
+Shadow		PROC	FAR	USES	AX
+		INC	DI
+		MOV	AH,ShadFl
+		CALL	Color
+		MOV	AL,ES:[DI]
+		CMP	AH,1
+		JB	@@Write
+		PUSHF
+		AND	AL,8Fh
+		XOR	AL,8
+		POPF
+		JE	@@Write
+		MOV	AL,7
+  @@Write:	STOSB
+		RET
+Shadow		ENDP
+
+;---------------------------------------------------------------
+;	Fill with color
+;		   AL - color
+;		ES:DI - buffer to fill
+;---------------------------------------------------------------
+ColorFill	PROC	FAR
+		INC	DI
+		STOSB
+		LOOP	ColorFill
+		RET
+ColorFill	ENDP
+
+;---------------------------------------------------------------
+;	Move ASCIIZ line to screen buffer
+;		DS:SI - line
+;		BH,BL - position to move
+;		   AH - color
+;---------------------------------------------------------------
+WriteCoLnBX	PROC	FAR
+		CALL	BasAdr
+WriteCoLnBX	ENDP
+
+WriteCoLine	PROC	FAR
+		LODSB
+		CMP	AL,0
+		JE	@@Exit
+		STOSW
+		JMP	WriteCoLine
+  @@Exit:	RET
+WriteCoLine	ENDP
+
+;---------------------------------------------------------------
+;	Clear screen line
+;		   BH - line
+;---------------------------------------------------------------
+ClsLine		PROC	FAR	USES	CX DI ES
+		MOV	BL,0
+		CALL	BasAdr
+		MOV	CL,DS:Columns
+		MOV	CH,0
+		MOV	AH,DS:CrntCol
+		MOV	AL,' '
+		REP	STOSW
+		RET
+ClsLine		ENDP
+
+;---------------------------------------------------------------
+;	Blank screen
+;---------------------------------------------------------------
+Blank		PROC	NEAR	USES	AX BX CX DX SI DI BP
+		MOV	AL,0
+		CALL	ShowMouse
+		MOV	AH,0Fh
+		INT	10h
+		MOV	AH,3
+		INT	10h
+		PUSH	CX
+		PUSH	DX
+		MOV	CX,2000h
+		MOV	AH,1
+		INT	10h
+		XOR	CX,CX
+		MOV	DH,DS:Lines
+		MOV	DL,DS:Columns
+		DEC	DH
+		DEC	DL
+		MOV	AH,Sky1_C
+		CALL	Color
+		MOV	BH,AH
+		MOV	AX,600h
+		INT	10h
+		MOV	DI,OFFSET Stars
+		MOV	CX,NmbStrs*SIZE STAR/2
+		XOR	AX,AX
+		REP	STOSW
+		XOR	CX,CX
+		CALL	GetMous
+		MOV	SI,CX
+		CALL	KeybStat
+		MOV	CL,AL
+		XOR	DI,DI
+  @@RndPos:	PUSH	SI
+		PUSH	CX
+		CALL	Rnd
+		MOV	BL,DS:Lines
+		MOV	BH,0
+		MUL	BX
+		MOV	CL,DL
+		CALL	Rnd
+		MOV	BL,DS:Columns
+		MUL	BX
+		MOV	DH,CL
+		CALL	Rnd
+		MOV	CL,3
+		ROR	AX,CL
+		CMP	AL,100
+		JB	@@ChkStars
+		MOV	BL,AL
+		CALL	Rnd
+		MOV	CL,5
+		ROR	AL,CL
+		CMP	AL,50
+		JB	@@ChkStars
+		OR	AL,AH
+		AND	AL,1
+		MOV	BH,AL
+		MOV	SI,OFFSET Stars
+		MOV	CX,NmbStrs
+		XOR	BP,BP
+  @@FindFree:	LODSW
+		OR	AX,AX
+		LODSW
+		JNE	@@CmpPos
+		OR	BP,BP
+		JNE	@@FindNext
+		MOV	BP,SI
+		JMP	@@FindNext
+  @@CmpPos:	CMP	AX,DX
+		JE	@@ChkStars
+  @@FindNext:	LOOP	@@FindFree
+		OR	BP,BP
+		JE	@@ChkStars
+		MOV	DS:[BP-SIZE STAR].StarMod,BX
+		MOV	DS:[BP-SIZE STAR].StarPos,DX
+		MOV	AH,0Fh
+		INT	10h
+		MOV	AH,2
+		INT	10h
+		MOV	AH,Sky1_C
+		CALL	Color
+		MOV	BL,AH
+		MOV	CX,1
+		MOV	AL,DS:StarTab[0]
+		MOV	AH,9
+		INT	10h
+  @@ChkStars:	MOV	SI,OFFSET Stars
+		MOV	CX,NmbStrs
+  @@NextStar:	PUSH	CX
+		LODSW
+		MOV	BX,AX
+		LODSW
+		OR	BX,BX
+		JE	@@SkipStar
+		MOV	DX,AX
+		DEC	BX
+		MOV	DS:[SI-SIZE STAR].StarClk,BL
+		MOV	AL,DS:StarTab[1]
+		CMP	BL,12
+		JE	@@PutStar
+		MOV	AL,DS:StarTab[2]
+		CMP	BL,9
+		JNE	@@ChgStar
+		OR	BH,BH
+		JE	@@PutStar
+		MOV	BL,0
+  @@ChgStar:	MOV	AL,DS:StarTab[3]
+		CMP	BL,6
+		JE	@@PutStar
+		MOV	AL,DS:StarTab[4]
+		CMP	BL,3
+		JE	@@PutStar
+		OR	BL,BL
+		JNE	@@SkipStar
+		XOR	AX,AX
+		MOV	DS:[SI-SIZE STAR].StarMod,AX
+		MOV	DS:[SI-SIZE STAR].StarPos,AX
+		MOV	AL,' '
+  @@PutStar:	PUSH	AX
+		MOV	AH,0Fh
+		INT	10h
+		MOV	AH,2
+		INT	10h
+		POP	AX
+		MOV	AH,Sky2_C
+		CALL	Color
+		MOV	BL,AH
+		MOV	CX,1
+		MOV	AH,9
+		INT	10h
+  @@SkipStar:	POP	CX
+		LOOP	@@NextStar
+		POP	CX
+		POP	SI
+  @@ChkExit:	CALL	GetKey
+		JNZ	@@Exit
+		CALL	KeybStat
+		XCHG	AL,CL
+		AND	AL,0F0h
+		XOR	AL,CL
+		JNZ	@@Exit
+		MOV	BX,CX
+		XOR	AX,AX
+		XOR	CX,CX
+		CALL	GetMous
+		JNZ	@@Exit
+		PUSH	BX
+		MOV	BX,0FCh
+		ADD	BL,DS:Columns
+		MOV	DX,204h
+		CALL	InWind
+		POP	BX
+		JC	@@MouseExit
+		MOV	SI,CX
+  @@MouseExit:	CMP	CX,SI
+		JNE	@@Exit
+		CALL	Timer
+		MOV	CX,BX
+		XCHG	DX,DI
+		CMP	DX,DI
+		JNE	@@RndPos
+		CALL	Yield
+		JMP	@@ChkExit
+  @@Exit:	MOV	AH,0Fh
+		INT	10h
+		POP	DX
+		MOV	AH,2
+		INT	10h
+		POP	CX
+		MOV	AH,1
+		INT	10h
+		MOV	AL,1
+		CALL	ShowMouse
+		RET
+Blank		ENDP
+
+;---------------------------------------------------------------
+;	Pseudo-random number generator
+;	Return: AX - pseudo-random number
+;---------------------------------------------------------------
+;
+; oldRand2 = Rand2
+; Rand2 = (short)(Rand1 * 3 + Rand2 * 3 + 23457)
+; Rand1 = oldRand2
+; return Rand2
+;
+Rnd		PROC	NEAR	USES	BX CX DX
+		MOV	BX,3
+		MOV	AX,ES:Rand1
+		MUL	BX
+		MOV	CX,AX
+		MOV	AX,ES:Rand2
+		MOV	ES:Rand1,AX
+		MUL	BX
+		ADD	AX,CX
+		ADD	AX,23457
+		MOV	ES:Rand2,AX
+		RET
+Rnd		ENDP
