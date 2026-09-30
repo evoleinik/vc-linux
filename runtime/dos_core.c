@@ -704,7 +704,7 @@ int dos_int_other(uint8_t n) {
     }
     case 0x20: terminate(0, 0, 0); return 0;
     case 0x27: terminate(0, 1, (uint16_t)((cpu.d.x + 15) >> 4)); return 0;
-    case 0x28: term_idle(0); return 0;
+    case 0x28: term_idle(5); return 0; /* DOS idle: the program is waiting */
     case 0x2E: {
         uint8_t line[128];
         for (int i = 0; i < 128; i++) line[i] = rd8(cpu.ds, (uint16_t)(cpu.si + i));
@@ -719,7 +719,7 @@ int dos_int_other(uint8_t n) {
         return 0;
     }
     case 0x2F:
-        if (cpu.a.x == 0x1680) { term_idle(1); cpu.a.l = 0; }
+        if (cpu.a.x == 0x1680) { term_idle(10); cpu.a.l = 0; } /* release the time slice: idle */
         else if (cpu.a.x == 0x4300) cpu.a.l = 0;
         return 0;
     case 0x67: cpu.a.h = 0x84; return 0;

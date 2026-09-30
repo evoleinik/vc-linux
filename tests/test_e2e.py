@@ -235,6 +235,45 @@ def test_refuses_to_run_without_a_terminal(work):
     assert b"needs a terminal" in r.stderr
 
 
+def test_delete_directory_symlink_keeps_the_target(work, tmp_path):
+    (work / "real").mkdir()
+    (work / "real" / "precious.txt").write_text("keep me\n")
+    (work / "linkdir").symlink_to("real")
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home)
+    try:
+        s.wait_for("10Quit", timeout=15)
+        select(s, "linkdir")
+        s.send("f8")
+        s.wait_for("Delete", timeout=5)
+        s.send("enter")
+        until(s, lambda: not (work / "linkdir").is_symlink())
+        s.pump(1.0)
+    finally:
+        s.close()
+    assert (work / "real" / "precious.txt").read_text() == "keep me\n"
+
+
+def test_delete_second_of_two_emoji_names(work, tmp_path):
+    (work / "face-😀.txt").write_text("first\n")
+    (work / "face-😃.txt").write_text("second\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home)
+    try:
+        s.wait_for("10Quit", timeout=15)
+        # the two names show as face-■.txt and face-■~1.txt
+        select(s, "■~1.txt")
+        s.send("f8")
+        s.wait_for("Delete", timeout=5)
+        s.send("enter")
+        until(s, lambda: len(list(work.glob("face-*.txt"))) == 1)
+    finally:
+        s.close()
+    assert [p.read_text() for p in work.glob("face-*.txt")] == ["first\n"]
+
+
 def test_mouse_click_moves_the_cursor(vc):
     vc.pump(1.0)  # VC resets the mouse late in start-up; an earlier click is lost, as in DOS
     lines = vc.text().splitlines()

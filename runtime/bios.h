@@ -18,4 +18,8 @@ int bios_blink_enabled(void);
 void bios_mouse_event(unsigned column, unsigned row, unsigned buttons);
 int bios_mouse_cell(unsigned *column, unsigned *row);
 
+/* Counts interrupts other than 16h. rt.c bumps it; the keyboard poll reads it
+ * to tell an idle keyboard spin from a loop that is doing work. */
+extern unsigned hle_other_calls;
+
 #endif

@@ -111,6 +111,8 @@ static void mouse_reset(void)
     mouse.ymax = bios_rows() * 8 - 1;
 }
 
+unsigned hle_other_calls;
+
 void bios_init(void)
 {
     bda_set_word(0x10, 0x0020); /* 80-column colour, no invented peripherals. */
@@ -227,7 +229,20 @@ void bios_int16(void)
     case 0x01:
     case 0x11:
         if (!key_read(function == 0x11, 0, &key)) {
-            term_idle(10);
+            /* Programs also poll here between units of real work, as VC's
+             * tree scan does per directory entry, so an empty poll must not
+             * sleep. Idle loops say so through INT 28h or INT 2Fh AX=1680h,
+             * which sleep instead. Only a loop that does nothing but poll
+             * the keyboard, with no other interrupt in between, is throttled. */
+            static unsigned last_other, spins;
+            int wait = 0;
+            if (hle_other_calls != last_other) {
+                last_other = hle_other_calls;
+                spins = 0;
+            } else if (++spins > 200) {
+                wait = 10;
+            }
+            term_idle(wait);
             if (!key_read(function == 0x11, 0, &key)) {
                 cpu.zf = 1;
                 break;

@@ -797,6 +797,24 @@ static void test_name_boundaries(void)
 
 /* A name that exists exactly as spelled opens without listing its directory,
  * so it works inside an execute-only directory. */
+/* A symlink to an ancestor directory lists as a file, so a recursive walk
+ * cannot loop through it. A symlink elsewhere stays a directory. */
+static void test_ancestor_symlink_lists_as_file(void)
+{
+    char path[PATH_MAX];
+    host_path(path, sizeof path, "loopdir");
+    host_require(mkdir(path, 0755) == 0, "mkdir loop dir");
+    host_path(path, sizeof path, "loopdir/up");
+    host_require(symlink("..", path) == 0, "symlink to parent");
+    host_path(path, sizeof path, "loopdir/elsewhere");
+    host_require(symlink("../xonly", path) == 0, "symlink to a sibling");
+    Found list[16];
+    size_t n = find_entries(1, "loopdir\\*.*", A_DIR | A_HIDDEN | A_SYSTEM, 1, list, 16);
+    const Found *up = found_name(list, n, "up"), *other = found_name(list, n, "elsewhere");
+    CHECK(up && !(up->attrs & A_DIR), "a link to an ancestor is listed as a file");
+    CHECK(other && (other->attrs & A_DIR), "a link to a sibling directory stays a directory");
+}
+
 static void test_execute_only_directory(void)
 {
     char path[PATH_MAX];
@@ -1668,6 +1686,7 @@ int main(void)
     test_name_boundaries();
     test_rmdir_symlinks();
     test_execute_only_directory();
+    test_ancestor_symlink_lists_as_file();
     test_extended_open();
     test_share_modes();
     test_cross_device_rename();

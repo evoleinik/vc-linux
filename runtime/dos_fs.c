@@ -821,18 +821,41 @@ static int split_pattern(const char *dos, char dir[PATH_MAX], char pattern[DOS_N
     return S_ISDIR(st.st_mode) ? 0 : 3;
 }
 
+/* A symlink to a directory that contains it (/proc/1/root points at /) would
+ * send a recursive walk, such as VC's directory tree, round in a circle. Such
+ * a link is listed as a plain file. Opening a path through it still works. */
+static bool links_to_ancestor(const char *dir_real, const char *path, const struct stat *st)
+{
+    struct stat lst;
+    if (!S_ISDIR(st->st_mode) || lstat(path, &lst) != 0 || !S_ISLNK(lst.st_mode) || !dir_real)
+        return false;
+    char *target = realpath(path, NULL);
+    if (!target) return false;
+    size_t n = strlen(target);
+    bool ancestor = !strcmp(target, "/") ||
+                    (!strncmp(dir_real, target, n) && (dir_real[n] == '/' || dir_real[n] == 0));
+    free(target);
+    return ancestor;
+}
+
 static int snapshot(const char *dir, Entry **entries, size_t *count)
 {
     int error = list_directory(dir, entries, count);
     if (error) return error;
+    char *dir_real = realpath(dir, NULL);
     for (size_t i = 0; i < *count; ++i) {
         Entry *e = *entries + i;
         char path[PATH_MAX];
         if (join_path(dir, e->host, path, sizeof(path)) || file_stat(path, &e->st)) continue;
+        if (links_to_ancestor(dir_real, path, &e->st)) {
+            e->st.st_mode = (e->st.st_mode & 07777) | S_IFREG;
+            e->st.st_size = 0;
+        }
         e->attr = file_attr(path, &e->st);
         e->birth = birth_time(path, -1, &e->st);
         e->have_stat = true;
     }
+    free(dir_real);
     return 0;
 }
 

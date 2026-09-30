@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include "bios.h"
 #include "hle.h"
 #include "rt.h"
 
@@ -211,19 +212,24 @@ static void note_moved(Known *k, uint32_t off, uint32_t L) {
     if (nmoved < MAX_MOVED) moved[nmoved++] = (Moved){L, k->img, off};
 }
 
+static uint64_t n_dispatch, n_direct, n_cached, n_delta, n_search;
+
 static int run_at(uint32_t L) {
+    n_dispatch++;
     for (int i = nknown - 1; i >= 0; i--) {
         Known *k = &known[i];
         if (L < k->base || L >= k->base + k->img->size) continue;
         uint32_t off = L - k->base;
         uint32_t n = k->img->size - off < 6 ? k->img->size - off : 6;
-        if (memcmp(&mem[L], &k->snap[off], n) == 0 && k->img->run(off, k->loadseg) == 0) return 1;
+        if (memcmp(&mem[L], &k->snap[off], n) == 0 && k->img->run(off, k->loadseg) == 0) { n_direct++; return 1; }
     }
     for (int i = 0; i < nmoved; i++) {
         Moved *m = &moved[i];
         Known *k = find_known(m->img);
-        if (m->lin == L && memcmp(&mem[L], &k->snap[m->off], 3) == 0)
+        if (m->lin == L && memcmp(&mem[L], &k->snap[m->off], 3) == 0) {
+            n_cached++;
             return run_moved(k, m->off, L) == 0;
+        }
     }
     /* A copy we already know: the same offset, and at least 3 matching bytes
      * at an instruction start. A block's last instruction is followed by
@@ -233,10 +239,11 @@ static int run_at(uint32_t L) {
         for (int j = 0; j < k->ndeltas; j++) {
             int64_t off = (int64_t)L - k->deltas[j] - k->base;
             if (off < 0 || off + 3 > k->img->size || memcmp(&mem[L], &k->snap[off], 3)) continue;
-            if (run_moved(k, (uint32_t)off, L) == 0) { note_moved(k, (uint32_t)off, L); return 1; }
+            if (run_moved(k, (uint32_t)off, L) == 0) { n_delta++; note_moved(k, (uint32_t)off, L); return 1; }
         }
     }
     const uint32_t K = 12;
+    n_search++;
     for (int i = nknown - 1; i >= 0; i--) {
         Known *k = &known[i];
         for (uint32_t off = 0; off + K <= k->img->size; off++) {
@@ -267,6 +274,7 @@ static void unimplemented_21(void) {
 }
 
 static int do_int(uint8_t n) {
+    if (n != 0x16) hle_other_calls++;
     switch (n) {
     case 0x10: bios_int10(); return 0;
     case 0x16: bios_int16(); return 0;
@@ -339,7 +347,9 @@ static void dump_recent(void) {
     dump_requested = 0;
     FILE *f = log_open();
     if (!f) return;
-    fprintf(f, "state on SIGUSR1:\n");
+    fprintf(f, "state on SIGUSR1: dispatches %llu direct %llu cached-moved %llu by-offset %llu searched %llu, moved table %d\n",
+            (unsigned long long)n_dispatch, (unsigned long long)n_direct, (unsigned long long)n_cached,
+            (unsigned long long)n_delta, (unsigned long long)n_search, nmoved);
     dump_state(f);
     fprintf(f, "last dispatches (oldest first):");
     for (unsigned i = 0; i < 256; i++) {
