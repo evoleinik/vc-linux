@@ -16,10 +16,18 @@ Design and decisions: `docs/plans/2026-09-30-native-port.md`.
 It needs a terminal of at least 80x25. For the exact VGA colours, set `COLORTERM=truecolor`.
 Settings live in `~/.config/vc-linux/` and a log goes to `~/.cache/vc-linux/vc.log`.
 
-What works: both panels on real files with long and Cyrillic names, view (F3), edit (F4), copy
-(F5), rename and move (F6), make directory (F7), delete (F8), menus and dialogs, the mouse, and
-commands typed on VC's command line. Those run in `/bin/sh` with the terminal handed back, and
-`cd` changes VC's directory the way `COMMAND.COM` did.
+What works: both panels on real files with long and Cyrillic names, view (F3), edit (F4, opens
+`$EDITOR`), copy (F5), rename and move (F6), make directory (F7), delete (F8), menus and dialogs,
+the mouse, and commands typed on VC's command line. Those run in `/bin/sh` with the terminal
+handed back, and `cd` changes VC's directory the way `COMMAND.COM` did.
+
+VC 4.99.09's own editor is switched off in its source, so F4 uses `VCEDIT.EXT`, which maps every
+file to the internal `vc-edit` command. That command hands the file name to `$EDITOR` as a single
+argument, never through a shell.
+
+**Careful with your own `VC.EXT` or `VCEDIT.EXT` entries.** VC pastes the file name in place of
+`!.!` and the line runs through `/bin/sh`, so a file named `$(rm -rf ~).zip` would run that
+command. The shipped `VC.EXT` is empty for that reason.
 
 Drive `C:` is `/`. Names are shown in code page 866.
 

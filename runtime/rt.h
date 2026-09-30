@@ -31,8 +31,8 @@ int dos_core_int21(void);
 /* Handle a software interrupt other than 10h, 16h, 21h and 33h.
  * Returns 1 if the stub should return with a full IRET, 0 for RETF 2. */
 int dos_int_other(uint8_t n);
-/* Load VC.COM as the first process. dos_prog is its DOS path. */
-void dos_start(const char *dos_prog, const uint8_t *tail, int tail_len);
+/* Load VC.COM as the first process. host_prog is where it lives on Linux. */
+void dos_start(const char *host_prog, const uint8_t *tail, int tail_len);
 
 /* Default setup files and images embedded in the binary: build/gen/files.c */
 typedef struct { const char *name; const uint8_t *data; uint32_t size; } EmbeddedFile;

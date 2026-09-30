@@ -1,6 +1,7 @@
 /* vc: Volkov Commander, translated. Sets up the machine, the config directory
  * and the terminal, starts VC.COM as the first DOS process and runs it. */
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,13 @@ int main(int argc, char **argv) {
         usage();
         return argc > 2 ? 2 : 0;
     }
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        fputs("vc: needs a terminal on stdin and stdout\n", stderr);
+        return 2;
+    }
+    /* Shell commands are our children and we wait for them. An inherited
+     * SIG_IGN would make the kernel reap them first. */
+    signal(SIGCHLD, SIG_DFL);
     if (argc == 2 && chdir(argv[1])) {
         fprintf(stderr, "vc: %s: %s\n", argv[1], strerror(errno));
         return 1;
@@ -66,24 +74,19 @@ int main(int argc, char **argv) {
     }
     install_files(dir);
 
-    char dos_prog[4200];
-    snprintf(dos_prog, sizeof dos_prog, "C:%s/VC.COM", dir);
-    for (char *p = dos_prog; *p; p++) if (*p == '/') *p = '\\';
-    if (strlen(dos_prog) > 120) {
-        fprintf(stderr, "vc: config path too long for DOS: %s\n", dir);
-        return 1;
-    }
+    char host_prog[4200];
+    snprintf(host_prog, sizeof host_prog, "%s/VC.COM", dir);
 
     dos_core_init();
     bios_init();
     dos_fs_init();
     term_init();
     atexit(term_shutdown);
-    rt_log("start: %s", dos_prog);
+    rt_log("start: %s", host_prog);
     /* Base-memory mode: no swap file, no EMS or XMS to find. The TSR manager
      * guards against DOS programs that stay resident, which cannot happen here. */
     static const char tail[] = " /std /notsr";
-    dos_start(dos_prog, (const uint8_t *)tail, (int)sizeof tail - 1);
+    dos_start(host_prog, (const uint8_t *)tail, (int)sizeof tail - 1);
     rt_run();
     term_shutdown();
     return rt_exit_code;

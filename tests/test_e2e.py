@@ -166,23 +166,73 @@ def test_delete(vc, work):
     assert not (work / "hello.txt").exists()
 
 
-def test_f4_opens_the_editor_from_EDITOR(work, tmp_path):
-    # VC 4.99.09's own editor is switched off in its source (VCEDIT.INC jumps
-    # straight to "Can't find the file"), so F4 must go through VCEDIT.EXT.
+def fake_editor(tmp_path: Path) -> Path:
     editor = tmp_path / "fake-editor"
-    editor.write_text('#!/bin/sh\necho "edited by $0" >> "$1"\n')
+    editor.write_text('#!/bin/sh\nprintf "%s\\n" "$1" > "$0.args"\necho "edited" >> "$1"\n')
     editor.chmod(0o755)
+    return editor
+
+
+@pytest.mark.parametrize("name", ["a long file name.markdown", "$(touch pwned).txt"])
+def test_f4_opens_EDITOR_with_the_exact_name(work, tmp_path, name):
+    # VC 4.99.09's own editor is switched off in its source (VCEDIT.INC jumps
+    # straight to "Can't find the file"), so F4 goes through VCEDIT.EXT. The
+    # name must reach the editor as one argument that no shell has parsed.
+    (work / name).write_text("text\n")
+    editor = fake_editor(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
     s = VcSession(work, home, extra_env={"EDITOR": str(editor)})
     try:
         s.wait_for("10Quit", timeout=15)
-        select(s, "a long file name.markdown")
+        select(s, name)
         s.send("f4")
-        until(s, lambda: "edited by" in (work / "a long file name.markdown").read_text())
+        until(s, lambda: "edited" in (work / name).read_text())
         s.wait_for("10Quit", timeout=5)
     finally:
         s.close()
+    assert Path(str(editor) + ".args").read_text() == name + "\n"
+    assert not (work / "pwned").exists()
+
+
+def test_cd_accepts_a_quoted_path(vc, work):
+    (work / "sub dir").mkdir()
+    vc.send(b'cd "sub dir"', "enter")
+    vc.wait_for("sub dir>", timeout=5)
+
+
+def test_cd_to_an_oversized_path_leaves_vc_working(work, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home, extra_env={"HOME": "/" + "h" * 300})
+    try:
+        s.wait_for("10Quit", timeout=15)
+        s.send(b"cd", "enter")
+        s.wait_for("10Quit", timeout=5)
+        s.send("f7")
+        s.wait_for("Make directory", timeout=5)
+        s.send(b"after", "enter")
+        until(s, lambda: (work / "after").is_dir())
+    finally:
+        s.close()
+
+
+def test_config_dir_with_cyrillic_name(work, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home, extra_env={"XDG_CONFIG_HOME": str(tmp_path / "конфиг")})
+    try:
+        s.wait_for("10Quit", timeout=15)
+        assert "hello.txt" in s.text()
+    finally:
+        s.close()
+
+
+def test_refuses_to_run_without_a_terminal(work):
+    import subprocess
+    r = subprocess.run([str(VC)], cwd=work, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    assert r.returncode == 2
+    assert b"needs a terminal" in r.stderr
 
 
 def test_mouse_click_moves_the_cursor(vc):

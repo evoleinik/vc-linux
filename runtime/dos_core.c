@@ -5,6 +5,7 @@
  * Everything VC can see is real bytes in `mem`: the MCB chain, PSPs, the
  * List of Lists. VC edits MCB headers directly and walks the chain itself,
  * so this code reads the chain back from memory every time. */
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,10 +269,8 @@ static void build_psp(uint16_t psp, uint16_t end_seg, uint16_t env, uint16_t par
 
 /* Allocate, build the PSP, copy and relocate the image, set the entry
  * registers. Returns 0 or a DOS error. */
-static int load_image(const Image *img, uint16_t env_strings_seg, const uint8_t *tail,
+static int load_image(const Image *img, const char *envbuf, size_t elen, const uint8_t *tail,
                       const char *dos_prog, uint16_t parent, uint16_t term_cs, uint16_t term_ip) {
-    char envbuf[32768];
-    size_t elen = env_strings_seg ? env_strings(env_strings_seg, envbuf, sizeof envbuf) : 0;
     uint32_t img_paras = (img->size + 15) / 16;
     uint32_t need, want;
     if (img->is_exe) {
@@ -352,10 +351,14 @@ static int host_cwd(char *out, size_t cap) {
     return dos_fs_to_host(DOS_SEG, SCRATCH_OFF, out, cap);
 }
 
-static int host_run(const char *cmd) {
+/* Run `script` with /bin/sh in the DOS current directory, the terminal handed
+ * back while it runs. Values that come from file names are never pasted into
+ * the script: they go in as positional arguments ($0, $1), which the shell
+ * does not parse. */
+static int host_run(const char *script, const char *arg0, const char *arg1) {
     char cwd[4096];
     if (host_cwd(cwd, sizeof cwd)) strcpy(cwd, "/");
-    rt_log("run: %s (in %s)", cmd, cwd);
+    rt_log("run: %s%s%s (in %s)", script, arg1 ? " -- " : "", arg1 ? arg1 : "", cwd);
     term_suspend();
     struct sigaction ign = {.sa_handler = SIG_IGN}, oint, oquit;
     sigaction(SIGINT, &ign, &oint);
@@ -366,13 +369,15 @@ static int host_run(const char *cmd) {
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
         if (chdir(cwd) != 0) _exit(126);
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        execl("/bin/sh", "sh", "-c", script, arg0 ? arg0 : "sh", arg1, (char *)NULL);
         _exit(127);
     }
     if (pid > 0) {
-        int st;
-        while (waitpid(pid, &st, 0) < 0) ;
-        status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+        int st = 0;
+        pid_t r;
+        while ((r = waitpid(pid, &st, 0)) < 0 && errno == EINTR) ;
+        if (r == pid) status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+        else rt_log("waitpid: %s", strerror(errno));
     }
     sigaction(SIGINT, &oint, NULL);
     sigaction(SIGQUIT, &oquit, NULL);
@@ -380,49 +385,78 @@ static int host_run(const char *cmd) {
     return status;
 }
 
+/* UTF-8 path to a NUL-terminated DOS path in code page 866, `/` becoming `\`.
+ * Returns 0, or -1 if it does not fit in cap or has a character CP866 lacks. */
+static int utf8_to_dos(const char *path, uint8_t *dos, size_t cap) {
+    size_t n = 0;
+    if (path[0] == '/') {
+        if (cap < 3) return -1;
+        dos[n++] = 'C';
+        dos[n++] = ':';
+    }
+    for (const unsigned char *p = (const unsigned char *)path; *p;) {
+        uint32_t u = *p++;
+        if (u >= 0xC0) {
+            int more = u >= 0xF0 ? 3 : u >= 0xE0 ? 2 : 1;
+            u &= 0x3Fu >> more;
+            while (more-- && (*p & 0xC0) == 0x80) u = u << 6 | (*p++ & 0x3F);
+        }
+        int c = u == '/' ? '\\' : ucs_to_cp866(u);
+        if (c < 0 || n + 1 >= cap) return -1;
+        dos[n++] = (uint8_t)c;
+    }
+    dos[n] = 0;
+    return 0;
+}
+
 /* COMMAND.COM ran `cd` itself, changing the DOS current directory, and VC's
  * panel follows it. A child shell cannot do that for us, so do it here.
- * Linux forms work too: `cd` alone and `~` mean $HOME, `/` separates.
+ * Linux forms work too: `cd` alone and `~` mean $HOME, `/` separates, and one
+ * argument may be quoted. Anything shell-like goes to the shell instead.
  * Returns -1 if cmd is not a plain cd, else its exit status. */
 static int internal_cd(const char *cmd) {
     while (*cmd == ' ') cmd++;
     size_t kw = !strncasecmp(cmd, "chdir", 5) ? 5 : !strncasecmp(cmd, "cd", 2) ? 2 : 0;
     if (!kw || (cmd[kw] && cmd[kw] != ' ' && cmd[kw] != '\\' && cmd[kw] != '/' && cmd[kw] != '.'))
         return -1;
-    if (strpbrk(cmd, ";&|<>`$(){}*?\"'")) return -1;
     const char *arg = cmd + kw;
     while (*arg == ' ') arg++;
-    char path[1024];
     size_t alen = strlen(arg);
     while (alen && arg[alen - 1] == ' ') alen--;
-    const char *home = getenv("HOME");
-    if (alen == 0) snprintf(path, sizeof path, "%s", home ? home : "/");
-    else if (arg[0] == '~' && (alen == 1 || arg[1] == '/'))
-        snprintf(path, sizeof path, "%s%.*s", home ? home : "", (int)alen - 1, arg + 1);
-    else snprintf(path, sizeof path, "%.*s", (int)alen, arg);
-    /* to a DOS path in code page 866 */
-    uint8_t dos[260];
-    size_t n = 0;
-    if (path[0] == '/' && n + 2 < sizeof dos) { dos[n++] = 'C'; dos[n++] = ':'; }
-    for (const unsigned char *p = (const unsigned char *)path; *p && n + 1 < sizeof dos;) {
-        uint32_t u = *p++;
-        if (u >= 0xC0) {
-            int more = u >= 0xF0 ? 3 : u >= 0xE0 ? 2 : 1;
-            u &= 0x3F >> more;
-            while (more-- && (*p & 0xC0) == 0x80) u = u << 6 | (*p++ & 0x3F);
-        }
-        int c = u == '/' ? '\\' : ucs_to_cp866(u);
-        dos[n++] = (uint8_t)(c < 0 ? '?' : c);
+    char word[1024];
+    if (alen >= sizeof word) return -1;
+    if (alen >= 2 && (arg[0] == '"' || arg[0] == '\'') && arg[alen - 1] == arg[0]) {
+        /* one quoted word: no other quote of that kind inside, and inside
+         * double quotes nothing the shell would expand */
+        memcpy(word, arg + 1, alen - 2);
+        word[alen - 2] = 0;
+        if (strchr(word, arg[0]) || (arg[0] == '"' && strpbrk(word, "$`\\"))) return -1;
+    } else {
+        memcpy(word, arg, alen);
+        word[alen] = 0;
+        if (strpbrk(word, ";&|<>`$(){}*?\"' \t")) return -1;
     }
-    dos[n] = 0;
-    for (size_t i = 0; i <= n; i++) wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), dos[i]);
-    Cpu save = cpu;
-    cpu.a.x = 0x713B;
-    cpu.ds = DOS_SEG;
-    cpu.d.x = SCRATCH_OFF;
-    dos_fs_int21();
-    int failed = cpu.cf;
-    cpu = save;
+    char path[2048];
+    const char *home = getenv("HOME");
+    if (!word[0]) snprintf(path, sizeof path, "%s", home ? home : "/");
+    else if (word[0] == '~' && (!word[1] || word[1] == '/'))
+        snprintf(path, sizeof path, "%s%s", home ? home : "", word + 1);
+    else snprintf(path, sizeof path, "%s", word);
+    uint8_t dos[256]; /* the scratch area holds 256 bytes */
+    int failed = utf8_to_dos(path, dos, sizeof dos) != 0;
+    if (!failed) {
+        for (size_t i = 0; i < sizeof dos; i++) {
+            wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), dos[i]);
+            if (!dos[i]) break;
+        }
+        Cpu save = cpu;
+        cpu.a.x = 0x713B;
+        cpu.ds = DOS_SEG;
+        cpu.d.x = SCRATCH_OFF;
+        dos_fs_int21();
+        failed = cpu.cf;
+        cpu = save;
+    }
     if (failed) {
         static const char msg[] = "Invalid directory\r\n";
         con_write((const uint8_t *)msg, sizeof msg - 1);
@@ -431,23 +465,38 @@ static int internal_cd(const char *cmd) {
     return failed;
 }
 
-/* A DOS command tail (count byte, text) to a host command line. "/C cmd"
- * means run cmd with the shell. Anything else runs the program itself. */
+/* data/VCEDIT.EXT maps every file to `vc-edit !.!`. VC puts the file name in
+ * place of !.!, and everything after the word is taken as that one name, so
+ * no shell ever parses it: `$(id).txt` stays a file name. */
+static const char EDIT_WORD[] = "vc-edit ";
+
+/* A DOS command tail (count byte, text) to a host command. "/C cmd" means run
+ * cmd with the shell. Anything else runs the program itself. */
 static int exec_host(const char *host_prog, const uint8_t *tail) {
     uint8_t n = tail[0] > 126 ? 126 : tail[0];
     char text[1024];
     cp866_to_utf8(tail + 1, n, text, sizeof text);
+    char *cr = strchr(text, '\r');
+    if (cr) *cr = 0;
     char *t = text;
     while (*t == ' ' || *t == '\t') t++;
-    char cmd[4096];
     if ((t[0] == '/' || t[0] == '-') && (t[1] == 'c' || t[1] == 'C') && (t[2] == ' ' || t[2] == 0)) {
-        int cd = internal_cd(t + 2);
+        char *cmd = t + 2;
+        while (*cmd == ' ') cmd++;
+        int cd = internal_cd(cmd);
         if (cd >= 0) return cd;
-        snprintf(cmd, sizeof cmd, "%s", t + 2);
-    } else {
-        snprintf(cmd, sizeof cmd, "'%s' %s", host_prog, t);
+        if (!strncmp(cmd, EDIT_WORD, sizeof EDIT_WORD - 1)) {
+            char *name = cmd + sizeof EDIT_WORD - 1;
+            size_t len = strlen(name);
+            while (len && name[len - 1] == ' ') name[--len] = 0;
+            return host_run("exec ${EDITOR:-vi} \"$1\"", "vc-edit", name);
+        }
+        return host_run(cmd, NULL, NULL);
     }
-    return host_run(cmd);
+    /* the program's own path comes in as $0, the DOS command tail follows */
+    char script[1100];
+    snprintf(script, sizeof script, "exec \"$0\" %s", t);
+    return host_run(script, host_prog, NULL);
 }
 
 /* ---- EXEC and terminate --------------------------------------------------- */
@@ -483,7 +532,9 @@ static void do_exec(void) {
     get_dta(&p->dta_seg, &p->dta_off);
     uint16_t ret_ip = rd16(cpu.ss, cpu.sp), ret_cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
     uint16_t parent_psp = cur_psp;
-    int err = load_image(img, envseg ? envseg : rd16(cur_psp, 0x2C), tail, dos_prog, parent_psp, ret_cs, ret_ip);
+    static char envbuf[32768];
+    size_t elen = env_strings(envseg ? envseg : rd16(cur_psp, 0x2C), envbuf, sizeof envbuf);
+    int err = load_image(img, envbuf, elen, tail, dos_prog, parent_psp, ret_cs, ret_ip);
     if (err) { cpu = p->parent; fail((uint16_t)err); return; }
     p->child = cur_psp;
     nprocs++;
@@ -663,7 +714,7 @@ int dos_int_other(uint8_t n) {
         char *cr = strchr(cmd, '\r');
         if (cr) *cr = 0;
         int cd = internal_cd(cmd);
-        last_retcode = (uint16_t)((cd >= 0 ? cd : host_run(cmd)) & 0xFF);
+        last_retcode = (uint16_t)((cd >= 0 ? cd : host_run(cmd, NULL, NULL)) & 0xFF);
         cpu.a.x = 0;
         return 0;
     }
@@ -679,31 +730,27 @@ int dos_int_other(uint8_t n) {
 
 /* ---- the first process ---------------------------------------------------- */
 
-void dos_start(const char *dos_prog, const uint8_t *tail, int tail_len) {
+void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
+    uint8_t dos_prog[128];
+    if (utf8_to_dos(host_prog, dos_prog, sizeof dos_prog))
+        rt_fault("%s: path too long for DOS or not representable in code page 866", host_prog);
+
     char env[2048];
     size_t n = 0;
+    char tmpdos[160] = "C:\\tmp";
     const char *tmp = getenv("TMPDIR");
-    char tmpdos[512] = "C:\\tmp";
-    if (tmp && tmp[0] == '/') {
-        snprintf(tmpdos, sizeof tmpdos, "C:%s", tmp);
-        for (char *p = tmpdos; *p; p++) if (*p == '/') *p = '\\';
-    }
+    uint8_t conv[128];
+    if (tmp && tmp[0] == '/' && !utf8_to_dos(tmp, conv, sizeof conv)) snprintf(tmpdos, sizeof tmpdos, "%s", conv);
     const char *vars[] = {"COMSPEC=C:\\bin\\sh", "PATH=C:\\", "PROMPT=$P$G", NULL};
     for (int i = 0; vars[i]; i++) n += (size_t)snprintf(env + n, sizeof env - n, "%s", vars[i]) + 1;
     n += (size_t)snprintf(env + n, sizeof env - n, "TEMP=%s", tmpdos) + 1;
     n += (size_t)snprintf(env + n, sizeof env - n, "TMP=%s", tmpdos) + 1;
-
-    uint16_t envseg, largest;
-    if (mem_alloc((uint16_t)((n + 1 + 15) / 16), 0, &envseg, &largest)) rt_fault("no memory for the environment");
-    memcpy(&mem[(uint32_t)envseg << 4], env, n);
-    mem[((uint32_t)envseg << 4) + n] = 0;
 
     uint8_t t[128] = {0};
     if (tail_len > 126) tail_len = 126;
     t[0] = (uint8_t)tail_len;
     memcpy(t + 1, tail, (size_t)tail_len);
     t[1 + tail_len] = 0x0D;
-    if (load_image(&image_vc_com, envseg, t, dos_prog, 0, STUB_SEG, STUB_EXIT))
+    if (load_image(&image_vc_com, env, n, t, (const char *)dos_prog, 0, STUB_SEG, STUB_EXIT))
         rt_fault("cannot load VC.COM");
-    mem_free(envseg);
 }
