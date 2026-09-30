@@ -15,7 +15,6 @@
 void dos_casemap_upper(void); /* dos_fs.c */
 
 int hle_redirect;
-int32_t rt_code_delta;
 int rt_exited;
 int rt_exit_code;
 
@@ -79,7 +78,6 @@ _Noreturn void rt_fault(const char *fmt, ...) {
 
 /* ---- clock and yielding -------------------------------------------------- */
 
-int32_t rt_budget = 20000;
 static struct timespec last_idle;
 static int last_mday = -1;
 
@@ -135,70 +133,109 @@ void port_out16(uint16_t port, uint16_t v) { port_out8(port, (uint8_t)v); port_o
 
 /* ---- loaded images ------------------------------------------------------- */
 
+/* One entry per image, kept after its memory is reused: a program may keep
+ * running routines it copied elsewhere, and those are found by matching their
+ * bytes against `snap`, the image as it was last loaded and relocated. */
+/* Code the program copied elsewhere: where it runs, and what it is a copy of. */
+typedef struct { uint32_t lin; const Image *img; uint32_t off; } Moved;
+#define MAX_MOVED 256
+static Moved moved[MAX_MOVED];
+static int nmoved;
+static void nmoved_reset(void) { nmoved = 0; }
+
 typedef struct {
     const Image *img;
     uint16_t loadseg;
     uint32_t base;
-    uint8_t *snap; /* the image as loaded and relocated, to validate entries */
-} Inst;
+    uint8_t *snap;
+    int32_t deltas[8]; /* offsets of copies seen so far */
+    int ndeltas;
+} Known;
 
-#define MAX_INST 4
-static Inst insts[MAX_INST];
-static int ninst;
+#define MAX_KNOWN 4
+static Known known[MAX_KNOWN];
+static int nknown;
 
 void rt_register_image(const Image *img, uint16_t loadseg) {
     uint32_t base = (uint32_t)loadseg << 4;
-    for (int i = 0; i < ninst;) {
-        Inst *o = &insts[i];
-        if (o->img == img || (base < o->base + o->img->size && o->base < base + img->size)) {
-            free(o->snap);
-            insts[i] = insts[--ninst];
-        } else i++;
+    Known *k = NULL;
+    for (int i = 0; i < nknown; i++) if (known[i].img == img) k = &known[i];
+    if (!k) {
+        if (nknown == MAX_KNOWN) rt_fault("too many images");
+        k = &known[nknown++];
+        k->img = img;
+        k->snap = malloc(img->size);
     }
-    if (ninst == MAX_INST) rt_fault("too many loaded images");
-    Inst *in = &insts[ninst++];
-    in->img = img;
-    in->loadseg = loadseg;
-    in->base = base;
-    in->snap = malloc(img->size);
-    memcpy(in->snap, &mem[base], img->size);
+    k->loadseg = loadseg;
+    k->base = base;
+    k->ndeltas = 0;
+    /* Newest first, so the byte check below prefers the image loaded last
+     * where an old one's area was reused. */
+    Known t = *k;
+    *k = known[nknown - 1];
+    known[nknown - 1] = t;
+    k = &known[nknown - 1];
+    nmoved_reset();
+    memcpy(k->snap, &mem[base], img->size);
     rt_log("loaded %s at %04X (linear %05X, %u bytes)", img->name, loadseg, base, img->size);
 }
 
-/* Code the program copied elsewhere: find its bytes in a loaded image. */
-typedef struct { uint32_t lin; Inst *in; uint32_t off; } Moved;
-static Moved moved[64];
-static int nmoved;
 
-static int run_moved(Inst *in, uint32_t off, uint32_t L) {
-    rt_code_delta = (int32_t)(L - (in->base + off));
-    int r = in->img->run(off, in->loadseg);
+static int run_moved(Known *k, uint32_t off, uint32_t L) {
+    rt_code_delta = (int32_t)(L - (k->base + off));
+    int r = k->img->run(off, k->loadseg);
     rt_code_delta = 0;
     return r;
 }
 
+static Known *find_known(const Image *img) {
+    for (int i = 0; i < nknown; i++) if (known[i].img == img) return &known[i];
+    return NULL;
+}
+
+static void note_moved(Known *k, uint32_t off, uint32_t L) {
+    int32_t d = (int32_t)(L - (k->base + off));
+    int seen = 0;
+    for (int i = 0; i < k->ndeltas; i++) seen |= k->deltas[i] == d;
+    if (!seen && k->ndeltas < 8) {
+        k->deltas[k->ndeltas++] = d;
+        rt_log("%s copy at offset %+d (first seen at %05X)", k->img->name, d, L);
+    }
+    if (nmoved < MAX_MOVED) moved[nmoved++] = (Moved){L, k->img, off};
+}
+
 static int run_at(uint32_t L) {
-    for (int i = 0; i < ninst; i++) {
-        Inst *in = &insts[i];
-        if (L < in->base || L >= in->base + in->img->size) continue;
-        uint32_t off = L - in->base;
-        uint32_t n = in->img->size - off < 6 ? in->img->size - off : 6;
-        if (memcmp(&mem[L], &in->snap[off], n) == 0)
-            return in->img->run(off, in->loadseg) == 0;
+    for (int i = nknown - 1; i >= 0; i--) {
+        Known *k = &known[i];
+        if (L < k->base || L >= k->base + k->img->size) continue;
+        uint32_t off = L - k->base;
+        uint32_t n = k->img->size - off < 6 ? k->img->size - off : 6;
+        if (memcmp(&mem[L], &k->snap[off], n) == 0 && k->img->run(off, k->loadseg) == 0) return 1;
     }
     for (int i = 0; i < nmoved; i++) {
         Moved *m = &moved[i];
-        if (m->lin == L && memcmp(&mem[L], &m->in->snap[m->off], 6) == 0)
-            return run_moved(m->in, m->off, L) == 0;
+        Known *k = find_known(m->img);
+        if (m->lin == L && memcmp(&mem[L], &k->snap[m->off], 3) == 0)
+            return run_moved(k, m->off, L) == 0;
+    }
+    /* A copy we already know: the same offset, and at least 3 matching bytes
+     * at an instruction start. A block's last instruction is followed by
+     * different bytes in the copy, so a longer match cannot be required. */
+    for (int i = nknown - 1; i >= 0; i--) {
+        Known *k = &known[i];
+        for (int j = 0; j < k->ndeltas; j++) {
+            int64_t off = (int64_t)L - k->deltas[j] - k->base;
+            if (off < 0 || off + 3 > k->img->size || memcmp(&mem[L], &k->snap[off], 3)) continue;
+            if (run_moved(k, (uint32_t)off, L) == 0) { note_moved(k, (uint32_t)off, L); return 1; }
+        }
     }
     const uint32_t K = 12;
-    for (int i = 0; i < ninst; i++) {
-        Inst *in = &insts[i];
-        for (uint32_t off = 0; off + K <= in->img->size; off++) {
-            if (in->snap[off] != mem[L] || memcmp(&in->snap[off], &mem[L], K) != 0) continue;
-            if (run_moved(in, off, L) != 0) continue; /* not an instruction start */
-            rt_log("moved code at %05X runs %s+%05X", L, in->img->name, off);
-            if (nmoved < 64) moved[nmoved++] = (Moved){L, in, off};
+    for (int i = nknown - 1; i >= 0; i--) {
+        Known *k = &known[i];
+        for (uint32_t off = 0; off + K <= k->img->size; off++) {
+            if (k->snap[off] != mem[L] || memcmp(&k->snap[off], &mem[L], K) != 0) continue;
+            if (run_moved(k, off, L) != 0) continue; /* not an instruction start */
+            note_moved(k, off, L);
             return 1;
         }
     }

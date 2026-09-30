@@ -323,6 +323,41 @@ def _verify_relocations(image: LoadedImage, record: Instruction) -> None:
                               f"({insn.mnemonic} {insn.op_str})")
 
 
+def _decode_entry_data(image: LoadedImage, listing: Listing, bases: dict[str, int],
+                       decoder, instructions: list[Instruction]) -> None:
+    """Decode the bytes the CPU runs at the program entry point, even when the
+    listing declares them as data.
+
+    VC.COM starts with DB 'RESIDENT',10,13 and the CPU executes those letters
+    (push dx, inc bp, ...) before it reaches the JMP after them. Decoding stops
+    at the first instruction the listing already knows, which must line up.
+    """
+    entry = image.hdr_cs * 16 + image.hdr_ip if image.is_exe else 0
+    starts = {record.off for record in instructions}
+    if entry in starts:
+        return
+    covering = [row for row in listing.lines
+                if row.segment in bases and row.bytes and row.offset is not None
+                and bases[row.segment] + row.offset <= entry < bases[row.segment] + row.offset + row.byte_count]
+    if not covering:
+        raise LayoutError(f"{listing.path}: entry point 0x{entry:x} is outside every listing row")
+    row = covering[0]
+    off = entry
+    while off not in starts:
+        insn = next(decoder.disasm(image.data[off:off + 16], off, count=1), None)
+        if insn is None:
+            raise LayoutError(f"{listing.path}: undecodable entry bytes at image 0x{off:x}")
+        if any(off < s < off + insn.size for s in starts):
+            raise LayoutError(f"{listing.path}: entry instruction at 0x{off:x} overlaps a listed instruction")
+        record = Instruction(off, insn, row)
+        _verify_relocations(image, record)
+        instructions.append(record)
+        off += insn.size
+        if insn.mnemonic in ("jmp", "ljmp", "ret", "retf", "iret"):
+            break
+    instructions.sort(key=lambda record: record.off)
+
+
 def build_layout(image: LoadedImage, listing: Listing) -> Layout:
     if not listing.generated_listing and any(
             (proc.uses for proc in listing.procedures.values())):
@@ -352,6 +387,7 @@ def build_layout(image: LoadedImage, listing: Listing) -> Layout:
         if first.off + first.insn.size > second.off:
             raise LayoutError(f"{listing.path}: overlapping instruction starts at image "
                               f"0x{first.off:x} and 0x{second.off:x}")
+    _decode_entry_data(image, listing, bases, decoder, instructions)
     starts = {record.off for record in instructions}
     for proc in listing.procedures.values():
         if proc.end != proc.offset and bases[proc.segment] + proc.offset not in starts:

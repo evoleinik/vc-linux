@@ -190,7 +190,8 @@ _CONDITIONS = {
 
 def _unwrapped_ip(off: int) -> str:
     # int64_t also makes an out-of-image negative relative target well-defined.
-    return f"((int64_t)loadseg * 16 + ({off}) - (int64_t)cpu.cs * 16)"
+    # rt_code_delta is nonzero only while code copied elsewhere runs.
+    return f"((int64_t)loadseg * 16 + ({off}) + rt_code_delta - (int64_t)cpu.cs * 16)"
 
 
 def _ip(off: int) -> str:

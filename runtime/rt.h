@@ -17,10 +17,6 @@
  * else, such as EXEC or terminate. The stub then skips its normal return. */
 extern int hle_redirect;
 
-/* Added to every IP the translated code computes, while the dispatcher runs
- * code that the program copied away from where it was loaded. */
-extern int32_t rt_code_delta;
-
 extern int rt_exited;
 extern int rt_exit_code;
 

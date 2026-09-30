@@ -4,6 +4,7 @@
 Cpu cpu;
 uint8_t mem[MEM_SIZE];
 int32_t rt_budget = 10000;
+int32_t rt_code_delta;
 
 uint16_t flags_get(void) {
     return (uint16_t)(2u | cpu.cf | ((uint16_t)cpu.pf << 2)
