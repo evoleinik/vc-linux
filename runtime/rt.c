@@ -2,6 +2,7 @@
  * follow statically. Then it sets CS:IP and returns here. This loop finds
  * what lives at CS:IP: a C interrupt handler stub, or translated code of a
  * loaded image. */
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,19 +80,25 @@ _Noreturn void rt_fault(const char *fmt, ...) {
 /* ---- clock and yielding -------------------------------------------------- */
 
 static struct timespec last_idle;
-static int last_mday = -1;
+static time_t midnight, next_midnight; /* local midnight, in epoch seconds */
 
+/* The BIOS tick counter at 0040:006C, 18.2 ticks a second since midnight.
+ * Cheap enough to call on every few dispatches: localtime only runs once a day. */
 void rt_update_clock(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm;
-    localtime_r(&ts.tv_sec, &tm);
-    uint64_t ms = ((uint64_t)tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec) * 1000 + ts.tv_nsec / 1000000;
+    if (ts.tv_sec >= next_midnight) {
+        struct tm tm;
+        localtime_r(&ts.tv_sec, &tm);
+        int crossed = next_midnight != 0;
+        midnight = ts.tv_sec - (tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+        next_midnight = midnight + 86400;
+        if (crossed) wr8(0x40, 0x70, 1);
+    }
+    uint64_t ms = (uint64_t)(ts.tv_sec - midnight) * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     uint32_t ticks = (uint32_t)(ms * 1193182ull / 65536ull / 1000ull);
     wr16(0x40, 0x6C, (uint16_t)ticks);
     wr16(0x40, 0x6E, (uint16_t)(ticks >> 16));
-    if (last_mday >= 0 && tm.tm_mday != last_mday) wr8(0x40, 0x70, 1);
-    last_mday = tm.tm_mday;
 }
 
 static long ms_since(const struct timespec *t) {
@@ -293,9 +300,33 @@ static void stub(uint16_t off) {
     }
 }
 
+/* kill -USR1 <pid> logs the registers and the last dispatched addresses. */
+static volatile sig_atomic_t dump_requested;
+static void on_usr1(int sig) { (void)sig; dump_requested = 1; }
+static uint32_t recent[256];
+static unsigned recent_at;
+
+static void dump_recent(void) {
+    dump_requested = 0;
+    FILE *f = log_open();
+    if (!f) return;
+    fprintf(f, "state on SIGUSR1:\n");
+    dump_state(f);
+    fprintf(f, "last dispatches (oldest first):");
+    for (unsigned i = 0; i < 256; i++) {
+        uint32_t v = recent[(recent_at + i) & 255];
+        if (v) fprintf(f, "%s%05X", i % 16 ? " " : "\n  ", v);
+    }
+    fputc('\n', f);
+}
+
 void rt_run(void) {
+    signal(SIGUSR1, on_usr1);
     while (!rt_exited) {
         uint32_t L = lin(cpu.cs, cpu.ip);
+        recent[recent_at++ & 255] = L;
+        if (dump_requested) dump_recent();
+        if (!(recent_at & 15)) rt_update_clock(); /* programs wait on 0040:006C */
         if (L >= (STUB_SEG << 4) && L < (STUB_SEG << 4) + STUB_END) {
             stub((uint16_t)(L - (STUB_SEG << 4)));
             continue;

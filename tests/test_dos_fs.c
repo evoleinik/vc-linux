@@ -192,6 +192,17 @@ static int error(unsigned code, const char *what)
     return correct;
 }
 
+/* Set date, set time and free space report errors without CF: AL=FFh for the
+ * clock calls, AX=FFFFh for free space. VC's DESQview probe depends on it. */
+static void sentinel(uint16_t mask, uint16_t value, const char *what)
+{
+    uint16_t fn = cpu.a.x;
+    int handled = invoke();
+    CHECK(handled == 1 && (cpu.a.x & mask) == value && cpu.cf == 0,
+          "%s: INT21 %04x expected AX&%04x=%04x with CF clear, handled=%d CF=%u AX=%04x",
+          what, fn, mask, value, handled, cpu.cf, cpu.a.x);
+}
+
 static uint16_t open_file(const char *path, unsigned mode)
 {
     path_begin((uint16_t)(0x3d00 | mode), path);
@@ -1116,10 +1127,11 @@ static void test_free_space_and_country(void)
     begin(0x3600); cpu.d.l = 3;
     if (ok("classic free space on C")) {
         CHECK(cpu.a.x > 0 && cpu.c.x >= 128, "classic sectors-per-cluster and bytes-per-sector are nonzero");
+        CHECK(cpu.a.x <= 64, "classic sectors-per-cluster stays a DOS value, never FFFFh (invalid drive)");
         CHECK(cpu.b.x <= cpu.d.x && cpu.d.x > 0, "classic free clusters <= total clusters");
     }
     begin(0x3600); cpu.d.l = 0; ok("classic free space on current drive");
-    begin(0x3600); cpu.d.l = 1; error(15, "classic free space invalid drive uses pinned DOS15");
+    begin(0x3600); cpu.d.l = 1; sentinel(0xFFFF, 0xFFFF, "classic free space invalid drive returns AX=FFFFh");
     path_begin(0x7303, "C:\\"); cpu.c.x = 60;
     for (unsigned i = 0; i < 62; ++i) wr8(ES, OUT + (uint16_t)i, 0xa5);
     if (ok("extended free space")) {
@@ -1180,13 +1192,15 @@ static void test_calendar(void)
         CHECK(cpu.c.h < 24 && cpu.c.l < 60 && cpu.d.h < 60 && cpu.d.l < 100,
               "current time fields include hundredths");
     begin(0x2b00); cpu.c.x = 2023; cpu.d.h = 2; cpu.d.l = 29;
-    error(13, "set date rejects non-leap February29");
+    sentinel(0x00FF, 0x00FF, "set date rejects non-leap February29");
     begin(0x2b00); cpu.c.x = 1979; cpu.d.h = 12; cpu.d.l = 31;
-    error(13, "set date rejects pre-DOS year");
+    sentinel(0x00FF, 0x00FF, "set date rejects pre-DOS year");
+    begin(0x2B01); cpu.c.x = 0x4445; cpu.d.x = 0x5351; /* 'DE' 'SQ' */
+    sentinel(0x00FF, 0x00FF, "DESQview probe date is rejected, so VC sees no DESQview");
     begin(0x2d00); cpu.c.h = 24; cpu.c.l = 0; cpu.d.h = 0; cpu.d.l = 0;
-    error(13, "set time rejects hour24");
+    sentinel(0x00FF, 0x00FF, "set time rejects hour24");
     begin(0x2d00); cpu.c.h = 0; cpu.c.l = 0; cpu.d.h = 0; cpu.d.l = 100;
-    error(13, "set time rejects100 hundredths");
+    sentinel(0x00FF, 0x00FF, "set time rejects100 hundredths");
     time_t before = time(NULL);
     begin(0x2b00); cpu.c.x = 2024; cpu.d.h = 2; cpu.d.l = 29;
     if (ok("set process-local DOS date")) CHECK(cpu.a.l == 0, "set date AL0");

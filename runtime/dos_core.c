@@ -380,6 +380,57 @@ static int host_run(const char *cmd) {
     return status;
 }
 
+/* COMMAND.COM ran `cd` itself, changing the DOS current directory, and VC's
+ * panel follows it. A child shell cannot do that for us, so do it here.
+ * Linux forms work too: `cd` alone and `~` mean $HOME, `/` separates.
+ * Returns -1 if cmd is not a plain cd, else its exit status. */
+static int internal_cd(const char *cmd) {
+    while (*cmd == ' ') cmd++;
+    size_t kw = !strncasecmp(cmd, "chdir", 5) ? 5 : !strncasecmp(cmd, "cd", 2) ? 2 : 0;
+    if (!kw || (cmd[kw] && cmd[kw] != ' ' && cmd[kw] != '\\' && cmd[kw] != '/' && cmd[kw] != '.'))
+        return -1;
+    if (strpbrk(cmd, ";&|<>`$(){}*?\"'")) return -1;
+    const char *arg = cmd + kw;
+    while (*arg == ' ') arg++;
+    char path[1024];
+    size_t alen = strlen(arg);
+    while (alen && arg[alen - 1] == ' ') alen--;
+    const char *home = getenv("HOME");
+    if (alen == 0) snprintf(path, sizeof path, "%s", home ? home : "/");
+    else if (arg[0] == '~' && (alen == 1 || arg[1] == '/'))
+        snprintf(path, sizeof path, "%s%.*s", home ? home : "", (int)alen - 1, arg + 1);
+    else snprintf(path, sizeof path, "%.*s", (int)alen, arg);
+    /* to a DOS path in code page 866 */
+    uint8_t dos[260];
+    size_t n = 0;
+    if (path[0] == '/' && n + 2 < sizeof dos) { dos[n++] = 'C'; dos[n++] = ':'; }
+    for (const unsigned char *p = (const unsigned char *)path; *p && n + 1 < sizeof dos;) {
+        uint32_t u = *p++;
+        if (u >= 0xC0) {
+            int more = u >= 0xF0 ? 3 : u >= 0xE0 ? 2 : 1;
+            u &= 0x3F >> more;
+            while (more-- && (*p & 0xC0) == 0x80) u = u << 6 | (*p++ & 0x3F);
+        }
+        int c = u == '/' ? '\\' : ucs_to_cp866(u);
+        dos[n++] = (uint8_t)(c < 0 ? '?' : c);
+    }
+    dos[n] = 0;
+    for (size_t i = 0; i <= n; i++) wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), dos[i]);
+    Cpu save = cpu;
+    cpu.a.x = 0x713B;
+    cpu.ds = DOS_SEG;
+    cpu.d.x = SCRATCH_OFF;
+    dos_fs_int21();
+    int failed = cpu.cf;
+    cpu = save;
+    if (failed) {
+        static const char msg[] = "Invalid directory\r\n";
+        con_write((const uint8_t *)msg, sizeof msg - 1);
+    }
+    rt_log("cd %s: %s", path, failed ? "failed" : "ok");
+    return failed;
+}
+
 /* A DOS command tail (count byte, text) to a host command line. "/C cmd"
  * means run cmd with the shell. Anything else runs the program itself. */
 static int exec_host(const char *host_prog, const uint8_t *tail) {
@@ -390,6 +441,8 @@ static int exec_host(const char *host_prog, const uint8_t *tail) {
     while (*t == ' ' || *t == '\t') t++;
     char cmd[4096];
     if ((t[0] == '/' || t[0] == '-') && (t[1] == 'c' || t[1] == 'C') && (t[2] == ' ' || t[2] == 0)) {
+        int cd = internal_cd(t + 2);
+        if (cd >= 0) return cd;
         snprintf(cmd, sizeof cmd, "%s", t + 2);
     } else {
         snprintf(cmd, sizeof cmd, "'%s' %s", host_prog, t);
@@ -609,7 +662,8 @@ int dos_int_other(uint8_t n) {
         cp866_to_utf8(line + 1, len, cmd, sizeof cmd);
         char *cr = strchr(cmd, '\r');
         if (cr) *cr = 0;
-        last_retcode = (uint16_t)(host_run(cmd) & 0xFF);
+        int cd = internal_cd(cmd);
+        last_retcode = (uint16_t)((cd >= 0 ? cd : host_run(cmd)) & 0xFF);
         cpu.a.x = 0;
         return 0;
     }

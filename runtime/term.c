@@ -224,8 +224,40 @@ static void read_host_size(void)
     }
 }
 
+/* VC_SCREEN_DUMP=path: after every render, write the text screen as UTF-8.
+ * Tests compare it with what a terminal emulator shows. */
+static void dump_screen(void)
+{
+    static const char *path;
+    static int checked;
+    if (!checked) {
+        path = getenv("VC_SCREEN_DUMP");
+        checked = 1;
+    }
+    if (!path)
+        return;
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    unsigned columns = bios_columns(), rows = bios_rows();
+    for (unsigned row = 0; row < rows; ++row) {
+        for (unsigned column = 0; column < columns; ++column) {
+            unsigned code = screen_ucs(mem[SCREEN + 2 * (row * columns + column)]);
+            if (code < 0x80) fputc((int)code, f);
+            else if (code < 0x800) { fputc(0xc0 | (code >> 6), f); fputc(0x80 | (code & 63), f); }
+            else { fputc(0xe0 | (code >> 12), f); fputc(0x80 | ((code >> 6) & 63), f); fputc(0x80 | (code & 63), f); }
+        }
+        fputc('\n', f);
+    }
+    fclose(f);
+    rename(tmp, path);
+}
+
 void term_render(void)
 {
+    dump_screen();
     if (!active && !output_sink)
         return;
     if (resize_pending) {

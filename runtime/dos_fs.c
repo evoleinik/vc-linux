@@ -1553,11 +1553,17 @@ int dos_fs_int21(void)
         }
         break;
     }
-    /* The brief's CF/AX error contract deliberately takes precedence over
-     * DOS 1.x's AL=FF (set clock) and AX=FFFF (free-space) error sentinels. */
-    case 0x2b: error = set_clock(true); break;
-    case 0x2d: error = set_clock(false); break;
-    case 0x36: error = disk_space(false); break;
+    /* These three report errors the DOS 1.x way, never with CF: set date and
+     * set time return AL=FFh, free space returns AX=FFFFh. VC detects
+     * DESQview by setting the impossible date 'DE'-'SQ' and reading AL. */
+    case 0x2b: case 0x2d:
+        if (set_clock(cpu.a.h == 0x2b)) cpu.a.l = 0xFF;
+        cpu.cf = 0;
+        return 1;
+    case 0x36:
+        if (disk_space(false)) cpu.a.x = 0xFFFF;
+        cpu.cf = 0;
+        return 1;
     case 0x38: error = country_info(); break;
     case 0x39: error = make_directory(); break;
     case 0x3a: error = remove_directory(); break;
@@ -1622,11 +1628,12 @@ static int disk_space(bool extended)
     if (!extended) {
         /* Scale the logical allocation unit so ordinary Linux volumes fit
          * DOS's 16-bit cluster counters. Very large volumes are saturated. */
-        while (sectors_per_cluster < 65535 && total_sectors / sectors_per_cluster > 65535) {
+        /* DOS 7 reports at most 2 GB here: 64 sectors of 512 bytes a cluster,
+         * 65535 clusters. A larger count would read as AX=FFFFh, "invalid
+         * drive". Callers wanting the real size use 7303h. */
+        while (sectors_per_cluster < 64 && total_sectors / sectors_per_cluster > 65535)
             sectors_per_cluster *= 2;
-            if (sectors_per_cluster > 65535) sectors_per_cluster = 65535;
-        }
-        if (sectors_per_cluster > 65535) sectors_per_cluster = 65535;
+        if (sectors_per_cluster > 64) sectors_per_cluster = 64;
         uint64_t total = total_sectors / sectors_per_cluster;
         uint64_t free = free_sectors / sectors_per_cluster;
         cpu.a.x = (uint16_t)sectors_per_cluster;

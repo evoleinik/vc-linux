@@ -40,6 +40,7 @@ class VcSession:
             "HOME": str(home),
             "XDG_CONFIG_HOME": str(home / ".config"),
             "VC_LOG": str(self.log),
+            "VC_SCREEN_DUMP": str(home / "screen.txt"),
             "TERM": "xterm-256color",
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "LANG": "C.UTF-8",
@@ -50,6 +51,7 @@ class VcSession:
             os.execve(str(VC), [str(VC)], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.exit_status: int | None = None
+        self.dump = home / "screen.txt"
 
     def pump(self, timeout: float = 0.05) -> None:
         while True:
@@ -67,6 +69,10 @@ class VcSession:
 
     def text(self) -> str:
         return "\n".join(self.screen.display)
+
+    def memory_text(self) -> str:
+        """What VC wrote into video memory at the last render."""
+        return self.dump.read_text().rstrip("\n") if self.dump.exists() else ""
 
     def wait_for(self, needle: str, timeout: float = 10.0) -> str:
         end = time.time() + timeout
