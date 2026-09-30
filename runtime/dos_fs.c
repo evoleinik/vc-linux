@@ -214,6 +214,14 @@ static bool utf8_to_cp(const char *s, char *out, size_t cap)
         p += count;
     }
     out[n] = 0;
+    /* DOS and Windows drop trailing spaces and dots from a name, so VC cannot
+     * name "note.txt " apart from "note.txt": it would act on the wrong file.
+     * Such a trailing run is unrepresentable too. "." and ".." are names. */
+    if (strcmp(out, ".") && strcmp(out, "..")) {
+        size_t end = n;
+        while (end && (out[end - 1] == ' ' || out[end - 1] == '.')) out[--end] = (char)0xfe;
+        if (end != n) lossless = false;
+    }
     return lossless && !*p;
 }
 

@@ -971,6 +971,37 @@ static void test_ancestor_symlink_lists_as_file(void)
     CHECK(other && (other->attrs & A_DIR), "a link to a sibling directory stays a directory");
 }
 
+/* DOS drops trailing spaces and dots, so such names convert like
+ * unrepresentable ones and get a stable suffix; the plain name stays itself. */
+static void test_trailing_space_and_dot_names(void)
+{
+    host_file("tail.txt", "plain", 0644);
+    host_file("tail.txt ", "spaced", 0644);
+    host_file("dotted.", "dotted", 0644);
+    Found list[128];
+    size_t n = find_entries(1, "*.*", A_DIR | A_HIDDEN | A_SYSTEM, 1, list, 128);
+    int plain = 0, spaced = 0, dotted = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const char *nm = list[i].name;
+        if (!strcmp(nm, "tail.txt")) plain++;
+        else if (!strncmp(nm, "tail", 4) && strchr(nm, '\xfe') && strchr(nm, '~')) spaced++;
+        else if (!strncmp(nm, "dotted", 6) && strchr(nm, '\xfe') && strchr(nm, '~')) dotted++;
+    }
+    CHECK(plain == 1 && spaced == 1, "tail.txt and 'tail.txt ' get distinct DOS names");
+    CHECK(dotted == 1, "a trailing dot converts like an unrepresentable character");
+    for (size_t i = 0; i < n; ++i) {
+        const char *nm = list[i].name;
+        if (strncmp(nm, "tail", 4) || !strchr(nm, '\xfe')) continue;
+        path_begin(0x7141, list[i].name);
+        cpu.si = 0; /* no wildcards */
+        cpu.c.x = 0;
+        ok("delete the spaced name by its DOS name");
+    }
+    struct stat st;
+    CHECK(host_stat("tail.txt", &st) == 0, "the plain file is untouched");
+    CHECK(host_stat("tail.txt ", &st) < 0, "the spaced file is the one deleted");
+}
+
 static void test_execute_only_directory(void)
 {
     char path[PATH_MAX], output[PATH_MAX], expected[PATH_MAX + 40], dos_fixture[PATH_MAX + 3];
@@ -1941,6 +1972,7 @@ int main(void)
     test_unlink_directory_symlinks();
     test_rmdir_symlinks();
     test_execute_only_directory();
+    test_trailing_space_and_dot_names();
     test_ancestor_symlink_lists_as_file();
     test_extended_open();
     test_share_modes();
