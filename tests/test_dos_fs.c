@@ -336,8 +336,17 @@ static void test_names_and_finds(void)
     check_alias(list, n, "A very long name.txt", "AVERYL~1.TXT");
     check_alias(list, n, "Base name alpha.txt", "BASENA~2.TXT");
     check_alias(list, n, "Base name beta.txt", "BASENA~3.TXT");
-    check_alias(list, n, "basena~1.txt", "BASENA~1.TXT");
-    check_alias(list, n, "plain.txt", "PLAIN.TXT");
+    /* A long name that already is 8.3, ignoring case, has no short name in
+     * the long-name record (as on Windows NT). VC copies under the short name
+     * when there is one, so plain.txt would arrive as PLAIN.TXT. */
+    check_alias(list, n, "basena~1.txt", "");
+    check_alias(list, n, "plain.txt", "");
+    {
+        Found classic[128];
+        size_t cn = find_entries(0, "*.*", A_DIR | A_HIDDEN | A_SYSTEM, 1, classic, 128);
+        const Found *p = found_name(classic, cn, "PLAIN.TXT");
+        CHECK(p != NULL, "classic find still names plain.txt by its alias PLAIN.TXT");
+    }
     check_alias(list, n, "\x92\xa5\xe1\xe2.txt", "\x92\x85\x91\x92.TXT");
     CHECK(found_name(list, n, "face-?.txt") != NULL, "unrepresentable emoji becomes one CP866 '?'");
     CHECK(found_name(list, n, ".") && found_name(list, n, ".."), "LFN directories contain dot and dot-dot");
@@ -623,6 +632,9 @@ static void test_paths_and_mutations(void)
     rename_file(0x5600, "new-only.bin", "renamed.bin", 0);
     rename_file(0x7156, "renamed.bin", "Renamed long file.bin", 0);
     CHECK(host_stat("Renamed long file.bin", &st) == 0, "LFN rename writes long host spelling");
+    rename_file(0x7156, "Renamed long file.bin", "lower83.bin", 0);
+    CHECK(host_stat("lower83.bin", &st) == 0, "LFN rename to an 8.3 name keeps its lowercase spelling");
+    rename_file(0x7156, "lower83.bin", "Renamed long file.bin", 0);
     rename_file(0x5600, "Renamed long file.bin", "plain.txt", 80);
     rename_file(0x7156, "absent", "target", 2);
     rename_file(0x5600, "Renamed long file.bin", "Z:\\target", 15);

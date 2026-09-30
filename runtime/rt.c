@@ -271,10 +271,39 @@ static int do_int(uint8_t n) {
     case 0x10: bios_int10(); return 0;
     case 0x16: bios_int16(); return 0;
     case 0x33: bios_int33(); return 0;
-    case 0x21:
+    case 0x21: {
+        /* VC_TRACE=1 logs every DOS call with the string at DS:DX and the result. */
+        static int trace = -1;
+        if (trace < 0) trace = getenv("VC_TRACE") != NULL;
+        Cpu before = cpu;
         rt_update_clock();
         if (!dos_con_int21() && !dos_fs_int21() && !dos_core_int21()) unimplemented_21();
+        if (trace && before.a.h > 0x0C) {
+            char str[80];
+            int i = 0;
+            for (; i < 79; i++) {
+                uint8_t c = rd8(before.ds, (uint16_t)(before.d.x + i));
+                if (c < 32 || c > 126) break;
+                str[i] = (char)c;
+            }
+            str[i] = 0;
+            if (before.a.h == 0x56 || before.a.x == 0x7156) {
+                char dst[80];
+                int j = 0;
+                for (; j < 79; j++) {
+                    uint8_t c = rd8(before.es, (uint16_t)(before.di + j));
+                    if (c < 32 || c > 126) break;
+                    dst[j] = (char)c;
+                }
+                dst[j] = 0;
+                rt_log("  rename target ES:DI \"%s\"", dst);
+            }
+            rt_log("int21 %04X BX=%04X CX=%04X DX=%04X SI=%04X DI=%04X \"%s\" -> CF=%d AX=%04X",
+                   before.a.x, before.b.x, before.c.x, before.d.x, before.si, before.di, str,
+                   cpu.cf, cpu.a.x);
+        }
         return 0;
+    }
     case 0x00: {
         uint16_t ip = rd16(cpu.ss, cpu.sp), cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
         rt_fault("divide error at %04X:%04X", cs, ip);

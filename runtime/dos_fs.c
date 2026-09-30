@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
@@ -821,7 +822,11 @@ static void fill_find(const Entry *e, bool lfn, bool packed)
         put32(seg, (uint16_t)(off + 28), (uint32_t)(size >> 32));
         put32(seg, (uint16_t)(off + 32), (uint32_t)size);
         write_string(seg, (uint16_t)(off + 44), e->dos, 260);
-        write_string(seg, (uint16_t)(off + 304), e->alias, 14);
+        /* Like Windows NT: no short name when the long name already is one,
+         * ignoring case. VC copies under the short name when it has one, so
+         * hello.txt would otherwise arrive as HELLO.TXT. */
+        if (strcasecmp(e->dos, e->alias))
+            write_string(seg, (uint16_t)(off + 304), e->alias, 14);
     }
 }
 

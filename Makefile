@@ -107,7 +107,10 @@ $(B)/vc: $(RT_SRC) $(wildcard runtime/*.h) $(B)/obj/vc_com.o $(B)/obj/vc_ovl.o $
 test-e2e: $(B)/vc
 	$(PY) -m pytest -q tests/test_e2e.py
 
-test: test-translator test-fs test-term test-e2e
+test-ini: $(B)/VC.OVL
+	$(PY) -m pytest -q tests/test_setup_ini.py
+
+test: test-translator test-fs test-term test-ini test-e2e
 
 clean:
 	rm -rf $(B)

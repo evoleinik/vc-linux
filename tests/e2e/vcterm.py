@@ -45,6 +45,8 @@ class VcSession:
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "LANG": "C.UTF-8",
         }
+        if "VC_TRACE" in os.environ:
+            env["VC_TRACE"] = os.environ["VC_TRACE"]
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(cwd)
