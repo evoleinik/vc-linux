@@ -25,3 +25,21 @@ $(B)/VC.OVL: $(ASM)
 	cd asm && ../$(JWASM) $(JFLAGS) -mz -Fl=../$(B)/VC.OVL.lst -Fo ../$(B)/VC.OVL VCOVL.ASM
 
 .PHONY: all images gen test clean
+
+# The terminal gate deliberately supplies its own Cpu and memory; CPU and DOS
+# file-system implementations are independent work and must not be linked here.
+$(B)/test_term: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Iruntime runtime/bios.c runtime/term.c tests/test_term.c -o $@
+
+test-term: $(B)/test_term
+	./$(B)/test_term
+
+$(B)/test_term_sanitize: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h
+	@mkdir -p $(B)
+	$(CC) -std=c11 -O1 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer -Iruntime runtime/bios.c runtime/term.c tests/test_term.c -o $@
+
+test-term-sanitize: $(B)/test_term_sanitize
+	./$(B)/test_term_sanitize
+
+.PHONY: test-term test-term-sanitize
