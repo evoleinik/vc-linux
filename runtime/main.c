@@ -80,7 +80,10 @@ int main(int argc, char **argv) {
     term_init();
     atexit(term_shutdown);
     rt_log("start: %s", dos_prog);
-    dos_start(dos_prog, (const uint8_t *)"", 0);
+    /* Base-memory mode: no swap file, no EMS or XMS to find. The TSR manager
+     * guards against DOS programs that stay resident, which cannot happen here. */
+    static const char tail[] = " /std /notsr";
+    dos_start(dos_prog, (const uint8_t *)tail, (int)sizeof tail - 1);
     rt_run();
     term_shutdown();
     return rt_exit_code;
