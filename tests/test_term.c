@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -380,6 +381,47 @@ static void test_navigation_keys(void)
     }
     expect_sequence("Home tilde 7 alias", "\033[7~", 0x47e0);
     expect_sequence("End tilde 8 alias", "\033[8~", 0x4fe0);
+}
+
+static void test_kitty_keypad_navigation(void)
+{
+    static const struct {
+        const char *name;
+        unsigned code, plain, control, alt;
+    } keys[] = {
+        {"Left",     57417,0x4be0,0x73e0,0x9b00},
+        {"Right",    57418,0x4de0,0x74e0,0x9d00},
+        {"Up",       57419,0x48e0,0x8de0,0x9800},
+        {"Down",     57420,0x50e0,0x91e0,0xa000},
+        {"Page Up",  57421,0x49e0,0x84e0,0x9900},
+        {"Page Down",57422,0x51e0,0x76e0,0xa100},
+        {"Home",     57423,0x47e0,0x77e0,0x9700},
+        {"End",      57424,0x4fe0,0x75e0,0x9f00},
+        {"Insert",   57425,0x52e0,0x92e0,0xa200},
+        {"Delete",   57426,0x53e0,0x93e0,0xa300},
+        {"Begin",    57427,0x4ce0,0x8fe0,0x9c00}
+    };
+    reset();
+    for (unsigned key = 0; key < sizeof(keys) / sizeof(keys[0]); ++key) {
+        for (unsigned modifiers = 0; modifiers < 8; ++modifiers) {
+            clear_input();
+            feed("\033[?1u", 100);
+            unsigned expected = modifiers & 2 ? keys[key].alt :
+                                modifiers & 4 ? keys[key].control : keys[key].plain;
+            for (unsigned event = 1; event <= 3; ++event) {
+                char sequence[32], label[96];
+                (void)snprintf(sequence, sizeof(sequence), "\033[%u;%u:%uu",
+                               keys[key].code, modifiers + 1, event);
+                (void)snprintf(label, sizeof(label), "kitty keypad %s modifiers %u event %u",
+                               keys[key].name, modifiers, event);
+                feed(sequence, 100 + event);
+                check_number(pop_raw(), event == 3 ? 0x10000 : expected, label);
+                check_number(pop_raw(), 0x10000, "keypad report emits at most one key");
+                check_number(mem[0x417] & 0x20, 0, "keypad navigation has NumLock off");
+            }
+        }
+    }
+    clear_input();
 }
 
 static void test_utf8_keys(void)
@@ -1148,6 +1190,37 @@ static void test_console_line_and_flush(void)
     check_number(mem[0x417] & 3, 0, "held Shift still releases normally after DOS flush");
 }
 
+static void test_console_flush_typeahead(void)
+{
+    static const unsigned functions[] = {6, 0xff};
+    static const char typeahead[] = "abcdefghijklmnopqrstuvwxyz";
+    reset();
+    for (unsigned i = 0; i < sizeof(functions) / sizeof(functions[0]); ++i) {
+        clear_input();
+        feed("\033[?1u\033[57441;2:1u", 100);
+        feed(typeahead, 101);
+        check_number((word(0x41c) + 32 - word(0x41a)) % 32, 30,
+                     "typeahead fills all 15 BIOS slots and overflows into pending");
+        cpu.a.l = (uint8_t)functions[i];
+        cpu.d.l = 0xff;
+        CHECK(console(0x0c), "DOS flush handles overflowing typeahead");
+        check_number(word(0x41a), word(0x41c), "DOS flush empties the BIOS ring");
+        if (functions[i] == 6)
+            check_number(cpu.zf, 1, "flush-and-read cannot return pending typeahead");
+        CHECK(mem[0x417] & 2, "overflow flush preserves held Shift");
+        (void)read_key(0x11); /* Poll/refill after a flush-only request, too. */
+        check_number(cpu.zf, 1, "later BIOS poll cannot refill from stale pending keys");
+        (void)console(0x0b);
+        check_number(cpu.a.l, 0, "later DOS input status stays empty");
+        feed("\033[57441;1:3u", 102);
+        check_number(mem[0x417] & 3, 0, "modifier release still works after overflow flush");
+        feed("z", 103);
+        check_number(pop_raw(), 0x2c7a, "new input after flushing still reaches the ring");
+        check_number(pop_raw(), 0x10000, "no stale typeahead follows new input");
+    }
+    clear_input();
+}
+
 static void test_noops(void)
 {
     static const unsigned video_noops[] = {0x1000,0x1001,0x1010,0x1100,0xfe00,0xff00,0xee00};
@@ -1370,9 +1443,30 @@ static int pty_blocking_key(PtyCase *terminal, uint8_t command,
     return actual == expected;
 }
 
+static volatile sig_atomic_t usr1_seen;
+
+static void on_test_usr1(int number)
+{
+    (void)number;
+    usr1_seen = 1;
+}
+
 static void pty_child(int commands, int responses)
 {
     uint8_t acknowledgement = 'I';
+    /* Fatal-signal tests must not leave core files in the workspace. */
+    struct rlimit no_core = {0, 0};
+    struct sigaction usr1_action = {0};
+    struct sigaction ignored_action = {0};
+    usr1_action.sa_handler = on_test_usr1;
+    sigemptyset(&usr1_action.sa_mask);
+    ignored_action.sa_handler = SIG_IGN;
+    sigemptyset(&ignored_action.sa_mask);
+    if (setrlimit(RLIMIT_CORE, &no_core) != 0 ||
+        sigaction(SIGUSR1, &usr1_action, NULL) != 0 ||
+        sigaction(SIGUSR2, &ignored_action, NULL) != 0 ||
+        sigaction(SIGRTMIN, &usr1_action, NULL) != 0)
+        _exit(122);
     reset();
     term_set_output(NULL, NULL);
     put_word(cell(0,0), 0x0750);
@@ -1399,6 +1493,25 @@ static void pty_child(int commands, int responses)
             term_render();
             break;
         case 'D': term_shutdown(); break;
+        case 'V': {
+            struct sigaction current;
+            if (sigaction(SIGUSR1, NULL, &current) != 0 ||
+                current.sa_handler != on_test_usr1)
+                _exit(123);
+            usr1_seen = 0;
+            if (raise(SIGUSR1) != 0 || !usr1_seen)
+                _exit(124);
+            break;
+        }
+        case 'P': {
+            struct sigaction current;
+            if (sigaction(SIGUSR2, NULL, &current) != 0 ||
+                current.sa_handler != SIG_IGN ||
+                sigaction(SIGRTMIN, NULL, &current) != 0 ||
+                current.sa_handler != on_test_usr1)
+                _exit(125);
+            break;
+        }
         case 'C':
             cpu.a.x = 0x0c06;
             cpu.d.l = 0xff;
@@ -1435,9 +1548,6 @@ static void pty_child(int commands, int responses)
             continue;
         }
         case 'A': exit(0); /* Deliberately rely on term_init's atexit hook. */
-        case 'T':
-            (void)raise(SIGTERM); /* Must terminate by signal, not _exit. */
-            _exit(114);
         case 'X':
             term_shutdown();
             if (!write_bytes(responses, &command, 1))
@@ -1769,31 +1879,91 @@ done:
     pty_dispose(&terminal);
 }
 
-static void test_pty_fatal_signal(void)
+static void test_pty_signal_handlers(void)
 {
     PtyCase terminal;
     int status;
-    uint8_t command = 'T';
     reset();
     if (!pty_open(&terminal))
         return;
+    if (!pty_command(&terminal, 'V'))
+        goto done;
+    check_raw(&terminal);
+    if (!pty_command(&terminal, 'S') || !pty_command(&terminal, 'V') ||
+        !pty_command(&terminal, 'U') || !pty_command(&terminal, 'V') ||
+        !pty_command(&terminal, 'D') || !pty_command(&terminal, 'V'))
+        goto done;
+    CHECK(pty_command(&terminal, 'P'),
+          "shutdown restores saved SIGUSR2 and real-time signal dispositions");
+    check_restored(&terminal);
+    if (pty_command(&terminal, 'X') && pty_exit(&terminal, &status))
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "SIGUSR1 handler survives terminal acquisition, suspend, resume and shutdown");
+done:
+    pty_dispose(&terminal);
+}
+
+static void check_pty_fatal_signal(int number)
+{
+    PtyCase terminal;
+    int status;
+    reset();
+    if (!pty_open(&terminal))
+        return;
+    check_raw(&terminal);
     clear_output();
     if (!pty_input(&terminal, "\033[?1u"))
         goto done;
     CHECK(strstr(output, "\033[>11u") != NULL, "signal child negotiated kitty");
     clear_output();
-    if (!write_bytes(terminal.command, &command, 1)) {
-        CHECK(0, "sending fatal-signal command failed");
+    if (kill(terminal.child, number) != 0) {
+        CHECK(0, "sending fatal signal to PTY child failed");
         goto done;
     }
     if (pty_exit(&terminal, &status)) {
-        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM,
-              "fatal cleanup preserves SIGTERM termination status");
+        CHECK(WIFSIGNALED(status), "fatal cleanup preserves signal termination status");
+        if (WIFSIGNALED(status))
+            check_number((unsigned)WTERMSIG(status), (unsigned)number,
+                         "fatal cleanup re-raises the original signal");
         check_leave_modes(1);
         check_restored(&terminal);
     }
 done:
     pty_dispose(&terminal);
+}
+
+static void test_pty_fatal_signals(void)
+{
+    static const int signals[] = {
+        SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE,
+        SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGXCPU, SIGXFSZ,
+        SIGVTALRM, SIGPROF, SIGPOLL, SIGSYS,
+#ifdef SIGSTKFLT
+        SIGSTKFLT,
+#endif
+#ifdef SIGPWR
+        SIGPWR,
+#endif
+#ifdef SIGEMT
+        SIGEMT,
+#endif
+#ifdef SIGLOST
+        SIGLOST,
+#endif
+    };
+    const char *group_name = test_name;
+    char name[80];
+    for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); ++i) {
+        (void)snprintf(name, sizeof(name), "%s(%d)", group_name, signals[i]);
+        test_name = name;
+        check_pty_fatal_signal(signals[i]);
+    }
+    for (int number = SIGRTMIN; number <= SIGRTMAX; ++number) {
+        (void)snprintf(name, sizeof(name), "%s(%d)", group_name, number);
+        test_name = name;
+        check_pty_fatal_signal(number);
+    }
+    test_name = group_name;
 }
 
 #define RUN(function) do { ++groups; test_name = #function; function(); } while (0)
@@ -1805,6 +1975,7 @@ int main(void)
     RUN(test_control_alt_keys);
     RUN(test_function_keys);
     RUN(test_navigation_keys);
+    RUN(test_kitty_keypad_navigation);
     RUN(test_utf8_keys);
     RUN(test_streaming_and_escape);
     RUN(test_kitty_modifiers);
@@ -1823,11 +1994,13 @@ int main(void)
     RUN(test_sgr_mouse_input);
     RUN(test_console_io);
     RUN(test_console_line_and_flush);
+    RUN(test_console_flush_typeahead);
     RUN(test_noops);
     RUN(test_pty_lifecycle);
     RUN(test_pty_atexit);
     RUN(test_pty_blocking_keyboard);
-    RUN(test_pty_fatal_signal);
+    RUN(test_pty_signal_handlers);
+    RUN(test_pty_fatal_signals);
     term_set_output(NULL, NULL);
     printf("test_term: %u groups, %u checks, %u failures\n", groups, checks, failures);
     return failures ? 1 : 0;

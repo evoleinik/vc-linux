@@ -761,6 +761,7 @@ int dos_con_int21(void)
         unsigned function = cpu.a.l;
         unsigned start, end;
         term_flush_input();
+        term_clear_pending();
         key_bounds(&start, &end);
         bda_set_word(0x1a, bda_word(0x1c));
         console_scan_pending = 0;
