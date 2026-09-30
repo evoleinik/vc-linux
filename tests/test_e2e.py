@@ -42,6 +42,15 @@ def vc(work, tmp_path):
     s.close()
 
 
+def lossy_suffix(host_name: str) -> str:
+    """The ~XXXX runtime/dos_fs.c appends to a name DOS cannot spell: FNV-1a
+    over the UTF-8 bytes, XOR-folded to 16 bits."""
+    h = 2166136261
+    for b in host_name.encode():
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return "~%04X" % ((h ^ (h >> 16)) & 0xFFFF)
+
+
 def status(s: VcSession) -> str:
     return s.text().splitlines()[STATUS_ROW]
 
@@ -177,7 +186,7 @@ def fake_editor(tmp_path: Path) -> Path:
     return editor
 
 
-def run_f4(work: Path, tmp_path: Path, name: str, quick_execute: bool = False) -> Path:
+def run_f4(work: Path, tmp_path: Path, name: str, quick_execute: bool = False, shown: str = "") -> Path:
     """Press F4 on `name` with a stub $EDITOR and return what the editor got."""
     editor = fake_editor(tmp_path)
     home = tmp_path / "home"
@@ -190,7 +199,7 @@ def run_f4(work: Path, tmp_path: Path, name: str, quick_execute: bool = False) -
     s = VcSession(work, home, extra_env={"EDITOR": str(editor)})
     try:
         s.wait_for("10Quit", timeout=15)
-        select(s, name)
+        select(s, shown or name)
         s.send("f4")
         until(s, lambda: "edited" in (work / name).read_text())
         s.wait_for("10Quit", timeout=5)
@@ -210,11 +219,12 @@ def test_f4_opens_EDITOR_with_the_exact_file(work, tmp_path, name, quick):
     assert not (work / "pwned").exists()
 
 
-@pytest.mark.xfail(reason="DOS strips trailing spaces; such names must convert like unrepresentable ones", strict=True)
 def test_f4_keeps_a_trailing_space(work, tmp_path):
+    # DOS drops trailing spaces, so "note.txt " shows as note~XXXX.txt■ and
+    # must still open itself, never note.txt.
     (work / "note.txt").write_text("plain\n")
     (work / "note.txt ").write_text("spaced\n")
-    assert run_f4(work, tmp_path, "note.txt ") == work / "note.txt "
+    assert run_f4(work, tmp_path, "note.txt ", shown=".txt■") == work / "note.txt "
     assert (work / "note.txt").read_text() == "plain\n"
 
 
@@ -301,8 +311,8 @@ def test_delete_second_of_two_emoji_names(work, tmp_path):
     s = VcSession(work, home)
     try:
         s.wait_for("10Quit", timeout=15)
-        # the two names show as face-■.txt and face-■~1.txt
-        select(s, "■~1.txt")
+        # each shows as face-■~XXXX.txt, XXXX from a hash of its own name
+        select(s, lossy_suffix("face-😃.txt") + ".txt")
         s.send("f8")
         s.wait_for("Delete", timeout=5)
         s.send("enter")
@@ -310,6 +320,51 @@ def test_delete_second_of_two_emoji_names(work, tmp_path):
     finally:
         s.close()
     assert [p.read_text() for p in work.glob("face-*.txt")] == ["first\n"]
+
+
+def test_group_delete_of_emoji_names_spares_the_unselected(work, tmp_path):
+    # The review's scenario: numbering by position made the third file take the
+    # second one's name mid-delete, so the unselected file went.
+    names = ["face-😀.txt", "face-😃.txt", "face-😄.txt"]
+    for n in names:
+        (work / n).write_text(n + "\n")
+    by_suffix = {lossy_suffix(n): n for n in names}
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home)
+    try:
+        s.wait_for("10Quit", timeout=15)
+        shown = [suf for line in s.text().splitlines() for suf in by_suffix if suf in line[40:]]
+        assert len(shown) == 3, s.text()
+        select(s, shown[0] + ".txt")
+        s.send("ins", "ins")  # Ins selects and moves down: the first two shown
+        s.pump(0.3)
+        s.send("f8")
+        s.wait_for("Delete", timeout=5)
+        s.send("enter")
+        s.pump(0.8)
+        s.send("enter")  # "All" if VC asks once more
+        until(s, lambda: len(list(work.glob("face-*.txt"))) == 1)
+    finally:
+        s.close()
+    assert [p.name for p in work.glob("face-*.txt")] == [by_suffix[shown[2]]]
+
+
+def test_delete_symlink_to_ancestor(work, tmp_path):
+    (work / "up").symlink_to("..")
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home)
+    try:
+        s.wait_for("10Quit", timeout=15)
+        select(s, "up")
+        s.send("f8")
+        s.wait_for("Delete", timeout=5)
+        s.send("enter")
+        until(s, lambda: not (work / "up").is_symlink())
+    finally:
+        s.close()
+    assert (work / "hello.txt").exists()
 
 
 def test_mouse_click_moves_the_cursor(vc):
