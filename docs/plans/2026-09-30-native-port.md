@@ -99,6 +99,39 @@ flowchart LR
 - Holding Shift, Ctrl or Alt only changes the key bar on terminals with the kitty keyboard protocol.
 - EMS, XMS and swap-to-disk modes stay off. VC runs in its base-memory mode.
 
+## Outcome (2026-09-30)
+
+VC runs natively. `build/vc` boots VC.COM, which runs VC.OVL as a child exactly as on DOS. The
+panels show real Linux files with long and Cyrillic names. View, copy, rename, make directory,
+delete, the mouse and shell commands all work, and each is checked on disk by
+`tests/test_e2e.py`.
+
+The translator, the DOS file layer and the terminal layer were written by three parallel codex
+workers from `docs/briefs/01-03`. The runtime core and the integration were written by Claude.
+
+What the first runs taught us, each now a test or a fix:
+
+- The CPU runs VC.COM's `RESIDENT` banner as code. The translator decodes entry bytes the listing
+  calls data.
+- VC.COM copies its resident routines elsewhere and reuses its old area for VC.OVL. The dispatcher
+  keeps reference bytes per image and matches copies by a known offset.
+- Set date, set time and classic free space report errors with AL=FFh or AX=FFFFh, never CF.
+  The CF version made VC detect DESQview.
+- Classic free space on a large volume returned sectors per cluster FFFFh, which reads as
+  "invalid drive". It is now capped at 64, as on DOS 7.
+- VC's zooming boxes wait one BIOS tick per frame. The tick counter now updates every 16
+  dispatches, and the Copy dialog went from over 1.5 s to 0.16 s.
+- VC uppercases 8.3 target names when "Lowercase short names" is on, and the long-name find must
+  leave the short name empty when the long name is already 8.3. Both are needed so that
+  `hello.txt` stays lowercase.
+- The fixture VC.INI from ddanila/vc fails VC's own checksum. `data/VC.INI` is now written by VC.
+- VC 4.99.09's internal editor is disabled in its source. F4 goes to `$EDITOR` through VCEDIT.EXT.
+- Terminal input can deliver a whole click, or a pasted command, faster than VC polls. Keys wait
+  for room in the BIOS ring, and a click lasts at least 80 ms.
+
+Known gaps: Ctrl-O shows VC's saved screen, not shell output. The screen is fixed at 80x25.
+Holding modifiers only updates the key bar on kitty-protocol terminals.
+
 ## Questions for Eugene
 
 1. **Drives.** `C:` maps to `/`. Should `H:` map to your home directory as well?
