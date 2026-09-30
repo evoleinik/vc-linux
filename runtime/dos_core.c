@@ -499,6 +499,16 @@ static int run_dos_command(const uint8_t *cmd, size_t len) {
     return host_run(utf8, NULL, NULL);
 }
 
+/* A DOS command line holds 126 bytes. VC cuts a longer one silently, so a
+ * line that fills it may have lost its end: F4 on a long name could open a
+ * shorter name, a typed rm could lose part of its path. Run none of them. */
+static int refuse_long_command(void) {
+    static const char msg[] = "Command line too long\r\n";
+    con_write((const uint8_t *)msg, sizeof msg - 1);
+    rt_log("refused a command that fills the 126-byte DOS limit");
+    return 1;
+}
+
 /* A DOS command tail (count byte, text, CR) to a host command. "/C cmd" means
  * run cmd like COMMAND.COM. Anything else runs the program itself. */
 static int exec_host(const char *host_prog, const uint8_t *tail) {
@@ -507,8 +517,10 @@ static int exec_host(const char *host_prog, const uint8_t *tail) {
     const uint8_t *cr = memchr(t, '\r', n);
     if (cr) n = (size_t)(cr - t);
     while (n && (*t == ' ' || *t == '\t')) { t++; n--; }
-    if (n >= 2 && (t[0] == '/' || t[0] == '-') && (t[1] == 'c' || t[1] == 'C') && (n == 2 || t[2] == ' '))
+    if (n >= 2 && (t[0] == '/' || t[0] == '-') && (t[1] == 'c' || t[1] == 'C') && (n == 2 || t[2] == ' ')) {
+        if (tail[0] >= 126) return refuse_long_command();
         return run_dos_command(t + 2, n - 2);
+    }
     /* the program's own path comes in as $0, the DOS command tail follows */
     char args[1024], script[1100];
     cp866_to_utf8(t, n, args, sizeof args);
@@ -729,7 +741,7 @@ int dos_int_other(uint8_t n) {
         size_t len = line[0] > 126 ? 126 : line[0];
         const uint8_t *cr = memchr(line + 1, '\r', len);
         if (cr) len = (size_t)(cr - (line + 1));
-        last_retcode = (uint16_t)(run_dos_command(line + 1, len) & 0xFF);
+        last_retcode = (uint16_t)((line[0] >= 126 ? refuse_long_command() : run_dos_command(line + 1, len)) & 0xFF);
         cpu.a.x = 0;
         return 0;
     }

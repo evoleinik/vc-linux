@@ -598,7 +598,7 @@ static void check_name_roundtrip(const char *dir, const char *dos_name,
     host_path(expected, sizeof expected, relative);
     putstr(DS, ARG, path);
     CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) == 0 && !strcmp(resolved, expected),
-          "NAME COLLISION: DOS spelling resolves to its one exact host entry");
+          "NAME COLLISION: DOS spelling resolves to its one exact host entry (%s -> %s)", path, resolved);
     uint16_t h = open_file(path, 0);
     read_equals(h, contents, "NAME COLLISION: classic open reads the assigned entry"); close_file(h);
     path_begin(0x716c, path); cpu.b.x = 0; cpu.d.x = 1;
@@ -754,26 +754,24 @@ static void test_converted_name_collisions(void)
         if (!priority[i].ambiguous)
             check_name_roundtrip(dir, priority[i].dos, priority[i].host, priority[i].contents);
     }
+    /* A spelling that is not a native name exactly, but matches a native
+     * name and an ambiguous converted one case-insensitively, is refused:
+     * it is how VC names the converted row, and giving back the native file
+     * let F8 on that row delete it. The exact native spelling still works. */
     const char *case_inputs[] = {"Name priority\\FACE-\xfe~aeb1.TXT", "Name priority\\face-\xfe~911a.txt"};
     for (size_t i = 0; i < 2; ++i) {
-        char resolved[PATH_MAX], expected[PATH_MAX];
-        snprintf(relative, sizeof relative, "%s/%s", dir, priority[i + 2].host);
-        host_path(expected, sizeof expected, relative);
+        char resolved[PATH_MAX];
         putstr(DS, ARG, case_inputs[i]);
-        CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) == 0 && !strcmp(resolved, expected),
-              "NAME COLLISION: case-insensitive real-name priority selects the native host spelling");
-        uint16_t h = open_file(case_inputs[i], 0);
-        read_equals(h, priority[i + 2].contents, "NAME COLLISION: real name wins even for a case-insensitive path");
-        close_file(h);
+        CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) != 0,
+              "NAME COLLISION: a case-insensitive spelling shared with a converted name is refused");
     }
-    path_begin(0x7141, case_inputs[0]); cpu.si = 1;
-    ok("NAME COLLISION: wildcard-mode literal delete selects the native entry only");
+    path_begin(0x7141, "Name priority\\Face-\xfe~AEB1.txt"); cpu.si = 0; cpu.c.x = 0;
+    error(2, "NAME COLLISION: F8 on the converted row cannot reach the native file");
     snprintf(relative, sizeof relative, "%s/%s", dir, priority[2].host);
-    CHECK(host_stat(relative, &st) < 0 && errno == ENOENT,
-          "NAME COLLISION: wildcard-mode literal delete removes the real entry");
+    CHECK(host_stat(relative, &st) == 0, "NAME COLLISION: the native file survives a delete of the converted row");
     snprintf(relative, sizeof relative, "%s/%s", dir, priority[0].host);
-    CHECK(host_stat(relative, &st) == 0, "NAME COLLISION: wildcard-mode literal delete preserves the lossy entry");
-    check_name_roundtrip(dir, priority[0].dos, priority[0].host, priority[0].contents);
+    CHECK(host_stat(relative, &st) == 0, "NAME COLLISION: the converted file is not deleted either");
+    check_name_roundtrip(dir, priority[2].dos, priority[2].host, priority[2].contents);
 }
 
 static void test_lossy_hash_collision(void)
@@ -1000,6 +998,39 @@ static void test_trailing_space_and_dot_names(void)
     struct stat st;
     CHECK(host_stat("tail.txt", &st) == 0, "the plain file is untouched");
     CHECK(host_stat("tail.txt ", &st) < 0, "the spaced file is the one deleted");
+}
+
+/* Characters DOS forbids in a name make it unrepresentable. A literal
+ * backslash must never act as a path separator. */
+static void test_forbidden_characters(void)
+{
+    char path[PATH_MAX];
+    host_path(path, sizeof path, "forbid");
+    host_require(mkdir(path, 0755) == 0, "mkdir forbidden-character fixture");
+    host_path(path, sizeof path, "forbid/dir");
+    host_require(mkdir(path, 0755) == 0, "mkdir forbid/dir");
+    host_file("forbid/dir/report.txt", "inside the directory", 0644);
+    host_file("forbid/dir\\report.txt", "backslash in the name", 0644);
+    host_file("forbid/a*b.txt", "star in the name", 0644);
+    Found list[16];
+    size_t n = find_entries(1, "forbid\\*.*", A_DIR | A_HIDDEN | A_SYSTEM, 1, list, 16);
+    const char *slashed = NULL;
+    int starred = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!strncmp(list[i].name, "dir\xfe", 4)) slashed = list[i].name;
+        if (!strncmp(list[i].name, "a\xfe", 2)) starred = 1;
+        CHECK(!strpbrk(list[i].name, "\\/*?"), "no listed name carries a forbidden character");
+    }
+    CHECK(slashed != NULL && starred, "backslash and star become the unrepresentable marker");
+    if (slashed) {
+        char dos[300];
+        snprintf(dos, sizeof dos, "forbid\\%s", slashed);
+        path_begin(0x7141, dos); cpu.si = 0; cpu.c.x = 0;
+        ok("delete the backslash-named file by its DOS name");
+    }
+    struct stat st;
+    CHECK(host_stat("forbid/dir\\report.txt", &st) < 0, "the backslash-named file is the one deleted");
+    CHECK(host_stat("forbid/dir/report.txt", &st) == 0, "the file inside dir/ is untouched");
 }
 
 static void test_execute_only_directory(void)
@@ -1972,6 +2003,7 @@ int main(void)
     test_unlink_directory_symlinks();
     test_rmdir_symlinks();
     test_execute_only_directory();
+    test_forbidden_characters();
     test_trailing_space_and_dot_names();
     test_ancestor_symlink_lists_as_file();
     test_extended_open();

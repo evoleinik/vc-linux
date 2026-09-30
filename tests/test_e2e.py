@@ -89,6 +89,25 @@ def until(s: VcSession, check, timeout: float = 8.0) -> None:
     raise AssertionError(f"condition not met after {timeout}s\n{s.text()}")
 
 
+def confirm_until(s: VcSession, done, timeout: float = 10.0) -> None:
+    """Press Enter on each confirmation box VC shows until done() holds.
+    VC may ask once for the group and again per file, and it zooms each box
+    in, so a key sent on a timer can land before the box can take it."""
+    import time
+    end = time.time() + timeout
+    answered = None
+    while time.time() < end:
+        s.pump(0.1)
+        if done():
+            return
+        box = [line for line in s.text().splitlines() if "Delete" in line and "║" in line]
+        if box and box != answered:
+            s.pump(0.3)  # let the zoom finish
+            s.send("enter")
+            answered = box
+    raise AssertionError(f"not done after {timeout}s\n{s.text()}")
+
+
 def other_panel_to(s: VcSession, path: Path) -> None:
     s.send("tab")
     s.send(f"cd {path}".encode(), "enter")
@@ -228,6 +247,29 @@ def test_f4_keeps_a_trailing_space(work, tmp_path):
     assert (work / "note.txt").read_text() == "plain\n"
 
 
+def test_f4_refuses_a_command_that_may_have_been_cut(work, tmp_path):
+    # The review's case: "/C vc-edit " plus a 116-byte name passes DOS's 126
+    # bytes, VC cuts it, and the cut name matched a different file.
+    stem = "a" * 106
+    (work / (stem + ".txt ")).write_text("the one pressed\n")   # shows as <stem>~XXXX.txt■
+    victim = work / (stem + lossy_suffix(stem + ".txt ") + ".txt")
+    victim.write_text("must stay untouched\n")
+    editor = fake_editor(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home, extra_env={"EDITOR": str(editor)})
+    try:
+        s.wait_for("10Quit", timeout=15)
+        select(s, ".txt■")
+        s.send("f4")
+        s.wait_for("10Quit", timeout=5)
+        s.pump(1.5)
+    finally:
+        s.close()
+    assert not Path(str(editor) + ".args").exists()
+    assert victim.read_text() == "must stay untouched\n"
+
+
 def test_retired_unsafe_defaults_are_replaced(work, tmp_path):
     home = tmp_path / "home"
     config = home / ".config" / "vc-linux"
@@ -340,11 +382,7 @@ def test_group_delete_of_emoji_names_spares_the_unselected(work, tmp_path):
         s.send("ins", "ins")  # Ins selects and moves down: the first two shown
         s.pump(0.3)
         s.send("f8")
-        s.wait_for("Delete", timeout=5)
-        s.send("enter")
-        s.pump(0.8)
-        s.send("enter")  # "All" if VC asks once more
-        until(s, lambda: len(list(work.glob("face-*.txt"))) == 1)
+        confirm_until(s, lambda: len(list(work.glob("face-*.txt"))) == 1)
     finally:
         s.close()
     assert [p.name for p in work.glob("face-*.txt")] == [by_suffix[shown[2]]]

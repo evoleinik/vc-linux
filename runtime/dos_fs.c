@@ -209,6 +209,9 @@ static bool utf8_to_cp(const char *s, char *out, size_t cap)
             count = 1;
         }
         int c = ucs_to_cp866(u);
+        /* Characters DOS forbids in a name are unrepresentable too: a \\ or
+         * / would split the name into a path, * and ? are wildcards. */
+        if (u < 0x20 || (u < 0x80 && strchr("\\/:*?\"<>|", (int)u))) c = -1;
         if (c < 0) lossless = false;
         out[n++] = c < 0 ? (char)0xfe : (char)c;
         p += count;
@@ -356,6 +359,11 @@ static unsigned matching_entry(const Entry *entries, size_t count, const char *n
             *index = i;
             return 1;
         }
+    /* Not an exact native spelling. If an ambiguous generated name also
+     * matches, the input could mean either entry, so refuse rather than
+     * hand back the native one: F8 on the generated row would delete it. */
+    for (size_t i = 0; i < count; ++i)
+        if (entries[i].ambiguous && cp_equal(name, entries[i].dos)) return 2;
     /* Real long names win over generated spellings. Native case twins keep
      * their existing unique short alias as a tie-break for nonexact input. */
     for (size_t i = 0; i < count; ++i) {

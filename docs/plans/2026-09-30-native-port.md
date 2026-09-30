@@ -132,6 +132,28 @@ What the first runs taught us, each now a test or a fix:
 Known gaps: Ctrl-O shows VC's saved screen, not shell output. The screen is fixed at 80x25.
 Holding modifiers only updates the key bar on kitty-protocol terminals.
 
+## Review (2026-09-30 to 10-01)
+
+One discovery review and two focused verification reviews ran, all read-only codex. That is the
+whole budget. The discovery review found 14 defects (3 blockers). Verification 1 found 6 new ones
+in the fixes, and verification 2 found 3 more. Every finding was reproduced by a test that fails
+on the old code, and then fixed. The ones that could lose data or run code:
+
+- F4 pasted file names into a shell command, so `$(...)` in a name ran. Now `vc-edit` hands the
+  resolved file to `$EDITOR` as one argument, on both command paths (COMSPEC /C and INT 2Eh).
+  The shipped `VC.EXT` is empty, and old unsafe defaults are replaced.
+- F8 on a directory symlink walked into the target. rmdir, and delete of any symlink, now
+  remove the link itself.
+- Names DOS cannot spell collapsed together, so a delete could hit a neighbour. That covers
+  characters outside CP866, the characters DOS forbids (`\ / : * ? " < > |`) and trailing spaces
+  or dots. Such a name now carries a suffix from a hash of its own name, never its position. A
+  clash is refused, and a spelling shared with a native name is refused unless it is exact.
+- A command at DOS's 126-byte limit may have been cut by VC, so it is refused.
+- A symlink to an ancestor directory is listed as a file, so the tree scan cannot loop.
+
+Two performance bugs turned up along the way. An empty keyboard poll slept 10 ms, which made the
+tree scan 76 times slower. Every path lookup also listed its whole directory.
+
 ## Questions for Eugene
 
 1. **Drives.** `C:` maps to `/`. Should `H:` map to your home directory as well?
