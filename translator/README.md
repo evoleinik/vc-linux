@@ -37,6 +37,24 @@ is rejected. Additional completeness checks require every nonempty PROC
 entry to be an instruction start, and every byte of every code segment to
 belong to a source instruction or explicit initialized data/alignment row.
 
+After those source boundaries are checked, layout closes the instruction set
+over static successors and the entry point. This recovers executable data such
+as VC.COM's `DB 'RESIDENT',10,13` banner and PutTree's `_JCXZ` macro, which emits
+two DB rows. Fall-through (including CALL/INT return sites and INT 20h), direct
+relative branches/calls, and relocated direct far targets seed a worklist. Each
+new instruction adds its own successors until no new starts remain. Unreachable
+data stays data. Undecodable bytes and overlaps with listed or recovered
+instructions are errors; recovered instructions also validate their relocations.
+
+Targets wrap IP within the listing segment/group's CS frame before converting
+back to linked image offsets. This is the nominal source frame, not every
+possible runtime CS alias. Indirect transfers and relocated near displacements
+are dynamic and cannot seed static targets. Unrelocated far pointers name
+physical memory, not an offset from the unknown load base, so they remain
+dispatcher transfers.
+Reachable bytes still need a source row: this does not replace the independent
+check for missing assembler-generated listing rows.
+
 JWasm's instruction fixup markers (`o`, `s`, etc.) are retained and excluded
 from pre-link-byte comparison. Its data byte column omits fixup markers, so
 the parser separately locates symbolic `DW`/structure initializer fields.

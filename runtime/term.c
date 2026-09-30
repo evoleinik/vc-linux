@@ -1,6 +1,7 @@
 /* A small UTF-8/ANSI front end for the real B800 text buffer and BIOS ring.
  * Only the terminal owns host tty state; the BIOS owns all guest state. */
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE /* NSIG, including Linux's real-time signal range. */
 #include "term.h"
 #include "cp866.h"
 #include "bios.h"
@@ -76,19 +77,45 @@ static uint64_t monotonic_ms(void);
 
 static const int fatal_signals[] = {
     SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGABRT, SIGSEGV, SIGBUS, SIGFPE,
-    SIGILL, SIGPIPE, SIGXCPU, SIGXFSZ
+    SIGILL, SIGTRAP, SIGUSR2, SIGPIPE, SIGALRM, SIGVTALRM, SIGPROF,
+    SIGXCPU, SIGXFSZ, SIGPOLL, SIGSYS,
+#ifdef SIGSTKFLT
+    SIGSTKFLT,
+#endif
+#ifdef SIGPWR
+    SIGPWR,
+#endif
+#ifdef SIGEMT
+    SIGEMT,
+#endif
+#ifdef SIGLOST
+    SIGLOST,
+#endif
 };
 #define FATAL_COUNT (sizeof(fatal_signals) / sizeof(fatal_signals[0]))
-static struct sigaction saved_fatal[FATAL_COUNT], saved_winch;
+static struct sigaction saved_fatal[NSIG], saved_winch;
+static sigset_t installed_fatal;
 static const char leave_modes[] =
     "\033[?1006l\033[?1002l\033>\033[0m\033[?25h\033[?7h\033[?1049l";
+
+static int is_fatal_signal(int number)
+{
+    /* Default-terminating Linux signals only. SIGUSR1 belongs to the runtime
+     * state dump; SIGKILL cannot be caught. libc reserves signals below its
+     * runtime SIGRTMIN, so do not install handlers for those internal slots. */
+    for (size_t i = 0; i < FATAL_COUNT; ++i)
+        if (number == fatal_signals[i])
+            return 1;
+    return number >= SIGRTMIN && number <= SIGRTMAX;
+}
 
 static void block_lifecycle_signals(sigset_t *previous)
 {
     sigset_t blocked;
     sigemptyset(&blocked);
-    for (size_t i = 0; i < FATAL_COUNT; ++i)
-        sigaddset(&blocked, fatal_signals[i]);
+    for (int number = 1; number < NSIG; ++number)
+        if (is_fatal_signal(number))
+            sigaddset(&blocked, number);
     sigaddset(&blocked, SIGWINCH);
     sigprocmask(SIG_BLOCK, &blocked, previous);
 }
@@ -396,11 +423,15 @@ static void install_handlers(void)
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     sigemptyset(&action.sa_mask);
+    sigemptyset(&installed_fatal);
     action.sa_handler = fatal_signal;
-    for (size_t i = 0; i < FATAL_COUNT; ++i)
-        sigaddset(&action.sa_mask, fatal_signals[i]);
-    for (size_t i = 0; i < FATAL_COUNT; ++i)
-        sigaction(fatal_signals[i], &action, &saved_fatal[i]);
+    for (int number = 1; number < NSIG; ++number)
+        if (is_fatal_signal(number))
+            sigaddset(&action.sa_mask, number);
+    for (int number = 1; number < NSIG; ++number)
+        if (is_fatal_signal(number) &&
+            sigaction(number, &action, &saved_fatal[number]) == 0)
+            sigaddset(&installed_fatal, number);
     action.sa_handler = window_signal;
     sigemptyset(&action.sa_mask);
     sigaction(SIGWINCH, &action, &saved_winch);
@@ -485,8 +516,9 @@ void term_shutdown(void)
 {
     term_suspend();
     if (handlers_installed) {
-        for (size_t i = 0; i < FATAL_COUNT; ++i)
-            sigaction(fatal_signals[i], &saved_fatal[i], NULL);
+        for (int number = 1; number < NSIG; ++number)
+            if (sigismember(&installed_fatal, number) == 1)
+                sigaction(number, &saved_fatal[number], NULL);
         sigaction(SIGWINCH, &saved_winch, NULL);
         handlers_installed = 0;
     }
@@ -783,6 +815,12 @@ static void queue_protocol_key(unsigned code, unsigned modifiers, unsigned event
         queue_function(code - 57364 + 1, modifiers);
     } else if (code >= 57399 && code <= 57414) {
         queue_keypad(code, modifiers);
+    } else if (code >= 57417 && code <= 57427) {
+        static const enum Navigation keys[] = {
+            NAV_LEFT, NAV_RIGHT, NAV_UP, NAV_DOWN, NAV_PGUP, NAV_PGDN,
+            NAV_HOME, NAV_END, NAV_INSERT, NAV_DELETE, NAV_BEGIN
+        };
+        queue_navigation(keys[code - 57417], modifiers);
     } else {
         switch (code) {
         case 57344: queue_character(27, modifiers); break;

@@ -1,17 +1,19 @@
 """Match listing segments against linked bytes and validate every boundary.
 
-There is deliberately no disassembly sweep. The only one-to-many source
-normalizations are the two exact JWasm encodings documented in
-``translator/README.md``. All other length discrepancies are errors.
+There is deliberately no disassembly sweep. The two exact JWasm source
+normalizations and the static-successor closure into declared data are
+documented in ``translator/README.md``. Other length discrepancies are errors.
 """
 
 import ast
 from bisect import bisect_left
+from collections import deque
 from dataclasses import dataclass, field, replace
 import operator
 import re
 
-from capstone import Cs, CS_ARCH_X86, CS_MODE_16
+from capstone import Cs, CS_ARCH_X86, CS_MODE_16, CS_GRP_CALL, CS_GRP_JUMP
+from capstone.x86_const import X86_OP_IMM
 
 from .image import LoadedImage
 from .listing import DataInitializer, Listing, ListingLine, PREFIXES
@@ -323,38 +325,91 @@ def _verify_relocations(image: LoadedImage, record: Instruction) -> None:
                               f"({insn.mnemonic} {insn.op_str})")
 
 
-def _decode_entry_data(image: LoadedImage, listing: Listing, bases: dict[str, int],
-                       decoder, instructions: list[Instruction]) -> None:
-    """Decode the bytes the CPU runs at the program entry point, even when the
-    listing declares them as data.
+def _static_successors(record: Instruction, relocations: set[int], frame: int):
+    """Image-relative fall-through/return sites and statically known targets."""
+    insn = record.insn
+    mnemonic = insn.mnemonic.split()[-1]
+    if mnemonic not in ("jmp", "ljmp", "ret", "retf", "iret", "iretd"):
+        # CALL/INT can return, including INT 20h if its vector was hooked.
+        yield frame + ((record.off + insn.size - frame) & 0xffff)
+    if not (insn.group(CS_GRP_JUMP) or insn.group(CS_GRP_CALL) or
+            mnemonic in ("loop", "loope", "loopne")):
+        return
+    if not insn.operands or insn.operands[0].type != X86_OP_IMM:
+        return
+    raw = bytes(insn.bytes)
+    if mnemonic in ("lcall", "ljmp"):
+        # Only a relocated far segment is relative to this image's load base.
+        # An absolute far pointer is a physical address, not an image offset.
+        if record.off + insn.size - 2 in relocations:
+            yield int.from_bytes(raw[-2:], "little") * 16 + int.from_bytes(raw[-4:-2], "little")
+    elif record.off + insn.imm_offset not in relocations:
+        # Disassemble image offsets, but wrap IP in the listing's CS frame.
+        # A near jump across half a segment may encode the opposite signed
+        # displacement; its unwrapped image address is not the actual target.
+        displacement = int.from_bytes(raw[insn.imm_offset:insn.imm_offset + insn.imm_size],
+                                      "little", signed=True)
+        yield frame + ((record.off + insn.size + displacement - frame) & 0xffff)
 
-    VC.COM starts with DB 'RESIDENT',10,13 and the CPU executes those letters
-    (push dx, inc bp, ...) before it reaches the JMP after them. Decoding stops
-    at the first instruction the listing already knows, which must line up.
+
+def _decode_static_successors(image: LoadedImage, listing: Listing, bases: dict[str, int],
+                              decoder, instructions: list[Instruction]) -> None:
+    """Close listed code over static successors and the program entry point.
+
+    DB bytes may be executable: VC.COM's RESIDENT banner runs at entry, and
+    PutTree's _JCXZ macro emits an instruction as two separate DB rows. Decode
+    only reachable starts, keeping both listed and recovered boundaries strict.
     """
     entry = image.hdr_cs * 16 + image.hdr_ip if image.is_exe else 0
+    if not 0 <= entry < len(image.data):
+        raise LayoutError(f"{listing.path}: entry point 0x{entry:x} is outside the image")
     starts = {record.off for record in instructions}
-    if entry in starts:
-        return
-    covering = [row for row in listing.lines
-                if row.segment in bases and row.bytes and row.offset is not None
-                and bases[row.segment] + row.offset <= entry < bases[row.segment] + row.offset + row.byte_count]
-    if not covering:
-        raise LayoutError(f"{listing.path}: entry point 0x{entry:x} is outside every listing row")
-    row = covering[0]
-    off = entry
-    while off not in starts:
-        insn = next(decoder.disasm(image.data[off:off + 16], off, count=1), None)
+    owners: list[Instruction | None] = [None] * len(image.data)
+    for record in instructions:
+        owners[record.off:record.off + record.insn.size] = [record] * record.insn.size
+    source_rows: list[ListingLine | None] = [None] * len(image.data)
+    for row in listing.lines:
+        if row.segment not in bases or not row.bytes or row.offset is None:
+            continue
+        if row.initializers and all(_is_uninitialized(i.expression) for i in row.initializers):
+            continue
+        begin = max(0, bases[row.segment] + row.offset)
+        end = min(len(image.data), bases[row.segment] + row.offset + row.byte_count)
+        if begin < end:
+            source_rows[begin:end] = [row] * (end - begin)
+    relocations = set(image.relocations)
+    frames = {}
+    for name, base in bases.items():
+        origin = _group_origin(listing.segments[name].group, bases, listing, image)
+        frames[name] = origin if origin is not None else base & ~15
+    pending = deque([entry])
+    for record in instructions:
+        pending.extend(_static_successors(record, relocations, frames[record.line.segment]))
+    while pending:
+        off = pending.popleft()
+        if off in starts or not 0 <= off < len(image.data):
+            continue
+        insn = next(decoder.disasm(image.data[off:off + 15], off, count=1), None)
+        overlap = owners[off]
+        if overlap is None and insn is not None:
+            overlap = next((owner for owner in owners[off:off + insn.size]
+                            if owner is not None), None)
+        if overlap is not None:
+            kind = "listed" if overlap.line.is_instruction else "decoded"
+            raise LayoutError(f"{listing.path}: static successor at image 0x{off:x} overlaps a "
+                              f"{kind} instruction at image 0x{overlap.off:x}")
         if insn is None:
-            raise LayoutError(f"{listing.path}: undecodable entry bytes at image 0x{off:x}")
-        if any(off < s < off + insn.size for s in starts):
-            raise LayoutError(f"{listing.path}: entry instruction at 0x{off:x} overlaps a listed instruction")
+            raise LayoutError(f"{listing.path}: undecodable reachable bytes at image 0x{off:x}")
+        row = source_rows[off]
+        if row is None:
+            raise LayoutError(f"{listing.path}: reachable image offset 0x{off:x} is outside every "
+                              "listing row; missing source/generated listing row")
         record = Instruction(off, insn, row)
         _verify_relocations(image, record)
         instructions.append(record)
-        off += insn.size
-        if insn.mnemonic in ("jmp", "ljmp", "ret", "retf", "iret"):
-            break
+        starts.add(off)
+        owners[off:off + insn.size] = [record] * insn.size
+        pending.extend(_static_successors(record, relocations, frames[row.segment]))
     instructions.sort(key=lambda record: record.off)
 
 
@@ -387,12 +442,6 @@ def build_layout(image: LoadedImage, listing: Listing) -> Layout:
         if first.off + first.insn.size > second.off:
             raise LayoutError(f"{listing.path}: overlapping instruction starts at image "
                               f"0x{first.off:x} and 0x{second.off:x}")
-    _decode_entry_data(image, listing, bases, decoder, instructions)
-    starts = {record.off for record in instructions}
-    for proc in listing.procedures.values():
-        if proc.end != proc.offset and bases[proc.segment] + proc.offset not in starts:
-            raise LayoutError(f"{listing.path}: PROC {proc.name} entry at "
-                              f"{proc.segment}:0x{proc.offset:x} is missing an instruction boundary")
     # A second, independent completeness check catches omitted generated rows:
     # each byte of every known code segment must belong to a decoded source
     # instruction or an explicit initialized data/alignment declaration.
@@ -412,6 +461,12 @@ def build_layout(image: LoadedImage, listing: Listing) -> Layout:
         if missing >= 0:
             raise LayoutError(f"{listing.path}: uncovered byte in code segment {segment.name} "
                               f"at listing offset 0x{missing:x}; missing source/generated listing row")
+    _decode_static_successors(image, listing, bases, decoder, instructions)
+    starts = {record.off for record in instructions}
+    for proc in listing.procedures.values():
+        if proc.end != proc.offset and bases[proc.segment] + proc.offset not in starts:
+            raise LayoutError(f"{listing.path}: PROC {proc.name} entry at "
+                              f"{proc.segment}:0x{proc.offset:x} is missing an instruction boundary")
     chunks, proc_chunks = [], {}
     previous = None
     for record in instructions:
