@@ -29,6 +29,28 @@ static int mkdirs(char *path) {
     return mkdir(path, 0755) && errno != EEXIST ? -1 : 0;
 }
 
+/* Defaults an earlier build shipped that are unsafe: they paste file names
+ * into shell commands. A file still holding exactly one of them was never
+ * edited by the user, so it is replaced. */
+static const struct { const char *name, *text; } retired[] = {
+    {"VCEDIT.EXT", "*: ${EDITOR:-vi} \"!.!\"\r\n"},
+    {"VC.EXT", "zip:\tpkunzip -d !.!\r\narj:\tarj x -v -y !.!\r\nlzh:\tlha x !.!\r\n"
+               "asm:\ttasm /w0/m9 !;\r\n\ttlink /t !;\r\n"},
+};
+
+static int holds_retired_default(const char *path, const char *name) {
+    for (size_t i = 0; i < sizeof retired / sizeof retired[0]; i++) {
+        if (strcmp(retired[i].name, name)) continue;
+        FILE *f = fopen(path, "rb");
+        if (!f) return 0;
+        char buf[512];
+        size_t n = fread(buf, 1, sizeof buf, f);
+        fclose(f);
+        if (n == strlen(retired[i].text) && !memcmp(buf, retired[i].text, n)) return 1;
+    }
+    return 0;
+}
+
 /* Setup files are written once and then belong to the user. The program
  * images are rewritten every run, since they are this binary. */
 static void install_files(const char *dir) {
@@ -37,7 +59,7 @@ static void install_files(const char *dir) {
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, f->name);
         int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL");
-        if (!program && access(path, F_OK) == 0) continue;
+        if (!program && access(path, F_OK) == 0 && !holds_retired_default(path, f->name)) continue;
         FILE *out = fopen(path, "wb");
         if (!out || fwrite(f->data, 1, f->size, out) != f->size) {
             fprintf(stderr, "vc: cannot write %s: %s\n", path, strerror(errno));

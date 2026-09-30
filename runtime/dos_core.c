@@ -470,32 +470,49 @@ static int internal_cd(const char *cmd) {
  * no shell ever parses it: `$(id).txt` stays a file name. */
 static const char EDIT_WORD[] = "vc-edit ";
 
-/* A DOS command tail (count byte, text) to a host command. "/C cmd" means run
- * cmd with the shell. Anything else runs the program itself. */
-static int exec_host(const char *host_prog, const uint8_t *tail) {
-    uint8_t n = tail[0] > 126 ? 126 : tail[0];
-    char text[1024];
-    cp866_to_utf8(tail + 1, n, text, sizeof text);
-    char *cr = strchr(text, '\r');
-    if (cr) *cr = 0;
-    char *t = text;
-    while (*t == ' ' || *t == '\t') t++;
-    if ((t[0] == '/' || t[0] == '-') && (t[1] == 'c' || t[1] == 'C') && (t[2] == ' ' || t[2] == 0)) {
-        char *cmd = t + 2;
-        while (*cmd == ' ') cmd++;
-        int cd = internal_cd(cmd);
-        if (cd >= 0) return cd;
-        if (!strncmp(cmd, EDIT_WORD, sizeof EDIT_WORD - 1)) {
-            char *name = cmd + sizeof EDIT_WORD - 1;
-            size_t len = strlen(name);
-            while (len && name[len - 1] == ' ') name[--len] = 0;
-            return host_run("exec ${EDITOR:-vi} \"$1\"", "vc-edit", name);
+/* Run one COMMAND.COM-style command line, given in code page 866 without its
+ * CR. Both ways VC runs commands come here: EXEC of COMSPEC with "/C cmd",
+ * and INT 2Eh when "Quick execute commands" is on. */
+static int run_dos_command(const uint8_t *cmd, size_t len) {
+    while (len && (cmd[0] == ' ' || cmd[0] == '\t')) { cmd++; len--; }
+    char utf8[1024];
+    cp866_to_utf8(cmd, len, utf8, sizeof utf8);
+    int cd = internal_cd(utf8);
+    if (cd >= 0) return cd;
+    const size_t w = sizeof EDIT_WORD - 1;
+    if (len > w && !memcmp(cmd, EDIT_WORD, w)) {
+        /* Everything after the word is one DOS file name, exactly as VC wrote
+         * it, trailing spaces included. The DOS layer maps it to the real host
+         * file, so a displayed name with a generated suffix finds its file. */
+        size_t n = len - w;
+        if (n > 255) n = 255;
+        for (size_t i = 0; i < n; i++) wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), cmd[w + i]);
+        wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + n), 0);
+        char host[4096];
+        if (dos_fs_to_host(DOS_SEG, SCRATCH_OFF, host, sizeof host)) {
+            static const char msg[] = "File not found\r\n";
+            con_write((const uint8_t *)msg, sizeof msg - 1);
+            return 2;
         }
-        return host_run(cmd, NULL, NULL);
+        return host_run("exec ${EDITOR:-vi} \"$1\"", "vc-edit", host);
     }
+    return host_run(utf8, NULL, NULL);
+}
+
+/* A DOS command tail (count byte, text, CR) to a host command. "/C cmd" means
+ * run cmd like COMMAND.COM. Anything else runs the program itself. */
+static int exec_host(const char *host_prog, const uint8_t *tail) {
+    size_t n = tail[0] > 126 ? 126 : tail[0];
+    const uint8_t *t = tail + 1;
+    const uint8_t *cr = memchr(t, '\r', n);
+    if (cr) n = (size_t)(cr - t);
+    while (n && (*t == ' ' || *t == '\t')) { t++; n--; }
+    if (n >= 2 && (t[0] == '/' || t[0] == '-') && (t[1] == 'c' || t[1] == 'C') && (n == 2 || t[2] == ' '))
+        return run_dos_command(t + 2, n - 2);
     /* the program's own path comes in as $0, the DOS command tail follows */
-    char script[1100];
-    snprintf(script, sizeof script, "exec \"$0\" %s", t);
+    char args[1024], script[1100];
+    cp866_to_utf8(t, n, args, sizeof args);
+    snprintf(script, sizeof script, "exec \"$0\" %s", args);
     return host_run(script, host_prog, NULL);
 }
 
@@ -706,15 +723,13 @@ int dos_int_other(uint8_t n) {
     case 0x27: terminate(0, 1, (uint16_t)((cpu.d.x + 15) >> 4)); return 0;
     case 0x28: term_idle(5); return 0; /* DOS idle: the program is waiting */
     case 0x2E: {
+        /* COMMAND.COM's back door: DS:SI is a count byte, the command, CR */
         uint8_t line[128];
         for (int i = 0; i < 128; i++) line[i] = rd8(cpu.ds, (uint16_t)(cpu.si + i));
-        uint8_t len = line[0] > 126 ? 126 : line[0];
-        char cmd[1024];
-        cp866_to_utf8(line + 1, len, cmd, sizeof cmd);
-        char *cr = strchr(cmd, '\r');
-        if (cr) *cr = 0;
-        int cd = internal_cd(cmd);
-        last_retcode = (uint16_t)((cd >= 0 ? cd : host_run(cmd, NULL, NULL)) & 0xFF);
+        size_t len = line[0] > 126 ? 126 : line[0];
+        const uint8_t *cr = memchr(line + 1, '\r', len);
+        if (cr) len = (size_t)(cr - (line + 1));
+        last_retcode = (uint16_t)(run_dos_command(line + 1, len) & 0xFF);
         cpu.a.x = 0;
         return 0;
     }

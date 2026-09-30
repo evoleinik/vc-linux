@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent / "e2e"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from vcterm import VC, VcSession  # noqa: E402
+import vcini  # noqa: E402
+
+DATA = Path(__file__).resolve().parents[1] / "data"
 
 pytestmark = pytest.mark.skipif(not VC.exists(), reason="build/vc not built; run make")
 
@@ -173,15 +177,16 @@ def fake_editor(tmp_path: Path) -> Path:
     return editor
 
 
-@pytest.mark.parametrize("name", ["a long file name.markdown", "$(touch pwned).txt"])
-def test_f4_opens_EDITOR_with_the_exact_name(work, tmp_path, name):
-    # VC 4.99.09's own editor is switched off in its source (VCEDIT.INC jumps
-    # straight to "Can't find the file"), so F4 goes through VCEDIT.EXT. The
-    # name must reach the editor as one argument that no shell has parsed.
-    (work / name).write_text("text\n")
+def run_f4(work: Path, tmp_path: Path, name: str, quick_execute: bool = False) -> Path:
+    """Press F4 on `name` with a stub $EDITOR and return what the editor got."""
     editor = fake_editor(tmp_path)
     home = tmp_path / "home"
-    home.mkdir()
+    config = home / ".config" / "vc-linux"
+    config.mkdir(parents=True)
+    if quick_execute:  # VC then runs commands through INT 2Eh instead of COMSPEC /C
+        ini = vcini.VcIni((DATA / "VC.INI").read_bytes())
+        ini.set_main("ExecTyp", 1)
+        (config / "VC.INI").write_bytes(ini.data)
     s = VcSession(work, home, extra_env={"EDITOR": str(editor)})
     try:
         s.wait_for("10Quit", timeout=15)
@@ -191,8 +196,41 @@ def test_f4_opens_EDITOR_with_the_exact_name(work, tmp_path, name):
         s.wait_for("10Quit", timeout=5)
     finally:
         s.close()
-    assert Path(str(editor) + ".args").read_text() == name + "\n"
+    return Path(Path(str(editor) + ".args").read_text().rstrip("\n"))
+
+
+@pytest.mark.parametrize("quick", [False, True], ids=["comspec", "int2e"])
+@pytest.mark.parametrize("name", ["a long file name.markdown", "$(touch pwned).txt"])
+def test_f4_opens_EDITOR_with_the_exact_file(work, tmp_path, name, quick):
+    # VC 4.99.09's own editor is switched off in its source (VCEDIT.INC jumps
+    # straight to "Can't find the file"), so F4 goes through VCEDIT.EXT. The
+    # file must reach the editor as one argument that no shell has parsed.
+    (work / name).write_text("text\n")
+    assert run_f4(work, tmp_path, name, quick) == work / name
     assert not (work / "pwned").exists()
+
+
+@pytest.mark.xfail(reason="DOS strips trailing spaces; such names must convert like unrepresentable ones", strict=True)
+def test_f4_keeps_a_trailing_space(work, tmp_path):
+    (work / "note.txt").write_text("plain\n")
+    (work / "note.txt ").write_text("spaced\n")
+    assert run_f4(work, tmp_path, "note.txt ") == work / "note.txt "
+    assert (work / "note.txt").read_text() == "plain\n"
+
+
+def test_retired_unsafe_defaults_are_replaced(work, tmp_path):
+    home = tmp_path / "home"
+    config = home / ".config" / "vc-linux"
+    config.mkdir(parents=True)
+    (config / "VCEDIT.EXT").write_bytes(b'*: ${EDITOR:-vi} "!.!"\r\n')  # shipped by an early build
+    (config / "VC.EXT").write_bytes(b"zip: my own entry\r\n")          # edited by the user
+    s = VcSession(work, home)
+    try:
+        s.wait_for("10Quit", timeout=15)
+    finally:
+        s.close()
+    assert (config / "VCEDIT.EXT").read_bytes() == (DATA / "VCEDIT.EXT").read_bytes()
+    assert (config / "VC.EXT").read_bytes() == b"zip: my own entry\r\n"
 
 
 def test_cd_accepts_a_quoted_path(vc, work):
