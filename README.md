@@ -3,27 +3,40 @@
 [![ci](https://github.com/evoleinik/vc-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/evoleinik/vc-linux/actions/workflows/ci.yml)
 [![license: BSD-2](https://img.shields.io/badge/license-BSD--2-blue)](LICENSE)
 
-**Volkov Commander, the DOS file manager, running natively on Linux.**
+**Preserving DOS software as source, not as an emulator image.**
 
 ![Volkov Commander on Linux: two panels, the Copy dialog open](docs/screenshot.png)
 
-Volkov Commander was the fast, tiny Norton Commander clone that half of the 1990s ran on DOS. Its
-author released the source under BSD-2 in 2026. This project turns that 8086 assembly into C by
-machine, then reimplements the DOS and BIOS services it calls on top of Linux. The binary that
-comes out is native x86-64 code. No emulator runs at run time. You manage real Linux files with
-the real VC: the same keys, colours, dialogs and quirks.
+Most DOS software survives as a binary inside an emulator, and lives only as long as that emulator
+is maintained. vc-linux preserves programs a different way. Each one is kept as three things:
 
-**Try it in your browser: [notanemulator.com](https://notanemulator.com/).**
-The same translated code, compiled to WebAssembly. It starts at once, with GW-BASIC, bootLogo
-turtle graphics, and twelve classic BASIC games on its `H:` drive.
+1. **The original source, unedited.** Volkov Commander's own assembly is in `asm/`. The other
+   programs are in `third_party/`, each with its licence and the upstream commit it came from.
+2. **A reproducible build of that source,** assembled or compiled the way it was originally.
+3. **A machine translation to C,** made instruction by instruction and checked against a
+   reference CPU (unicorn) from random states. The translated C is never edited by hand.
 
-## Why not DOSBox, mc or far2l?
+Only DOS and the PC hardware around the CPU are rewritten, by hand, in `runtime/`. The result is
+ordinary C that any C compiler can build. Today it runs as a native Linux program on your real
+files, and as WebAssembly in any browser. No emulator runs at run time.
 
-| | Runs the original VC code | Works on your real files | Native, no emulator |
+| Preserved so far | Author, year | Licence |
+|---|---|---|
+| Volkov Commander 4.99.09, the file manager | Vsevolod Volkov, 1991-2000 | BSD-2 (released 2026) |
+| GW-BASIC | Microsoft, 1983 | MIT (released 2020) |
+| *BASIC Computer Games*, twelve of them | David H. Ahl, 1978 | public domain (2022) |
+| bootLogo, a Logo with turtle graphics | Oscar Toledo G., 2024 | BSD-2 |
+
+**Try it in your browser: [notanemulator.com](https://notanemulator.com/).** VC starts at once,
+and runs GW-BASIC, the BASIC games and bootLogo from its `H:` drive, the way DOS did.
+
+## How this differs from emulation and rewrites
+
+| | Keeps the original program | Runs without an emulator | Works on your real files |
 |---|---|---|---|
-| DOSBox, dosemu2, js-dos | yes | no: a fake drive, 8.3 names | no |
+| DOSBox, dosemu2, js-dos archives | yes | no | no: a fake drive, 8.3 names |
 | Midnight Commander, far2l | no: different programs | yes | yes |
-| **vc-linux** | **yes: translated instruction by instruction** | **yes, long and Cyrillic names** | **yes** |
+| **vc-linux** | **yes: translated instruction by instruction** | **yes** | **yes, long and Cyrillic names** |
 
 ## Quick start
 
