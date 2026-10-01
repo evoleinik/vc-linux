@@ -60,3 +60,14 @@ people log in (a handle and password, or GitHub), and what saved state means.
 
 2. (Criteria 2, 4, 5) Which BBS runs on the server: ENiGMA½ (BSD-2, maintained, multi-node with
    boards, mail and paging built in), a small server of our own, or Maximus translated like VC?
+
+2. Eugene, 2026-10-01: ENiGMA½ answers the call.
+3. Eugene, 2026-10-01: it runs on the `axis` k3s node, at `bbs.notanemulator.com`.
+
+## Decision — 2026-10-01
+
+- **Client:** MS-DOS Kermit, translated, on H:. A virtual Hayes modem on COM1 bridges `ATDT` to a
+  WebSocket in the page, or TCP on Linux, at `bbs.notanemulator.com`.
+- **Server:** ENiGMA½ on `axis` behind Traefik with TLS: accounts, boards, private mail, who's
+  online, paging and chat. Eugene is the sysop.
+- **Later:** saved state per user (H: tied to the BBS account) and translated BBS doors.
