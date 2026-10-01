@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const dir = process.argv[2] || "build/web";
-const built = ["vc.mjs", "vc.wasm", "vc-web.js", "speaker.js"];
+const built = ["vc.mjs", "vc.wasm", "vc-web.js", "speaker.js", "graphics.js"];
 const sources = {
   "index.html": readFileSync(join(dir, "index.html"), "utf8"),
   "vc-web.js": readFileSync(join(dir, "vc-web.js"), "utf8"),

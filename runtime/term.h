@@ -12,6 +12,8 @@ void term_set_output(TermOutput output, void *opaque);
 void term_set_truecolor(int enabled);
 void term_invalidate(void);
 void term_bell(void);
+/* Test hook: total complete CGA pixel/braille decodes, independent of timing. */
+unsigned term_graphics_decode_count(void);
 
 /* Streaming parser entry points. Times are monotonic milliseconds; an Esc is
  * resolved only after 30 ms without another input byte. */

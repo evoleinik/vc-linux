@@ -2,6 +2,7 @@ import { Terminal } from "./vendor/xterm.mjs";
 // __V__ is replaced per build, so a cached page never mixes two builds.
 import createVC from "./vc.mjs?v=__V__";
 import { createSpeaker } from "./speaker.js?v=__V__";
+import { createGraphics } from "./graphics.js?v=__V__";
 
 const container = document.getElementById("terminal");
 const layout = document.querySelector("main");
@@ -16,6 +17,7 @@ let inputBytes = 0;
 let exited = false;
 let terminal;
 const speaker = createSpeaker();
+let graphics;
 
 function enqueue(data) {
   if (exited || !data) return;
@@ -160,6 +162,7 @@ window.addEventListener("keydown", (event) => {
 }, { capture: true });
 window.addEventListener("blur", releaseModifiers);
 container.addEventListener("focusout", releaseModifiers);
+container.addEventListener("pointerdown", () => terminal?.focus());
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) releaseModifiers();
 });
@@ -194,6 +197,12 @@ async function start() {
   terminal.onData(enqueue);
   terminal.attachCustomKeyEventHandler(handleKey);
   terminal.open(container);
+  const canvas = document.createElement("canvas");
+  canvas.id = "graphics";
+  canvas.hidden = true;
+  canvas.setAttribute("aria-label", "CGA graphics screen");
+  container.appendChild(canvas);
+  graphics = createGraphics(canvas, container);
   fit();
   terminal.focus();
   // Any-motion tracking, so VC's mouse cursor follows the pointer without a click.
@@ -217,6 +226,7 @@ async function start() {
     vcReadInput: readInput,
     vcExit: onExit,
     vcSpeaker: (frequency) => speaker.setFrequency(frequency),
+    vcGraphics: (frame) => graphics.draw(frame),
   });
 }
 

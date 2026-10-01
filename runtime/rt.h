@@ -24,6 +24,11 @@ extern int rt_exit_code;
 void rt_log(const char *fmt, ...);
 void rt_update_clock(void);
 void rt_register_image(const Image *img, uint16_t loadseg);
+/* A separately generated set of listing-proved entry points may supplement
+ * an unchanged image translation. The dispatcher still checks that image's
+ * bytes before either runner, including when the guest copies code. */
+typedef int (*RtImageRunner)(uint32_t off, uint16_t loadseg);
+void rt_register_supplement(const Image *img, RtImageRunner run);
 void rt_run(void);
 /* Effective PIT channel-2 frequency, or zero when its gate/speaker is off.
  * Linux stays silent; the browser forwards changes to Module.vcSpeaker. */
@@ -44,6 +49,9 @@ int dos_run_psp(void);
 /* Stop a non-VC child after an untranslated transfer. Return 0 for VC itself,
  * including its overlay child, so the dispatcher keeps its fatal diagnostic. */
 int dos_abort_untranslated(void);
+/* Ctrl-Break stops only a non-VC child that has not installed INT 1Bh.
+ * Return 0 when the dispatcher should deliver the guest's own interrupt. */
+int dos_abort_break(void);
 /* Handle a software interrupt other than 10h, 16h, 21h and 33h.
  * Returns 1 if the stub should return with a full IRET, 0 for RETF 2. */
 int dos_int_other(uint8_t n);

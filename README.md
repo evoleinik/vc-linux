@@ -14,8 +14,8 @@ comes out is native x86-64 code. No emulator runs at run time. You manage real L
 the real VC: the same keys, colours, dialogs and quirks.
 
 **Try it in your browser: [notanemulator.com](https://notanemulator.com/).**
-The same translated code, compiled to WebAssembly. It starts at once, with GW-BASIC and twelve
-classic BASIC games on its `H:` drive.
+The same translated code, compiled to WebAssembly. It starts at once, with GW-BASIC, bootLogo
+turtle graphics, and twelve classic BASIC games on its `H:` drive.
 
 ## Why not DOSBox, mc or far2l?
 
@@ -60,6 +60,7 @@ goes to `~/.cache/vc-linux/vc.log`.
 | Alt-letter | Speed search | takes a `*` wildcard |
 | Command line | Translated DOS programs, else `/bin/sh` | Searches the current DOS directory and DOS `PATH` for `.COM`/`.EXE`; `vc` runs native VC; `cd ~` works |
 | Enter on `.BAS` | GW-BASIC | `SYSTEM` returns to VC; Ctrl-Pause or Ctrl-Shift-B stops BASIC |
+| `bootlogo`, or Enter on `BOOTLOGO.COM` | bootLogo turtle graphics | `QUIT`, then VC's Enter confirmation returns to the panels |
 | Mouse | Click to move the cursor | SGR mouse reporting |
 
 Drives: `C:` is `/` and `H:` is your home directory. Names are shown in code page 866, so Cyrillic
@@ -76,6 +77,20 @@ Linux installs the interpreter in the config directory; bring your own `.bas` fi
 stays silent. A `CALL` or `USR` into code without a translation stops that BASIC session with a
 short message and returns to VC.
 
+Type `bootlogo` for Oscar Toledo G.'s original bootLogo. Try `REPEAT 4 [REPEAT 4 [FD 20 RT 90] RT 90]`
+or `REPEAT 36 [FD 60 RT 170]`. `QUIT` exits; VC's own DOS code then asks for Enter and restores
+its text panels. `BOOTLOGO.COM` is a real, 503-byte NASM-built COM file installed next to GW-BASIC.
+Renamed copies run by the same byte-matching EXEC rule. The `logo` command remains available
+for a host program such as UCBLogo.
+
+CGA modes 4/5 (320×200, four colours) and 6 (640×200, two colours) use real interlaced B800h
+video memory. GW-BASIC's `SCREEN 1`, `PSET`, `LINE`, `CIRCLE` and `DRAW` work; `SCREEN 0`
+returns BASIC to text. Terminals display an 80×25 coloured braille reduction; a browser shows
+the exact pixels on a crisp canvas. The original BASIC has only 31 bytes of typeahead, so type
+long statements normally rather than pasting a whole line at once. bootLogo is deliberately
+tiny: always close brackets, keep procedure definitions under 120 characters, and avoid zero
+distances or repeat counts (which mean 65536).
+
 In a plain terminal, Ctrl-[ sends the same byte as Esc. Ctrl-I sends the same byte as Tab, and
 Ctrl-M the same as Enter. VC gives each of them a different job, so vc asks the terminal to report
 keys in full. kitty, foot, Ghostty, Alacritty and iTerm2 do it through the kitty keyboard protocol.
@@ -85,17 +100,21 @@ WezTerm does too once `enable_kitty_keyboard` is on. xterm does it through modif
 
 The same translated C also compiles to WebAssembly with Emscripten. The page opens VC at once on a
 small in-memory `H:` drive holding a README, VC's history, its own assembly sources, GW-BASIC,
-and twelve of David Ahl's public-domain BASIC Computer Games. xterm.js
+bootLogo, and twelve of David Ahl's public-domain BASIC Computer Games. xterm.js
 shows the screen in the IBM VGA font. The page reports keys in full, so Ctrl-[, Ctrl-I and Ctrl-M
 work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload. There is no shell
 and no editor, but `cd` and translated DOS programs run from the command line. Open `GAMES` and
 press Enter on a `.BAS` file to play. `BEEP`, `SOUND` and `PLAY` use a Web Audio square wave after
 the first key press. Use Ctrl-Pause or Ctrl-Shift-B to stop a game, then `SYSTEM` to return to VC.
+`BOOTLOGO.TXT` explains bootLogo with a square, a star and the original README's flower. The original
+`GAMES\SPIRAL.BAS` example uses BASIC's `SCREEN 1` and `DRAW`; press a key when it finishes to
+return to text. The CGA canvas occupies the same screen area as xterm and keeps its keyboard
+input active.
 
 To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
 
     make web          # build/web/: index.html, vc.mjs, vc.wasm
-    make test-web     # Node checks VC, GW-BASIC, arithmetic, speaker and SYSTEM
+    make test-web     # Node checks VC, BASIC, Logo, CGA pixels, sound and returns
 
 Serve `build/web/` over HTTP to open it. The design is in `docs/plans/2026-10-01-browser-build.md`.
 
@@ -125,10 +144,13 @@ flowchart LR
   TERM[BIOS video, keyboard, mouse on a terminal] --> BIN
 ```
 
-- **The translator** (`translator/`) reads instruction boundaries from the assembler listing and
+- **The translator** (`translator/`) reads JWasm or NASM instruction boundaries from the assembler listing and
   decodes the linked bytes with capstone. It emits C for each instruction, flags included. It
   also decodes bytes the CPU runs that the listing calls data. VC starts by executing the text
   `RESIDENT`.
+  bootLogo's single mutable pen-colour operand is read from live memory. Four indirect
+  `DRAW` entries are emitted in a separate, source-proved supplement; VC's and GW-BASIC's
+  original generated C stay byte-identical.
 - **The runtime** (`runtime/rt.c`, `runtime/dos_core.c`) keeps the machine faithful: a 1 MB
   memory array, a real stack, a real interrupt vector table, MCB chain and PSPs. VC's tricks run
   as written. It runs VC.OVL as a child process, splits its own memory block, and copies its
@@ -146,15 +168,16 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 
 | Suite | What it proves |
 |---|---|
-| `test-translator` | All 63,680 distinct instructions in VC and GW-BASIC match Unicorn from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
+| `test-translator` | All 63,901 distinct instructions in VC, GW-BASIC and bootLogo match Unicorn from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
 | `test-fs` | The DOS file layer, including GW-BASIC's DOS 1.x FCB calls: over 4,300 checks against a temporary tree. |
 | `test-exec` | Byte-identical EXEC, DOS search order, command tails, safe missing associations and child FCB cleanup. |
 | `test-machine` | Timer interrupts, IF, HLT, Ctrl-Break, PIT speaker frequencies and declared mutable operands. |
 | `test-process` | Child fault recovery, parent interrupt/device state, and fatal no-translation faults in VC itself. |
 | `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,600 checks. |
+| `test-cga` | Every CGA mode and pixel address, palette, XOR/readback, graphics glyphs, cursor and scrolling: over 823,000 checks. |
 | `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
-| `test-web` | The WebAssembly build under Node: VC, GW-BASIC, arithmetic, BEEP/SOUND/PLAY hooks, SYSTEM and quit. Needs Emscripten. |
-| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real GW-BASIC launches, identity/injection checks, Ctrl-Break and every shipped game's first prompt. |
+| `test-web` | The WebAssembly build under Node: VC, GW-BASIC, bootLogo, exact CGA pixels, canvas transitions, BEEP/SOUND/PLAY hooks and quit. Needs Emscripten. |
+| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real DOS launches, identity/injection checks, Ctrl-Break, every shipped game's first prompt, Logo drawings and BASIC graphics. |
 
 Every finding from the three code reviews was fixed with a test that failed on the old code first.
 
@@ -163,12 +186,16 @@ Every finding from the three code reviews was fixed with a test that failed on t
 - `VC_TRACE=1 build/vc` logs every INT 21h call with its string argument and result.
 - `kill -USR1 <pid>` logs the registers and the last 256 addresses the dispatcher ran.
 - `VC_SCREEN_DUMP=file` writes video memory as text after every render.
+  In CGA modes it writes the 80×25 braille drawing.
+- `VC_FRAME_DUMP=file` writes exact pixels as a binary P5 PGM: 320×200 with maximum 3 (modes
+  4/5), or 640×200 with maximum 1 (mode 6). Bytes are raw CGA palette indices, not converted
+  brightness. Returning to text leaves the last graphics frame available for inspection.
 
 ## Layout
 
 - `asm/` VC 4.99.09 sources by Vsevolod V. Volkov, BSD-2, from the
   [ddanila/vc](https://github.com/ddanila/vc) build branch.
-- `translator/` Python: JWasm listing plus linked image to C.
+- `translator/` Python: JWasm/NASM listing plus linked image to C.
 - `runtime/` C: machine state, dispatcher, loader, DOS and BIOS services, terminal.
 - `data/` default `VC.INI` (written by VC itself), `VCEDIT.EXT`, `VC.HLP`.
 - `web/` the browser page, its H: README, and vendored xterm.js and IBM VGA font with their
@@ -211,6 +238,12 @@ public domain in 2022; the game listings are vendored from `coding-horror/basic-
 Build-time conversion changes DOS names and line endings; Star Trek additionally gets spaces
 around compact `TO`/`STEP` keywords for this interpreter's tokenizer. Vendored listings stay
 unchanged. The first-prompt gate is not a claim that every later branch of a game was tested.
+
+bootLogo is Oscar Toledo G.'s BSD-2-CLAUSE Logo (`third_party/bootlogo`); NASM 3.02 builds its
+unchanged COM source (`tools/nasm`). Graphics text uses Daniel Hepper's public-domain 8×8 fonts
+(`third_party/font8x8`). The shared CP437/866 box and block characters have glyphs; other
+unsupported non-ASCII graphics characters remain blank. `web/GAMES/SPIRAL.BAS` is an original
+example under this repository's BSD-2 license, separate from Ahl's public-domain games.
 
 The translator, runtime and tests are BSD 2-Clause (`LICENSE`). They were built with Claude Code
 and OpenAI Codex.

@@ -18,9 +18,15 @@
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); \
 } } while (0)
 
-enum { CHILD_FAULT, IRQ_FAULT, ROOT_FAULT, OVERLAY_FAULT };
+enum {
+    CHILD_FAULT, IRQ_FAULT, ROOT_FAULT, OVERLAY_FAULT,
+    CHILD_BREAK, DEFAULT_BREAK, BLOCKED_BREAK, HOOKED_BREAK, ROOT_BREAK,
+};
 static int scenario;
 static unsigned child_runs, child_irqs, parent_ticks, parent_breaks, steps, renders;
+static unsigned child_breaks;
+static int child_busy, break_sent;
+static uint64_t last_input_poll;
 static uint64_t now_ns = 1000000000ull;
 static uint16_t parent_psp, child_psp, child_env, child_allocation;
 static Cpu saved_parent;
@@ -47,6 +53,7 @@ const Image image_gwbasic = {
     .name = "GWBASIC.EXE", .is_exe = 1, .bytes = basic_file + 16, .size = 256,
     .hdr_sp = 0x800, .min_alloc = 0x100, .max_alloc = 0x100, .run = basic_run,
 };
+const Image image_bootlogo = {.name = "LOGO.COM"}; /* Not executed by this fixture. */
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file},
@@ -63,6 +70,14 @@ int clock_gettime(clockid_t clock, struct timespec *time) {
 
 void term_idle(int milliseconds) {
     if (milliseconds > 0) now_ns += (uint64_t)milliseconds * 1000000ull;
+    if (child_busy) {
+        CHECK(now_ns - last_input_poll <= 50000000ull);
+        last_input_poll = now_ns;
+        if (!break_sent) {
+            break_sent = 1;
+            bios_request_break();
+        }
+    }
 }
 void term_shutdown(void) {}
 void term_suspend(void) { CHECK(0); } /* Nothing here may invoke a host shell. */
@@ -134,11 +149,18 @@ static void check_recovery(void) {
     CHECK(rt_speaker_hz() == 0 && !bios_take_break());
     CHECK(parent_ticks == 0 && parent_breaks == 0); /* No replay of child events. */
     CHECK(child_runs == 1 && child_irqs == (unsigned)(scenario == IRQ_FAULT));
+    CHECK(child_breaks == (unsigned)(scenario == HOOKED_BREAK));
     CHECK(rd16((uint16_t)(child_psp - 1), 1) == 0);
     CHECK(rd16((uint16_t)(child_env - 1), 1) == 0);
     CHECK(rd16((uint16_t)(child_allocation - 1), 1) == 0);
     CHECK(renders > 0);
-    CHECK(strstr(screen, "No translated code at 0000:0000."));
+    if (scenario == CHILD_BREAK || scenario == DEFAULT_BREAK || scenario == BLOCKED_BREAK) {
+        CHECK(break_sent);
+        CHECK(rd16(0x40, 0x1a) == rd16(0x40, 0x1c)); /* No synthetic NUL. */
+        CHECK(strstr(screen, "Ctrl-Break."));
+    } else {
+        CHECK(strstr(screen, "No translated code at 0000:0000."));
+    }
     CHECK(strstr(screen, "GWBASIC.EXE stopped."));
 }
 
@@ -159,6 +181,12 @@ static int parent_run(uint32_t off, uint16_t loadseg) {
     case 0:
         parent_psp = cpu.ds;
         if (scenario == ROOT_FAULT) { no_code(); break; }
+        if (scenario == ROOT_BREAK) {
+            vector(0x1b, parent_psp, 0x1c8);
+            bios_request_break();
+            cpu.ip = 0x108;
+            break;
+        }
         cpu.es = parent_psp;
         cpu.a.x = 0x4a00;
         cpu.b.x = 0x1000;
@@ -166,6 +194,12 @@ static int parent_run(uint32_t off, uint16_t loadseg) {
         cpu_int(0x21, 0x108);
         break;
     case 8:
+        if (scenario == ROOT_BREAK) {
+            CHECK(parent_breaks == 1 && !bios_take_break());
+            CHECK(rd16(0x40, 0x1a) == rd16(0x40, 0x1c));
+            rt_exited = 1;
+            break;
+        }
         CHECK(!cpu.cf);
         cpu.ds = parent_psp;
         cpu.d.x = 0x2000;
@@ -183,12 +217,15 @@ static int parent_run(uint32_t off, uint16_t loadseg) {
         exec_child(scenario == OVERLAY_FAULT ? "VC.OVL" : "GWBASIC.EXE", 0x118);
         break;
     case 24:
+        child_busy = 0;
         check_recovery();
         cpu.a.x = 0x4d00;
         cpu_int(0x21, 0x120);
         break;
     case 32:
         CHECK(cpu.a.x != 0); /* Abnormal child exit is visible to its parent. */
+        if (scenario == CHILD_BREAK || scenario == DEFAULT_BREAK || scenario == BLOCKED_BREAK)
+            CHECK(cpu.a.h == 1); /* DOS termination type: Ctrl-Break. */
         cpu.a.x = 0x2f00;
         cpu_int(0x21, 0x128);
         break;
@@ -228,12 +265,20 @@ static int parent_run(uint32_t off, uint16_t loadseg) {
 }
 
 static int basic_run(uint32_t off, uint16_t loadseg) {
-    if (off != 0x80 && (off > 24 || off % 8)) return -1;
+    if (off != 0x80 && off != 0x88 && (off > 32 || off % 8)) return -1;
     CHECK(++steps < 1000 && cpu.cs == loadseg);
     if (off == 0x80) {
         CHECK(scenario == IRQ_FAULT && !cpu.ifl);
         ++child_irqs;
         no_code(); /* Deliberately abandon IRQ 0 without sending EOI. */
+        return 0;
+    }
+    if (off == 0x88) {
+        CHECK(scenario == HOOKED_BREAK && !cpu.ifl);
+        ++child_breaks;
+        cpu.ip = pop16();
+        cpu.cs = pop16();
+        flags_set(pop16());
         return 0;
     }
     switch (off) {
@@ -269,13 +314,26 @@ static int basic_run(uint32_t off, uint16_t loadseg) {
         break;
     case 24:
         vector(0x08, loadseg, 0x80);
-        vector(0x1b, loadseg, 0x88);
+        if (scenario == DEFAULT_BREAK)
+            vector(0x1b, STUB_SEG, 0x1b);
+        else if (scenario != CHILD_BREAK && scenario != BLOCKED_BREAK)
+            vector(0x1b, loadseg, 0x88);
         vector(0x1c, loadseg, 0x90);
         divisor(0, 2983);
         divisor(2, 2700);
         port_out8(0x61, 3);
         CHECK(rt_speaker_hz() > 0);
-        if (scenario == IRQ_FAULT) {
+        if (scenario >= CHILD_BREAK) {
+            port_out8(0x21, 0xff);
+            cpu.ifl = 1;
+            child_busy = 1;
+            last_input_poll = now_ns;
+            cpu.ip = 0x20;
+            if (scenario == BLOCKED_BREAK) {
+                cpu.a.x = 0x0700; /* DOS single-byte input is interruptible too. */
+                cpu_int(0x21, 0x20);
+            }
+        } else if (scenario == IRQ_FAULT) {
             port_out8(0x21, 0xfe);
             now_ns += 10000000ull;
             cpu.ip = 0x20; /* IRQ delivery must preempt this untranslated IP. */
@@ -285,6 +343,17 @@ static int basic_run(uint32_t off, uint16_t loadseg) {
             bios_request_break();
             now_ns += 1000000000ull;
             no_code();
+        }
+        break;
+    case 32:
+        CHECK(scenario != BLOCKED_BREAK); /* Break must never return a NUL. */
+        CHECK(now_ns - last_input_poll <= 50000000ull);
+        if (scenario == HOOKED_BREAK && child_breaks == 1) {
+            CHECK(rd16(0x40, 0x1a) == rd16(0x40, 0x1c));
+            child_busy = 0;
+            no_code(); /* Recovery checks below still exercise the fault path. */
+        } else {
+            now_ns += 1000000ull; /* Tight translated work: no BIOS or DOS calls. */
         }
         break;
     }
@@ -346,6 +415,11 @@ int main(void) {
     failed += run_case("untranslated child IRQ restores parent", IRQ_FAULT, 0);
     failed += run_case("root VC remains fatal", ROOT_FAULT, 70);
     failed += run_case("VC.OVL child remains fatal", OVERLAY_FAULT, 70);
+    failed += run_case("Ctrl-Break stops child with inherited parent hook", CHILD_BREAK, 0);
+    failed += run_case("Ctrl-Break stops child with default hook", DEFAULT_BREAK, 0);
+    failed += run_case("Ctrl-Break interrupts a blocking DOS read", BLOCKED_BREAK, 0);
+    failed += run_case("Ctrl-Break preserves the child's own hook", HOOKED_BREAK, 0);
+    failed += run_case("Ctrl-Break leaves root VC running", ROOT_BREAK, 0);
     const char *names[] = {"VC.COM", "VC.OVL", "GWBASIC.EXE", "CHILD.DAT"};
     for (unsigned i = 0; i < sizeof names / sizeof names[0]; ++i) {
         char path[256];
@@ -353,6 +427,6 @@ int main(void) {
         CHECK(unlink(path) == 0);
     }
     CHECK(rmdir(fixture_dir) == 0);
-    printf("test_rt_process: 4 cases, %d failures\n", failed);
+    printf("test_rt_process: 9 cases, %d failures\n", failed);
     return failed ? 1 : 0;
 }

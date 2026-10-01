@@ -39,6 +39,19 @@ EM_JS(int, browser_read, (uint8_t *data, size_t capacity), {
     return bytes.length;
 });
 
+/* Frames use CGA's raw colour indices, not luminance. Copy both arrays: the
+ * wasm heap is reused on the next render and the page may retain a frame. */
+EM_JS(void, browser_graphics,
+      (unsigned mode, unsigned width, const uint8_t *pixels,
+       const uint8_t *palette), {
+    if (!Module['vcGraphics']) return;
+    Module['vcGraphics'](width ? {
+        mode: mode, width: width, height: 200,
+        pixels: HEAPU8.slice(pixels, pixels + width * 200),
+        palette: HEAPU8.slice(palette, palette + 12),
+    } : null);
+});
+
 static uint64_t last_browser_yield;
 
 static void browser_output(const char *data, size_t n, void *opaque)
@@ -91,6 +104,10 @@ static unsigned host_columns, host_rows;
 static uint16_t shadow[MAX_CELLS]; /* Always raw guest cells, never mouse XOR. */
 static int shadow_valid, cursor_known, old_mouse_visible, old_blink;
 static unsigned old_columns, old_rows, old_cursor, old_shape;
+static unsigned old_graphics_width;
+#ifdef __EMSCRIPTEN__
+static int browser_graphics_visible;
+#endif
 static unsigned old_mouse_column, old_mouse_row;
 static int old_cursor_visible;
 static char output_buffer[8192];
@@ -102,6 +119,18 @@ static uint64_t last_input_ms;
 static unsigned held_modifiers, mouse_buttons;
 static int input_eof;
 static uint64_t monotonic_ms(void);
+static uint8_t graphics_pixels[640 * 200];
+static uint16_t graphics_cells[80 * 25];
+/* Keep source validity separate from the terminal shadow: resize, a new
+ * output sink, or an output failure needs a repaint, not another decode. */
+static uint8_t graphics_source[0x4000], graphics_mode, graphics_palette;
+static int graphics_source_valid;
+static unsigned graphics_decode_count;
+
+unsigned term_graphics_decode_count(void)
+{
+    return graphics_decode_count;
+}
 
 static const int fatal_signals[] = {
     SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGABRT, SIGSEGV, SIGBUS, SIGFPE,
@@ -249,9 +278,8 @@ static void emit_attribute(unsigned attribute, int blink)
     emit(sequence, (size_t)n);
 }
 
-static void emit_glyph(uint8_t byte)
+static void emit_ucs(unsigned code)
 {
-    unsigned code = screen_ucs(byte);
     char utf8[3];
     size_t n;
     if (code < 0x80) {
@@ -270,6 +298,117 @@ static void emit_glyph(uint8_t byte)
     emit(utf8, n);
 }
 
+static void emit_glyph(uint8_t byte)
+{
+    emit_ucs(screen_ucs(byte));
+}
+
+/* Use the fixed xterm colour cube / greys, not its theme-dependent first
+ * sixteen entries. This is the nearest available RGB to each CGA colour. */
+static unsigned graphics_256(unsigned index)
+{
+    static const uint8_t colours[16] = {
+        16, 19, 34, 37, 124, 127, 130, 248,
+        240, 63, 83, 87, 203, 207, 227, 231
+    };
+    return colours[index & 15];
+}
+
+static void emit_graphics_attribute(unsigned attribute)
+{
+    if (truecolor) {
+        emit_attribute(attribute, 0);
+        return;
+    }
+    char sequence[64];
+    int n = snprintf(sequence, sizeof(sequence), "\033[0;38;5;%u;48;5;%um",
+                     graphics_256(attribute & 15),
+                     graphics_256((attribute >> 4) & 15));
+    emit(sequence, (size_t)n);
+}
+
+/* One terminal cell covers 4x8 (modes 4/5) or 8x8 (mode 6) source pixels.
+ * A braille dot is set by ANY foreground pixel in its reduction rectangle;
+ * the cell's colour counts source pixels, not dots. A nonzero index may map
+ * to the background RGB too; those invisible pixels do not count as ink.
+ * Ties prefer lower indices. */
+static int collect_graphics(unsigned width)
+{
+    /* Guest programs can write CGA memory and BDA bytes directly. BIOS-only
+     * dirty flags would miss those writes, including the aperture's tails. */
+    if (graphics_source_valid && graphics_mode == mem[0x449] &&
+        graphics_palette == mem[0x466] &&
+        !memcmp(graphics_source, mem + SCREEN, sizeof(graphics_source)))
+        return 0;
+    memcpy(graphics_source, mem + SCREEN, sizeof(graphics_source));
+    graphics_mode = mem[0x449];
+    graphics_palette = mem[0x466];
+    graphics_source_valid = 1;
+    ++graphics_decode_count;
+    static const unsigned dots[4][2] = {{1,8}, {2,16}, {4,32}, {64,128}};
+    uint8_t colours[4];
+    for (unsigned i = 0; i < 4; ++i)
+        colours[i] = bios_cga_color(i);
+    for (unsigned y = 0; y < 200; ++y)
+        for (unsigned x = 0; x < width; ++x)
+            graphics_pixels[y * width + x] = (uint8_t)bios_graphics_pixel(x, y);
+    unsigned scale_x = width / 160;
+    for (unsigned row = 0; row < 25; ++row) {
+        for (unsigned column = 0; column < 80; ++column) {
+            unsigned mask = 0, counts[4] = {0}, colour = 0;
+            for (unsigned y = 0; y < 8; ++y) {
+                for (unsigned x = 0; x < scale_x * 2; ++x) {
+                    unsigned pixel = graphics_pixels[(row * 8 + y) * width +
+                                                      column * scale_x * 2 + x];
+                    if (colours[pixel] != colours[0]) {
+                        mask |= dots[y / 2][x / scale_x];
+                        ++counts[pixel];
+                    }
+                }
+            }
+            for (unsigned pixel = 1; pixel < 4; ++pixel)
+                if (counts[pixel] > counts[colour])
+                    colour = pixel;
+            graphics_cells[row * 80 + column] = (uint16_t)(mask |
+                (colours[colour] << 8) | (colours[0] << 12));
+        }
+    }
+    return 1;
+}
+
+static void render_graphics(unsigned view_columns, unsigned view_rows)
+{
+    output_failed = 0;
+    output_batch = 1;
+    int last_attribute = -1;
+    if (!shadow_valid)
+        emit_string("\033[0m\033[2J\033[?25l");
+    for (unsigned row = 0; row < view_rows; ++row) {
+        int contiguous = 0;
+        for (unsigned column = 0; column < view_columns; ++column) {
+            unsigned cell = row * 80 + column;
+            uint16_t raw = graphics_cells[cell];
+            if (shadow_valid && shadow[cell] == raw) {
+                contiguous = 0;
+                continue;
+            }
+            if (!contiguous)
+                emit_position(column, row);
+            if ((int)(raw >> 8) != last_attribute) {
+                last_attribute = raw >> 8;
+                emit_graphics_attribute((unsigned)last_attribute);
+            }
+            emit_ucs(0x2800 | (raw & 255));
+            shadow[cell] = raw;
+            contiguous = 1;
+        }
+    }
+    flush_output();
+    output_batch = 0;
+    shadow_valid = !output_failed;
+    cursor_known = 0;
+}
+
 static void read_host_size(void)
 {
     struct winsize size;
@@ -279,16 +418,11 @@ static void read_host_size(void)
     }
 }
 
-/* VC_SCREEN_DUMP=path: after every render, write the text screen as UTF-8.
+/* VC_SCREEN_DUMP=path: UTF-8 text, or the same 80x25 braille used by the tty.
  * Tests compare it with what a terminal emulator shows. */
-static void dump_screen(void)
+static void dump_screen(unsigned graphics_width)
 {
-    static const char *path;
-    static int checked;
-    if (!checked) {
-        path = getenv("VC_SCREEN_DUMP");
-        checked = 1;
-    }
+    const char *path = getenv("VC_SCREEN_DUMP");
     if (!path)
         return;
     char tmp[4096];
@@ -296,10 +430,13 @@ static void dump_screen(void)
     FILE *f = fopen(tmp, "w");
     if (!f)
         return;
-    unsigned columns = bios_columns(), rows = bios_rows();
+    unsigned columns = graphics_width ? 80 : bios_columns();
+    unsigned rows = graphics_width ? 25 : bios_rows();
     for (unsigned row = 0; row < rows; ++row) {
         for (unsigned column = 0; column < columns; ++column) {
-            unsigned code = screen_ucs(mem[SCREEN + 2 * (row * columns + column)]);
+            unsigned code = graphics_width ?
+                0x2800 | (graphics_cells[row * 80 + column] & 255) :
+                screen_ucs(mem[SCREEN + 2 * (row * columns + column)]);
             if (code < 0x80) fputc((int)code, f);
             else if (code < 0x800) { fputc(0xc0 | (code >> 6), f); fputc(0x80 | (code & 63), f); }
             else { fputc(0xe0 | (code >> 12), f); fputc(0x80 | ((code >> 6) & 63), f); fputc(0x80 | (code & 63), f); }
@@ -310,9 +447,62 @@ static void dump_screen(void)
     rename(tmp, path);
 }
 
+/* P5 PGM, exactly width*200 bytes in row order: each byte is the raw CGA
+ * palette index (maxval 3 in modes 4/5, 1 in mode 6), NOT scaled luminance.
+ * Returning to text preserves the last graphics frame for inspection. */
+static void dump_frame(unsigned width)
+{
+    const char *path = getenv("VC_FRAME_DUMP");
+    if (!width || !path)
+        return;
+    char tmp[4096];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+        return;
+    FILE *f = fopen(tmp, "wb");
+    if (!f)
+        return;
+    fprintf(f, "P5\n%u 200\n%u\n", width, width == 640 ? 1 : 3);
+    int complete = fwrite(graphics_pixels, 1, width * 200, f) == width * 200;
+    if (fclose(f) != 0)
+        complete = 0;
+    if (complete)
+        rename(tmp, path);
+}
+
 void term_render(void)
 {
-    dump_screen();
+    unsigned graphics_width = bios_graphics_width();
+    if (graphics_width != old_graphics_width) {
+        old_graphics_width = graphics_width;
+        term_invalidate();
+    }
+    int graphics_changed = 0;
+    if (graphics_width)
+        graphics_changed = collect_graphics(graphics_width);
+    else
+        graphics_source_valid = 0;
+    if (!graphics_width || graphics_changed) {
+        dump_screen(graphics_width);
+        dump_frame(graphics_width);
+    }
+#ifdef __EMSCRIPTEN__
+    if (graphics_width) {
+        if (!browser_graphics_visible || graphics_changed) {
+            uint8_t palette[12];
+            for (unsigned i = 0; i < 4; ++i)
+                memcpy(palette + i * 3, vga_rgb[bios_cga_color(i)], 3);
+            browser_graphics(mem[0x449], graphics_width, graphics_pixels, palette);
+        }
+        browser_graphics_visible = 1;
+        shadow_valid = 1;
+        return;
+    }
+    if (browser_graphics_visible) {
+        browser_graphics(0, 0, NULL, NULL);
+        browser_graphics_visible = 0;
+        term_invalidate();
+    }
+#endif
     if (!active && !output_sink)
         return;
     if (resize_pending) {
@@ -320,7 +510,8 @@ void term_render(void)
         read_host_size();
         term_invalidate();
     }
-    unsigned columns = bios_columns(), rows = bios_rows();
+    unsigned columns = graphics_width ? 80 : bios_columns();
+    unsigned rows = graphics_width ? 25 : bios_rows();
     unsigned view_columns = columns, view_rows = rows;
     /* A small host window is clipped, not allowed to scroll the emulated
      * screen. SIGWINCH invalidates the whole shadow when it grows again. */
@@ -328,6 +519,11 @@ void term_render(void)
         view_columns = host_columns;
     if (active && host_rows && view_rows > host_rows)
         view_rows = host_rows;
+    if (graphics_width) {
+        if (graphics_changed || !shadow_valid)
+            render_graphics(view_columns, view_rows);
+        return;
+    }
     int blink = bios_blink_enabled();
     if (columns != old_columns || rows != old_rows || blink != old_blink)
         term_invalidate();

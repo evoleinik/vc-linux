@@ -134,7 +134,8 @@ static void install_files(const char *dir) {
 #ifdef __EMSCRIPTEN__
         /* H: is the program drive in the browser. Configuration remains out
          * of sight under /var/vc/config, as before. */
-        const char *target = !strcmp(f->name, "GWBASIC.EXE") ? "/home/vc" : dir;
+        const char *target = !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM")
+            ? "/home/vc" : dir;
 #else
         const char *target = dir;
 #endif
@@ -144,12 +145,26 @@ static void install_files(const char *dir) {
             exit(1);
         }
         int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL") ||
-                      !strcmp(f->name, "GWBASIC.EXE");
+                      !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM");
         if (!program && access(path, F_OK) == 0 && !holds_retired_default(path, f->name)) continue;
-        if (file_matches(path, f)) continue;
-        if (install_file(path, f)) {
+        if (!file_matches(path, f) && install_file(path, f)) {
             fprintf(stderr, "vc: cannot write %s: %s\n", path, strerror(errno));
             exit(1);
+        }
+        if (!strcmp(f->name, "BOOTLOGO.COM")) {
+            /* Retire the old DOS PATH alias only after its replacement is
+             * installed. Changed files and user-created symlinks are not ours. */
+            length = snprintf(path, sizeof path, "%s/LOGO.COM", target);
+            if (length < 0 || (size_t)length >= sizeof path) {
+                fputs("vc: legacy program path is too long\n", stderr);
+                exit(1);
+            }
+            struct stat legacy;
+            if (!lstat(path, &legacy) && S_ISREG(legacy.st_mode) && file_matches(path, f) &&
+                unlink(path) && errno != ENOENT) {
+                fprintf(stderr, "vc: cannot retire %s: %s\n", path, strerror(errno));
+                exit(1);
+            }
         }
     }
 }
@@ -200,6 +215,7 @@ int main(int argc, char **argv) {
     snprintf(host_prog, sizeof host_prog, "%s/VC.COM", dir);
 
     dos_core_init();
+    rt_register_supplement(&image_gwbasic, run_gwbasic_graphics);
     bios_init();
     dos_fs_init();
     term_init();

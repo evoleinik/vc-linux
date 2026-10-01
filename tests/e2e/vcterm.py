@@ -41,6 +41,7 @@ class VcSession:
             "XDG_CONFIG_HOME": str(home / ".config"),
             "VC_LOG": str(self.log),
             "VC_SCREEN_DUMP": str(home / "screen.txt"),
+            "VC_FRAME_DUMP": str(home / "frame.pgm"),
             "TERM": "xterm-256color",
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "LANG": "C.UTF-8",
@@ -56,6 +57,7 @@ class VcSession:
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.exit_status: int | None = None
         self.dump = home / "screen.txt"
+        self.frame_dump = home / "frame.pgm"
 
     def pump(self, timeout: float = 0.05) -> None:
         while True:

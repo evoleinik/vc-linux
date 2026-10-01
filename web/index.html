@@ -32,8 +32,19 @@
       justify-content: center;
       gap: 12px;
     }
-    #terminal { flex: none; }
+    #terminal { flex: none; position: relative; }
     #terminal .xterm-viewport { overflow-y: hidden; }
+    /* Keep xterm laid out and focusable: its textarea and key translator
+       still receive input while the pixels cover its invisible screen. */
+    #terminal.graphics-mode .xterm { opacity: 0; }
+    #graphics {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      pointer-events: none;
+    }
     footer { flex: none; max-width: 100%; text-align: center; }
     p { margin: 0; }
     a { color: #aaa; text-decoration-color: #666; }

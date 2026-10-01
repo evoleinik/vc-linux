@@ -13,10 +13,12 @@ B       := build
 CC      ?= gcc
 CFLAGS  ?= -O1 -g -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable
 ASM     := $(wildcard asm/*.ASM asm/*.INC)
+FONT_HEADERS := $(wildcard third_party/font8x8/*.h)
 
 all: $(B)/vc
 
 include tools/gwbasic.mk
+include tools/bootlogo.mk
 
 images: $(B)/VC.COM $(B)/VC.OVL
 
@@ -51,7 +53,7 @@ $(B)/gen/vc_com.c: $(B)/VC.COM $(B)/gen/VC.COM.lst $(wildcard translator/*.py)
 $(B)/gen/vc_ovl.c: $(B)/VC.OVL $(B)/gen/VC.OVL.lst $(wildcard translator/*.py)
 	$(PY) -m translator $(B)/VC.OVL $(B)/gen/VC.OVL.lst --name VC.OVL --symbol image_vc_ovl -o $@
 
-gen: $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c
+gen: $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c
 
 test-translator: gen
 	$(PY) -m pytest -q tests/test_translator_*.py
@@ -60,14 +62,14 @@ test-translator: gen
 
 # The terminal gate deliberately supplies its own Cpu and memory; CPU and DOS
 # file-system implementations are independent work and must not be linked here.
-$(B)/test_term: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h
+$(B)/test_term: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h $(FONT_HEADERS)
 	@mkdir -p $(B)
 	$(CC) $(CFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Iruntime runtime/bios.c runtime/term.c runtime/cp866.c tests/test_term.c -o $@
 
 test-term: $(B)/test_term
 	./$(B)/test_term
 
-$(B)/test_term_sanitize: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h
+$(B)/test_term_sanitize: tests/test_term.c runtime/bios.c runtime/bios.h runtime/term.c runtime/term.h runtime/cpu.h runtime/hle.h $(FONT_HEADERS)
 	@mkdir -p $(B)
 	$(CC) -std=c11 -O1 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer -Iruntime runtime/bios.c runtime/term.c runtime/cp866.c tests/test_term.c -o $@
 
@@ -75,6 +77,15 @@ test-term-sanitize: $(B)/test_term_sanitize
 	./$(B)/test_term_sanitize
 
 .PHONY: test-term test-term-sanitize
+
+$(B)/test_cga: tests/test_cga.c runtime/bios.c runtime/bios.h runtime/cpu.h runtime/hle.h runtime/term.h $(FONT_HEADERS)
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -std=c11 -Wextra -Wpedantic -Iruntime runtime/bios.c tests/test_cga.c -o $@
+
+test-cga: $(B)/test_cga
+	./$(B)/test_cga
+
+.PHONY: test-cga
 
 $(B)/test_dos_fs: tests/test_dos_fs.c runtime/dos_fs.c runtime/dos_fs.h runtime/cp866.c runtime/cp866.h runtime/cpu.h runtime/hle.h
 	@mkdir -p $(B)
@@ -101,7 +112,7 @@ test-exec: $(B)/test_dos_exec
 
 .PHONY: test-exec
 
-$(B)/test_machine: tests/test_machine.c runtime/rt.c runtime/cpu.c runtime/bios.c $(wildcard runtime/*.h)
+$(B)/test_machine: tests/test_machine.c runtime/rt.c runtime/cpu.c runtime/bios.c $(wildcard runtime/*.h) $(FONT_HEADERS)
 	@mkdir -p $(B)
 	$(CC) $(CFLAGS) -std=gnu11 -Wextra -Iruntime runtime/rt.c runtime/cpu.c runtime/bios.c tests/test_machine.c -o $@
 
@@ -110,7 +121,7 @@ test-machine: $(B)/test_machine
 
 .PHONY: test-machine
 
-$(B)/test_rt_process: tests/test_rt_process.c runtime/rt.c runtime/dos_core.c runtime/dos_fs.c runtime/cp866.c runtime/cpu.c runtime/bios.c $(wildcard runtime/*.h)
+$(B)/test_rt_process: tests/test_rt_process.c runtime/rt.c runtime/dos_core.c runtime/dos_fs.c runtime/cp866.c runtime/cpu.c runtime/bios.c $(wildcard runtime/*.h) $(FONT_HEADERS)
 	@mkdir -p $(B)
 	$(CC) $(CFLAGS) -std=gnu11 -Wextra -Iruntime tests/test_rt_process.c runtime/rt.c runtime/dos_core.c runtime/dos_fs.c runtime/cp866.c runtime/cpu.c runtime/bios.c -o $@
 
@@ -122,12 +133,12 @@ test-process: $(B)/test_rt_process
 # ---- the native binary -----------------------------------------------------
 RT_SRC := runtime/rt.c runtime/dos_core.c runtime/main.c runtime/cpu.c runtime/dos_fs.c \
           runtime/cp866.c runtime/bios.c runtime/term.c
-GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/files.c
+GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/files.c
 GEN_OBJ := $(patsubst $(B)/gen/%.c,$(B)/obj/%.o,$(GEN_SRC))
 
-$(B)/gen/files.c: $(B)/VC.COM $(B)/VC.OVL $(B)/gwbasic/GWBASIC.EXE data/VC.INI data/VC.EXT data/VCEDIT.EXT data/VC.HLP tools/embed.py
+$(B)/gen/files.c: $(B)/VC.COM $(B)/VC.OVL $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM data/VC.INI data/VC.EXT data/VCEDIT.EXT data/VC.HLP tools/embed.py Makefile
 	@mkdir -p $(B)/gen
-	$(PY) tools/embed.py $@ VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL GWBASIC.EXE=$(B)/gwbasic/GWBASIC.EXE VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT VC.HLP=data/VC.HLP
+	$(PY) tools/embed.py $@ VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL GWBASIC.EXE=$(B)/gwbasic/GWBASIC.EXE BOOTLOGO.COM=$(B)/bootlogo/LOGO.COM VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT VC.HLP=data/VC.HLP
 
 $(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h
 	@mkdir -p $(B)/obj
@@ -135,11 +146,11 @@ $(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h
 
 $(B)/obj/files.o: runtime/rt.h
 
-$(B)/vc: $(RT_SRC) $(wildcard runtime/*.h) $(GEN_OBJ)
+$(B)/vc: $(RT_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(GEN_OBJ)
 	$(CC) $(CFLAGS) -std=gnu11 -Iruntime -o $@ $(RT_SRC) $(GEN_OBJ)
 
 # The release binary: static and stripped, so it runs on any x86-64 Linux.
-$(B)/vc-static: $(RT_SRC) $(wildcard runtime/*.h) $(GEN_OBJ)
+$(B)/vc-static: $(RT_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(GEN_OBJ)
 	$(CC) -O2 -static -std=gnu11 -Iruntime -o $@ $(RT_SRC) $(GEN_OBJ)
 	strip $@
 
@@ -150,12 +161,12 @@ $(BASIC_GAME_FILES) &: tools/basic_games.py $(wildcard third_party/basic-compute
 games: $(BASIC_GAME_FILES)
 
 test-e2e: $(B)/vc games
-	$(PY) -m pytest -q tests/test_e2e.py tests/test_gwbasic_e2e.py tests/test_install_e2e.py tests/test_command_e2e.py
+	$(PY) -m pytest -q tests/test_e2e.py tests/test_gwbasic_e2e.py tests/test_install_e2e.py tests/test_command_e2e.py tests/test_logo_e2e.py
 
 test-ini: $(B)/VC.OVL
 	$(PY) -m pytest -q tests/test_setup_ini.py
 
-test: test-translator test-fs test-exec test-machine test-process test-term test-ini test-e2e
+test: test-translator test-fs test-exec test-machine test-process test-term test-cga test-ini test-e2e
 
 clean:
 	rm -rf $(B)
@@ -173,17 +184,17 @@ WEB_DEMO := $(WEB_WORK)/demo
 WEB_FLAGS := $(WEB_OPT) -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 \
              -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,node -sFORCE_FILESYSTEM \
              -sEXPORTED_RUNTIME_METHODS='["FS","ENV"]'
-WEB_DEMO_INPUT := web/README.TXT README.md asm/VC.ASM asm/VCOVL.ASM asm/LICENSE.TXT tools/web_demo.py $(BASIC_GAME_FILES) $(B)/gwbasic/GWBASIC.EXE third_party/gwbasic/LICENSE
-WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT HISTORY.TXT SRC/VC.ASM SRC/VCOVL.ASM SRC/LICENSE.TXT GWBASIC.EXE GWBASIC.TXT) $(patsubst $(B)/games/%,$(WEB_DEMO)/GAMES/%,$(BASIC_GAME_FILES))
-WEB_ASSETS := web/index.html web/vc-web.js web/speaker.js $(wildcard web/vendor/*)
+WEB_DEMO_INPUT := web/README.TXT web/BOOTLOGO.TXT web/GAMES/SPIRAL.BAS README.md asm/VC.ASM asm/VCOVL.ASM asm/LICENSE.TXT tools/web_demo.py $(BASIC_GAME_FILES) $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM third_party/gwbasic/LICENSE third_party/bootlogo/LICENSE
+WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT HISTORY.TXT SRC/VC.ASM SRC/VCOVL.ASM SRC/LICENSE.TXT GWBASIC.EXE GWBASIC.TXT BOOTLOGO.COM BOOTLOGO.TXT LOGOLIC.TXT GAMES/SPIRAL.BAS) $(patsubst $(B)/games/%,$(WEB_DEMO)/GAMES/%,$(BASIC_GAME_FILES))
+WEB_ASSETS := web/index.html web/vc-web.js web/speaker.js web/graphics.js $(wildcard web/vendor/*)
 WEB_COPIES := $(patsubst web/%,$(WEB_OUT)/%,$(WEB_ASSETS))
 
 # Grouped targets keep both the demo preparation and the single emcc link safe
 # under make -j.
 $(WEB_DEMO_FILES) &: $(WEB_DEMO_INPUT)
-	$(PY) tools/web_demo.py $(WEB_DEMO) $(B)/gwbasic/GWBASIC.EXE $(B)/games
+	$(PY) tools/web_demo.py $(WEB_DEMO) $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM
 
-$(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm &: $(RT_SRC) $(wildcard runtime/*.h) $(GEN_SRC) $(WEB_DEMO_FILES) Makefile
+$(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm &: $(RT_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(GEN_SRC) $(WEB_DEMO_FILES) Makefile
 	@mkdir -p $(WEB_OUT)
 	$(EMCC) $(WEB_FLAGS) \
 	  -std=gnu11 -Iruntime $(RT_SRC) $(GEN_SRC) --embed-file $(WEB_DEMO)@/home/vc -o $(WEB_OUT)/vc.mjs
@@ -195,9 +206,9 @@ $(WEB_OUT)/%: web/%
 # The page and its loader name every file with this build's hash, so a browser holding cached files
 # from an older build never mixes the two. GitHub Pages caches each file for 10 minutes.
 WEB_VERSIONED := $(WEB_OUT)/index.html $(WEB_OUT)/vc-web.js
-$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm web/index.html web/vc-web.js web/speaker.js
+$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm web/index.html web/vc-web.js web/speaker.js web/graphics.js
 	@mkdir -p $(dir $@)
-	v=$$(cat $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm web/index.html web/vc-web.js web/speaker.js | sha256sum | cut -c1-12); \
+	v=$$(cat $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm web/index.html web/vc-web.js web/speaker.js web/graphics.js | sha256sum | cut -c1-12); \
 	  sed "s/__V__/$$v/g" $< > $@
 
 web: $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm $(WEB_COPIES)
@@ -205,6 +216,7 @@ web: $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm $(WEB_COPIES)
 test-web: web
 	$(NODE) tests/web_assets.mjs $(WEB_OUT)
 	$(NODE) tests/test_web_speaker.mjs
+	$(NODE) tests/test_web_graphics.mjs
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs
 
 .PHONY: web test-web

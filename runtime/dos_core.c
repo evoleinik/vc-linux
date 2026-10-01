@@ -37,6 +37,7 @@ typedef struct {
     uint16_t child;    /* PSP of the running child */
     const Image *image;
     RtProcessState *machine;
+    uint32_t break_vector; /* Inherited INT 1Bh is not the child's hook. */
     Cpu parent;        /* parent registers at its EXEC call */
     uint16_t dta_seg, dta_off;
 } Proc;
@@ -342,11 +343,17 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
 /* Non-built-in EXECs select a translation by the complete original file,
  * including its MZ header and relocation table: comparing only the load module
  * would accept a damaged header. VC.COM and VC.OVL bypass this disk check. */
-static const Image *const images[] = {&image_vc_com, &image_vc_ovl, &image_gwbasic};
+static const Image *const images[] = {
+    &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo
+};
 
 static const EmbeddedFile *image_file(const Image *img) {
+    /* Installation names locate trusted reference bytes, not the program
+     * being EXECed. bootLogo's translation keeps its original NASM label;
+     * the candidate on disk is still matched only by its complete bytes. */
+    const char *name = img == &image_bootlogo ? "BOOTLOGO.COM" : img->name;
     for (int i = 0; i < embedded_file_count; i++)
-        if (!strcmp(embedded_files[i].name, img->name)) return &embedded_files[i];
+        if (!strcmp(embedded_files[i].name, name)) return &embedded_files[i];
     return NULL;
 }
 
@@ -803,6 +810,7 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     p->machine = rt_save_process_state();
     if (!p->machine) return 8;
     p->image = img;
+    p->break_vector = lin(rd16(0, 0x1b * 4 + 2), rd16(0, 0x1b * 4));
     p->parent = cpu;
     get_dta(&p->dta_seg, &p->dta_off);
     uint16_t ret_ip = rd16(cpu.ss, cpu.sp), ret_cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
@@ -909,23 +917,49 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
     hle_redirect = 1;
 }
 
-int dos_abort_untranslated(void) {
-    if (!nprocs) return 0;
+static Proc *abortable_child(void) {
+    if (!nprocs) return NULL;
     Proc *p = &procs[nprocs - 1];
     if (p->child != cur_psp || p->image == &image_vc_com || p->image == &image_vc_ovl)
-        return 0;
+        return NULL;
+    return p;
+}
+
+static void abort_child(Proc *p, uint8_t code, uint8_t how) {
+    RtProcessState *machine = p->machine;
+    p->machine = NULL;
+    terminate(code, 0, 0);
+    last_retcode |= (uint16_t)how << 8;
+    /* terminate also writes DOS exit vectors; restore the full parent IVT
+     * after that, including GW-BASIC's otherwise abandoned timer hooks. */
+    rt_finish_process_state(machine, 1);
+}
+
+int dos_abort_untranslated(void) {
+    Proc *p = abortable_child();
+    if (!p) return 0;
     char message[160];
     snprintf(message, sizeof message, "\r\nNo translated code at %04X:%04X. %s stopped.\r\n",
              cpu.cs, cpu.ip, p->image->name);
     rt_log("No translated code at %04X:%04X. %s stopped.", cpu.cs, cpu.ip, p->image->name);
     con_write((const uint8_t *)message, strlen(message));
     term_render(); /* Make the diagnostic visible before VC redraws its panels. */
-    RtProcessState *machine = p->machine;
-    p->machine = NULL;
-    terminate(70, 0, 0);
-    /* terminate also writes DOS exit vectors; restore the full parent IVT
-     * after that, including GW-BASIC's otherwise abandoned timer hooks. */
-    rt_finish_process_state(machine, 1);
+    abort_child(p, 70, 0);
+    return 1;
+}
+
+int dos_abort_break(void) {
+    Proc *p = abortable_child();
+    if (!p) return 0;
+    uint32_t handler = lin(rd16(0, 0x1b * 4 + 2), rd16(0, 0x1b * 4));
+    if (handler != p->break_vector && handler != lin(STUB_SEG, 0x1b))
+        return 0;
+    char message[96];
+    snprintf(message, sizeof message, "\r\nCtrl-Break. %s stopped.\r\n", p->image->name);
+    rt_log("Ctrl-Break. %s stopped.", p->image->name);
+    con_write((const uint8_t *)message, strlen(message));
+    term_render();
+    abort_child(p, 0, 1); /* INT 21h/4Dh reports termination by Ctrl-Break. */
     return 1;
 }
 

@@ -88,9 +88,6 @@ _Noreturn void rt_fault(const char *fmt, ...) {
 
 /* ---- clock and yielding -------------------------------------------------- */
 
-#ifndef __EMSCRIPTEN__
-static struct timespec last_idle;
-#endif
 static time_t midnight, next_midnight; /* local midnight, in epoch seconds */
 
 static uint64_t monotonic_ns(void) {
@@ -118,27 +115,13 @@ void rt_update_clock(void) {
     wr16(0x40, 0x6E, (uint16_t)(ticks >> 16));
 }
 
-#ifndef __EMSCRIPTEN__
-static long ms_since(const struct timespec *t) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (now.tv_sec - t->tv_sec) * 1000 + (now.tv_nsec - t->tv_nsec) / 1000000;
-}
-#endif
-
 void rt_yield(void) {
     rt_budget = 20000;
     rt_update_clock();
-#ifndef __EMSCRIPTEN__
-    if (ms_since(&last_idle) >= 40) {
-        term_idle(0);
-        clock_gettime(CLOCK_MONOTONIC, &last_idle);
-    }
-#endif
     /* Under Emscripten RT_TICK reaches here from translated functions behind
      * Image.run. Never sleep on that indirect stack: ASYNCIFY_IGNORE_INDIRECT
-     * leaves it uninstrumented. Only the dispatcher's direct interrupt path
-     * may reach term_idle and suspend execution. */
+     * leaves it uninstrumented. Terminal input/rendering/yielding all belong
+     * to rt_run's direct chain, on native builds as well as in the browser. */
 }
 
 /* ---- ports --------------------------------------------------------------- */
@@ -216,6 +199,7 @@ void rt_finish_process_state(RtProcessState *state, int restore) {
         timer_next_ns = monotonic_ns() + timer_period_ns();
         rt_halted = 0;
         bios_take_break();
+        bios_cancel_read();
         speaker_update();
     }
     free(state);
@@ -262,6 +246,7 @@ uint8_t port_in8(uint16_t port) {
     case 0x3D4: return crtc_index;
     case 0x3D5: return crtc_regs[crtc_index & 31];
     case 0x3D6: return 0; /* no OS/2 VIO */
+    case 0x3D9: return bios_cga_color_register();
     default: return 0xFF;
     }
 }
@@ -288,6 +273,7 @@ void port_out8(uint16_t port, uint8_t v) {
     else if (port == 0x21) pic_mask = v;
     else if (port == 0x3D4) crtc_index = v;
     else if (port == 0x3D5) crtc_regs[crtc_index & 31] = v;
+    else if (port == 0x3D9) bios_cga_color_select(v);
 }
 void port_out16(uint16_t port, uint16_t v) { port_out8(port, (uint8_t)v); port_out8((uint16_t)(port + 1), (uint8_t)(v >> 8)); }
 
@@ -315,6 +301,29 @@ typedef struct {
 #define MAX_KNOWN 4
 static Known known[MAX_KNOWN];
 static int nknown;
+static struct { const Image *image; RtImageRunner run; } supplements[MAX_KNOWN];
+static unsigned nsupplements;
+
+void rt_register_supplement(const Image *img, RtImageRunner run) {
+    if (!img || !run) rt_fault("invalid image supplement");
+    for (unsigned i = 0; i < nsupplements; ++i) {
+        if (supplements[i].image != img) continue;
+        if (supplements[i].run != run) rt_fault("conflicting image supplements");
+        return;
+    }
+    if (nsupplements == MAX_KNOWN) rt_fault("too many image supplements");
+    supplements[nsupplements].image = img;
+    supplements[nsupplements++].run = run;
+}
+
+static int run_image(Known *k, uint32_t off) {
+    int result = k->img->run(off, k->loadseg);
+    if (result == 0) return 0;
+    for (unsigned i = 0; i < nsupplements; ++i)
+        if (supplements[i].image == k->img)
+            return supplements[i].run(off, k->loadseg);
+    return result;
+}
 
 void rt_register_image(const Image *img, uint16_t loadseg) {
     uint32_t base = (uint32_t)loadseg << 4;
@@ -343,7 +352,7 @@ void rt_register_image(const Image *img, uint16_t loadseg) {
 
 static int run_moved(Known *k, uint32_t off, uint32_t L) {
     rt_code_delta = (int32_t)(L - (k->base + off));
-    int r = k->img->run(off, k->loadseg);
+    int r = run_image(k, off);
     rt_code_delta = 0;
     return r;
 }
@@ -393,7 +402,7 @@ static int run_at(uint32_t L) {
         if (L < k->base || L >= k->base + k->img->size) continue;
         uint32_t off = L - k->base;
         uint32_t n = k->img->size - off < 6 ? k->img->size - off : 6;
-        if (code_matches(k, off, L, n) && k->img->run(off, k->loadseg) == 0) { n_direct++; return 1; }
+        if (code_matches(k, off, L, n) && run_image(k, off) == 0) { n_direct++; return 1; }
     }
     for (int i = 0; i < nmoved; i++) {
         Moved *m = &moved[i];
@@ -506,6 +515,13 @@ static void stub(uint16_t off) {
     hle_redirect = 0;
     if (off < 0x100) {
         int iret = do_int((uint8_t)off);
+        if (bios_take_read_retry() && !hle_redirect) {
+            /* Blocking BIOS/DOS reads enable keyboard IRQs while waiting.
+             * Leave the original interrupt frame intact and retry this stub
+             * after INT 1Bh; returning now would fabricate a guest input byte. */
+            cpu.ifl = 1;
+            return;
+        }
         if (!hle_redirect) stub_return(iret);
     } else if (off == STUB_CASEMAP) {
         dos_casemap_upper();
@@ -574,6 +590,12 @@ static void dispatch_events(void) {
             wait_ms = due ? (int)((due + 999999ull) / 1000000ull) : 1;
             if (wait_ms > 10) wait_ms = 10;
         }
+#ifdef __EMSCRIPTEN__
+        /* A busy child may never consume ordinary typeahead. term_idle can
+         * return immediately for a nonempty BIOS ring, so guarantee a page
+         * turn here regardless, before reading newly delivered host keys. */
+        emscripten_sleep(0);
+#endif
         term_idle(wait_ms);
         now = monotonic_ns();
         last_poll = now;
@@ -582,7 +604,7 @@ static void dispatch_events(void) {
     if (!cpu.ifl) return;
     if (bios_take_break()) {
         rt_halted = 0;
-        cpu_int(0x1b, cpu.ip);
+        if (!dos_abort_break()) cpu_int(0x1b, cpu.ip);
     } else if (timer_pending && !timer_in_service && !(pic_mask & 1)) {
         --timer_pending;
         timer_in_service = 1;

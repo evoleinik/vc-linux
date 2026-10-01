@@ -1,4 +1,4 @@
-/* Text-mode BIOS and DOS CON, sharing the actual BDA and video memory with
+/* Text/CGA BIOS and DOS CON, sharing the actual BDA and video memory with
  * translated code. No private queue or screen buffer can go stale when VC
  * updates either region directly. */
 #define _POSIX_C_SOURCE 200809L /* clock_gettime */
@@ -13,10 +13,31 @@
 #include <string.h>
 #include <time.h>
 
+/* The upstream public-domain bitmaps use plain char for byte constants.
+ * Keep their files unchanged and suppress only that signed-char diagnostic;
+ * glyph reads below explicitly convert back to uint8_t before shifting. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wconstant-conversion"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Woverflow"
+#endif
+#include "../third_party/font8x8/font8x8_basic.h"
+#include "../third_party/font8x8/font8x8_box.h"
+#include "../third_party/font8x8/font8x8_block.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 enum {
     BDA = 0x40,
     SCREEN = 0xb8000,
     SCREEN_BYTES = 0x8000,
+    CGA_BYTES = 0x4000,
+    CGA_HEIGHT = 200,
     KEY_START = 0x1e,
     KEY_END = 0x3e
 };
@@ -25,6 +46,13 @@ static int blink_enabled;
 static int console_scan_pending;
 static uint8_t console_scan;
 static int break_pending;
+static int read_retry;
+static struct {
+    uint16_t ss, sp, segment, offset;
+    unsigned count;
+    uint8_t widths[255];
+    int active;
+} line_read;
 
 typedef struct {
     int show;
@@ -62,6 +90,127 @@ unsigned bios_rows(void)
     return rows > maximum ? maximum : rows;
 }
 
+unsigned bios_graphics_width(void)
+{
+    unsigned mode = mem[0x449];
+    return mode == 6 ? 640 : (mode == 4 || mode == 5 ? 320 : 0);
+}
+
+uint8_t bios_cga_color_register(void)
+{
+    return mem[0x466];
+}
+
+void bios_cga_color_select(uint8_t value)
+{
+    mem[0x466] = value;
+    term_invalidate();
+}
+
+uint8_t bios_cga_color(unsigned pixel)
+{
+    uint8_t select = bios_cga_color_register();
+    if (mem[0x449] == 6)
+        return (pixel & 1) ? select & 15 : 0;
+    pixel &= 3;
+    if (pixel == 0)
+        return select & 15;
+    unsigned intensity = (select & 0x10) >> 1;
+    /* Disabling the colour burst (mode 5) selects cyan/red/white on an RGBI
+     * display, independently of the palette-select bit. Composite artefact
+     * colours and scanline palette changes are not emulated. */
+    static const uint8_t palettes[3][3] = {
+        {2, 4, 6}, {3, 5, 7}, {3, 4, 7}
+    };
+    unsigned palette = mem[0x449] == 5 ? 2 : (select >> 5) & 1;
+    return (uint8_t)(palettes[palette][pixel - 1] | intensity);
+}
+
+static size_t cga_address(unsigned x, unsigned y)
+{
+    unsigned pixels_per_byte = bios_graphics_width() == 640 ? 8 : 4;
+    return SCREEN + (y & 1) * 0x2000 + (y >> 1) * 80 + x / pixels_per_byte;
+}
+
+uint8_t bios_graphics_pixel(unsigned x, unsigned y)
+{
+    unsigned width = bios_graphics_width();
+    if (x >= width || y >= CGA_HEIGHT)
+        return 0;
+    unsigned shift = width == 640 ? 7 - (x & 7) : 6 - 2 * (x & 3);
+    unsigned mask = width == 640 ? 1 : 3;
+    return (uint8_t)((mem[cga_address(x, y)] >> shift) & mask);
+}
+
+static void graphics_pixel(unsigned x, unsigned y, uint8_t color)
+{
+    unsigned width = bios_graphics_width();
+    if (x >= width || y >= CGA_HEIGHT)
+        return;
+    unsigned shift = width == 640 ? 7 - (x & 7) : 6 - 2 * (x & 3);
+    unsigned mask = width == 640 ? 1 : 3;
+    size_t address = cga_address(x, y);
+    uint8_t bits = (uint8_t)((color & mask) << shift);
+    if (color & 0x80)
+        mem[address] ^= bits;
+    else
+        mem[address] = (uint8_t)((mem[address] & ~(mask << shift)) | bits);
+}
+
+static const char *graphics_glyph(uint8_t ch)
+{
+    /* CP437 and CP866 share the complete B0h-DFh box/block range. The
+     * remaining non-ASCII characters have no supplied font and stay blank. */
+    static const uint16_t boxes[48] = {
+        0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
+        0x2555, 0x2563, 0x2551, 0x2557, 0x255d, 0x255c, 0x255b, 0x2510,
+        0x2514, 0x2534, 0x252c, 0x251c, 0x2500, 0x253c, 0x255e, 0x255f,
+        0x255a, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256c, 0x2567,
+        0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256b,
+        0x256a, 0x2518, 0x250c, 0x2588, 0x2584, 0x258c, 0x2590, 0x2580
+    };
+    if (ch < 128)
+        return font8x8_basic[ch];
+    if (ch >= 0xb0 && ch <= 0xdf) {
+        unsigned codepoint = boxes[ch - 0xb0];
+        return codepoint < 0x2580 ? font8x8_box[codepoint - 0x2500] :
+                                 font8x8_block[codepoint - 0x2580];
+    }
+    return font8x8_basic[' '];
+}
+
+static void graphics_character(unsigned column, unsigned row,
+                               uint8_t ch, uint8_t color)
+{
+    const char *glyph = graphics_glyph(ch);
+    for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+            /* Upstream font bits run left-to-right, unlike CGA byte bits. */
+            uint8_t ink = ((uint8_t)glyph[y] >> x) & 1 ? color : color & 0x80;
+            graphics_pixel(column * 8 + x, row * 8 + y, ink);
+        }
+}
+
+static uint8_t graphics_read_character(unsigned column, unsigned row)
+{
+    uint8_t bitmap[8] = {0};
+    /* The CGA BIOS compares the eight scanlines against its font, not a
+     * remembered character. GW-BASIC's editor reads text back this way and
+     * guest programs may have changed any of these pixels directly. */
+    for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x)
+            if (bios_graphics_pixel(column * 8 + x, row * 8 + y))
+                bitmap[y] |= (uint8_t)(1u << x);
+    /* Prefer space to the many blank control/unsupported glyphs. */
+    for (unsigned ch = 32; ch < 127; ++ch)
+        if (!memcmp(bitmap, graphics_glyph((uint8_t)ch), sizeof(bitmap)))
+            return (uint8_t)ch;
+    for (unsigned ch = 0xb0; ch <= 0xdf; ++ch)
+        if (!memcmp(bitmap, graphics_glyph((uint8_t)ch), sizeof(bitmap)))
+            return (uint8_t)ch;
+    return 0; /* No matching glyph, as with arbitrary turtle graphics. */
+}
+
 static size_t screen_cell(unsigned column, unsigned row)
 {
     return SCREEN + 2 * ((size_t)row * bios_columns() + column);
@@ -86,10 +235,11 @@ static void font_geometry(unsigned rows, unsigned height)
     term_invalidate();
 }
 
-static void mode_three(int preserve_screen)
+static void mode_text(unsigned mode, int preserve_screen)
 {
-    mem[0x449] = 3;
-    bda_set_word(0x4a, 80);
+    unsigned columns = mode < 2 ? 40 : 80;
+    mem[0x449] = (uint8_t)mode;
+    bda_set_word(0x4a, (uint16_t)columns);
     bda_set_word(0x4e, 0);
     for (unsigned page = 0; page < 8; ++page)
         bda_set_word(0x50 + page * 2, 0);
@@ -98,10 +248,36 @@ static void mode_three(int preserve_screen)
     mem[0x487] = (uint8_t)(0x60 | (preserve_screen ? 0x80 : 0));
     mem[0x488] = 0xf9;
     mem[0x489] = 0x51;
+    mem[0x465] = (uint8_t)(0x28 | (mode >= 2 ? 1 : 0) | (mode & 1 ? 0 : 4));
+    mem[0x466] = 0x30;
     blink_enabled = 0; /* VC's bright backgrounds are the default. */
     font_geometry(25, 16);
+    if (columns == 40)
+        bda_set_word(0x4c, 0x0800);
     if (!preserve_screen)
         fill_cells(SCREEN, SCREEN_BYTES / 2, 0x07);
+}
+
+static void mode_graphics(unsigned mode, int preserve_screen)
+{
+    mem[0x449] = (uint8_t)mode;
+    bda_set_word(0x4a, mode == 6 ? 80 : 40);
+    bda_set_word(0x4c, CGA_BYTES);
+    bda_set_word(0x4e, 0);
+    for (unsigned page = 0; page < 8; ++page)
+        bda_set_word(0x50 + page * 2, 0);
+    bda_set_word(0x60, 0x0607);
+    mem[0x462] = 0;
+    bda_set_word(0x63, 0x3d4);
+    mem[0x465] = (uint8_t)(mode == 4 ? 0x2a : mode == 5 ? 0x2e : 0x1e);
+    mem[0x466] = (uint8_t)(mode == 6 ? 0x3f : 0x30);
+    mem[0x484] = 24;
+    bda_set_word(0x85, 8);
+    mem[0x487] = (uint8_t)(0x60 | (preserve_screen ? 0x80 : 0));
+    blink_enabled = 0;
+    if (!preserve_screen)
+        memset(mem + SCREEN, 0, CGA_BYTES);
+    term_invalidate();
 }
 
 static void mouse_reset(void)
@@ -117,7 +293,7 @@ unsigned hle_other_calls;
 void bios_init(void)
 {
     bda_set_word(0x10, 0x0020); /* 80-column colour, no invented peripherals. */
-    mode_three(0);
+    mode_text(3, 0);
     mem[0x417] = 0;
     mem[0x418] = 0;
     mem[0x496] = 0x10; /* Enhanced keyboard installed; right modifiers clear. */
@@ -129,6 +305,8 @@ void bios_init(void)
     console_scan_pending = 0;
     console_scan = 0;
     break_pending = 0;
+    read_retry = 0;
+    line_read.active = 0;
     mem[0x471] = 0;
     mouse_reset();
     /* The runtime owns the timer at 046Ch: it is deliberately untouched. */
@@ -180,13 +358,12 @@ int bios_key_push(uint16_t key)
 
 void bios_request_break(void)
 {
-    /* IBM's keyboard ISR empties the queue and inserts a null word. That
-     * also releases a blocking INT 16h so rt_run can enter the guest's 1Bh
-     * handler on its own stack, never recursively through a C BIOS call. */
+    /* Discard old typeahead, but do not turn the interrupt into a NUL key.
+     * A blocked read explicitly unwinds to the dispatcher below instead. */
     unsigned start, end;
     key_bounds(&start, &end);
     bda_set_word(0x1c, bda_word(0x1a));
-    (void)bios_key_push(0);
+    console_scan_pending = 0;
     mem[0x471] |= 0x80;
     break_pending = 1;
 }
@@ -196,6 +373,20 @@ int bios_take_break(void)
     int pending = break_pending;
     break_pending = 0;
     return pending;
+}
+
+int bios_take_read_retry(void)
+{
+    int retry = read_retry;
+    read_retry = 0;
+    return retry;
+}
+
+void bios_cancel_read(void)
+{
+    read_retry = 0;
+    console_scan_pending = 0;
+    line_read.active = 0;
 }
 
 static int legacy_key(uint16_t *key)
@@ -238,6 +429,19 @@ static int key_read(int extended, int remove, uint16_t *key)
     return 0;
 }
 
+static int key_wait(int extended, uint16_t *key)
+{
+    for (;;) {
+        if (break_pending) {
+            read_retry = 1;
+            return 0;
+        }
+        if (key_read(extended, 1, key))
+            return 1;
+        term_idle(50);
+    }
+}
+
 void bios_int16(void)
 {
     uint16_t key;
@@ -245,8 +449,8 @@ void bios_int16(void)
     switch (function) {
     case 0x00:
     case 0x10:
-        while (!key_read(function == 0x10, 1, &key))
-            term_idle(50);
+        if (!key_wait(function == 0x10, &key))
+            return;
         cpu.a.x = key;
         break;
     case 0x01:
@@ -305,6 +509,28 @@ static void scroll_window(int down, unsigned count, uint8_t attribute,
     unsigned height = bottom - top + 1, width = right - left + 1;
     if (count == 0 || count >= height)
         count = height;
+    if (bios_graphics_width()) {
+        unsigned first = top * 8, limit = (bottom + 1) * 8, shift = count * 8;
+        unsigned bytes = width * (bios_graphics_width() == 640 ? 1 : 2);
+        uint8_t fill = bios_graphics_width() == 640 ?
+                       ((attribute & 1) ? 0xff : 0) : (attribute & 3) * 0x55;
+        /* Copy whole scanlines in direction order, keeping the two physical
+         * banks interlaced. Both ends are aligned to 8-pixel character cells. */
+        if (down) {
+            for (unsigned y = limit; y-- > first + shift;)
+                memmove(mem + cga_address(left * 8, y),
+                        mem + cga_address(left * 8, y - shift), bytes);
+            for (unsigned y = first; y < first + shift; ++y)
+                memset(mem + cga_address(left * 8, y), fill, bytes);
+        } else {
+            for (unsigned y = first; y + shift < limit; ++y)
+                memmove(mem + cga_address(left * 8, y),
+                        mem + cga_address(left * 8, y + shift), bytes);
+            for (unsigned y = limit - shift; y < limit; ++y)
+                memset(mem + cga_address(left * 8, y), fill, bytes);
+        }
+        return;
+    }
     if (down) {
         for (unsigned row = bottom + 1; row-- > top + count;)
             memmove(mem + screen_cell(left, row),
@@ -333,7 +559,7 @@ static void cursor_set(unsigned column, unsigned row)
     bda_set_word(0x50, (uint16_t)((row << 8) | column));
 }
 
-static void teletype(uint8_t ch)
+static void teletype(uint8_t ch, uint8_t color)
 {
     unsigned column, row, columns = bios_columns(), rows = bios_rows();
     (void)cursor_position(&column, &row);
@@ -356,8 +582,11 @@ static void teletype(uint8_t ch)
             --column;
         break;
     default:
-        /* Text-mode BIOS TTY preserves the destination cell's attribute. */
-        mem[screen_cell(column, row)] = ch;
+        if (bios_graphics_width())
+            graphics_character(column, row, ch, color);
+        else
+            /* Text-mode BIOS TTY preserves the destination cell's attribute. */
+            mem[screen_cell(column, row)] = ch;
         if (++column == columns) {
             column = 0;
             ++row;
@@ -365,7 +594,8 @@ static void teletype(uint8_t ch)
         break;
     }
     if (row >= rows) {
-        scroll_window(0, 1, 0x07, 0, 0, columns - 1, rows - 1);
+        scroll_window(0, 1, bios_graphics_width() ? 0 : 0x07,
+                      0, 0, columns - 1, rows - 1);
         row = rows - 1;
     }
     cursor_set(column, row);
@@ -374,7 +604,7 @@ static void teletype(uint8_t ch)
 void con_write(const uint8_t *buf, size_t n)
 {
     for (size_t i = 0; i < n; ++i)
-        teletype(buf[i]);
+        teletype(buf[i], 3);
 }
 
 void bios_int10(void)
@@ -382,10 +612,10 @@ void bios_int10(void)
     unsigned column, row;
     switch (cpu.a.h) {
     case 0x00:
-        /* The native screen implements colour text mode 3, not graphics or
-         * the independent monochrome framebuffer at B000:0000. */
-        if ((cpu.a.l & 0x7f) == 3)
-            mode_three((cpu.a.l & 0x80) != 0);
+        if ((cpu.a.l & 0x7f) <= 3)
+            mode_text(cpu.a.l & 0x7f, (cpu.a.l & 0x80) != 0);
+        else if ((cpu.a.l & 0x7f) >= 4 && (cpu.a.l & 0x7f) <= 6)
+            mode_graphics(cpu.a.l & 0x7f, (cpu.a.l & 0x80) != 0);
         break;
     case 0x01:
         bda_set_word(0x60, cpu.c.x);
@@ -414,13 +644,28 @@ void bios_int10(void)
         break;
     case 0x08:
         if (cpu.b.h == 0 && cursor_position(&column, &row)) {
-            size_t address = screen_cell(column, row);
-            cpu.a.x = (uint16_t)(mem[address] | (mem[address + 1] << 8));
+            if (bios_graphics_width())
+                cpu.a.x = graphics_read_character(column, row);
+            else {
+                size_t address = screen_cell(column, row);
+                cpu.a.x = (uint16_t)(mem[address] | (mem[address + 1] << 8));
+            }
         }
         break;
     case 0x09:
     case 0x0a:
         if (cpu.b.h == 0 && cursor_position(&column, &row)) {
+            if (bios_graphics_width()) {
+                unsigned count = cpu.c.x;
+                while (count-- != 0 && row < bios_rows()) {
+                    graphics_character(column, row, cpu.a.l, cpu.b.l);
+                    if (++column == bios_columns()) {
+                        column = 0;
+                        ++row;
+                    }
+                }
+                break;
+            }
             size_t address = screen_cell(column, row);
             size_t limit = screen_cell(0, bios_rows());
             unsigned count = cpu.c.x;
@@ -432,13 +677,27 @@ void bios_int10(void)
             }
         }
         break;
+    case 0x0b: {
+        uint8_t select = bios_cga_color_register();
+        if (cpu.b.h == 0)
+            bios_cga_color_select((uint8_t)((select & 0xe0) | (cpu.b.l & 0x1f)));
+        else if (cpu.b.h == 1)
+            bios_cga_color_select((uint8_t)((select & 0xdf) | ((cpu.b.l & 1) << 5)));
+        break;
+    }
+    case 0x0c:
+        graphics_pixel(cpu.c.x, cpu.d.x, cpu.a.l);
+        break;
+    case 0x0d:
+        cpu.a.l = bios_graphics_pixel(cpu.c.x, cpu.d.x);
+        break;
     case 0x0e:
-        teletype(cpu.a.l);
+        teletype(cpu.a.l, cpu.b.l);
         break;
     case 0x0f:
         cpu.a.l = mem[0x449];
         cpu.a.h = (uint8_t)bios_columns();
-        cpu.b.h = 0;
+        cpu.b.h = mem[0x462];
         break;
     case 0x10:
         if (cpu.a.l == 3) {
@@ -648,16 +907,13 @@ static int console_get(int blocking, uint8_t *ch, int *extended)
         return 1;
     }
     uint16_t key;
-    if (!key_read(1, 1, &key)) {
-        if (!blocking) {
-            term_idle(0);
-            if (!key_read(1, 1, &key))
-                return 0;
-        } else {
-            do {
-                term_idle(50);
-            } while (!key_read(1, 1, &key));
-        }
+    if (blocking) {
+        if (!key_wait(1, &key))
+            return 0;
+    } else if (!key_read(1, 1, &key)) {
+        term_idle(0);
+        if (!key_read(1, 1, &key))
+            return 0;
     }
     unsigned ascii = key & 0xff, scan = key >> 8;
     *extended = ascii == 0 || (ascii == 0xe0 && scan != 0);
@@ -676,9 +932,9 @@ static void console_put(uint8_t ch)
     if (ch == '\t') {
         unsigned count = 8 - (mem[0x450] & 7);
         while (count-- != 0)
-            teletype(' ');
+            teletype(' ', 3);
     } else {
-        teletype(ch);
+        teletype(ch, 3);
     }
 }
 
@@ -698,7 +954,10 @@ static void console_erase(unsigned cells)
         } else {
             break;
         }
-        mem[screen_cell(column, row)] = ' ';
+        if (bios_graphics_width())
+            graphics_character(column, row, ' ', 3);
+        else
+            mem[screen_cell(column, row)] = ' ';
     }
     cursor_set(column, row);
 }
@@ -706,33 +965,46 @@ static void console_erase(unsigned cells)
 static void console_line(void)
 {
     uint16_t segment = cpu.ds, offset = cpu.d.x;
-    unsigned maximum = rd8(segment, offset), count = 0;
-    uint8_t widths[255];
+    unsigned maximum = rd8(segment, offset);
     if (maximum == 0)
         return;
+    /* Preserve an edited line across the dispatcher round trip to INT 1Bh.
+     * The stack and buffer identify the interrupted DOS call; a later call
+     * must not accidentally resume another program's editing state. */
+    if (!line_read.active || line_read.ss != cpu.ss || line_read.sp != cpu.sp ||
+        line_read.segment != segment || line_read.offset != offset) {
+        line_read.ss = cpu.ss;
+        line_read.sp = cpu.sp;
+        line_read.segment = segment;
+        line_read.offset = offset;
+        line_read.count = 0;
+        line_read.active = 1;
+    }
     for (;;) {
         uint8_t ch;
         int extended;
-        (void)console_get(1, &ch, &extended);
+        if (!console_get(1, &ch, &extended))
+            return;
         if (extended)
             continue; /* Both halves of an extended key are editing no-ops. */
         if (ch == '\r') {
-            wr8(segment, (uint16_t)(offset + 1), (uint8_t)count);
-            wr8(segment, (uint16_t)(offset + 2 + count), '\r');
+            wr8(segment, (uint16_t)(offset + 1), (uint8_t)line_read.count);
+            wr8(segment, (uint16_t)(offset + 2 + line_read.count), '\r');
             console_put('\r');
             console_put('\n');
+            line_read.active = 0;
             return;
         }
         if (ch == '\b') {
-            if (count != 0)
-                console_erase(widths[--count]);
+            if (line_read.count != 0)
+                console_erase(line_read.widths[--line_read.count]);
         } else if (ch == 0x1b) {
-            while (count != 0)
-                console_erase(widths[--count]);
+            while (line_read.count != 0)
+                console_erase(line_read.widths[--line_read.count]);
         } else if (ch >= ' ' || ch == '\t') {
-            if (count + 1 < maximum) {
-                wr8(segment, (uint16_t)(offset + 2 + count), ch);
-                widths[count++] = ch == '\t' ?
+            if (line_read.count + 1 < maximum) {
+                wr8(segment, (uint16_t)(offset + 2 + line_read.count), ch);
+                line_read.widths[line_read.count++] = ch == '\t' ?
                     (uint8_t)(8 - (mem[0x450] & 7)) : 1;
                 console_put(ch);
             } else {
@@ -748,7 +1020,8 @@ int dos_con_int21(void)
     int extended;
     switch (cpu.a.h) {
     case 0x01:
-        (void)console_get(1, &ch, &extended);
+        if (!console_get(1, &ch, &extended))
+            return 1;
         cpu.a.l = ch;
         if (!extended)
             console_put(ch);
@@ -772,7 +1045,8 @@ int dos_con_int21(void)
     case 0x07:
     case 0x08:
         /* Ctrl-C remains a byte: this layer does not dispatch DOS INT 23h. */
-        (void)console_get(1, &ch, &extended);
+        if (!console_get(1, &ch, &extended))
+            return 1;
         cpu.a.l = ch;
         return 1;
     case 0x09:

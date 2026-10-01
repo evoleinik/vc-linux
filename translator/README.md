@@ -11,6 +11,46 @@ writes `build/gen/vc_com.c` and `build/gen/vc_ovl.c`. Run the CLI directly with:
 `make test-translator` runs the instruction differential tests, exhaustive
 PutTime comparison, and focused translator/runtime regression tests.
 
+## NASM flat COM programs
+
+`make bootlogo` builds the vendored bootLogo's real `build/bootlogo/LOGO.COM`
+(503 bytes) and `LOGO.lst`. `make gen` emits `build/gen/bootlogo.c` with
+`--format nasm`; the default JWasm and linked GW-BASIC paths are unchanged.
+The COM, listing and generated C are deterministic.
+
+The NASM recipe uses `-Dcom_file=1 -f bin -LefFt -l LISTING`. `-Le` identifies
+the **active, expanded** statements with `;;;`: ordinary listing rows also
+contain inactive conditional branches (including bootLogo's other ORG) and
+macro invocations. `-Lf`/`-LF` override hidden-listing directives and `-Lt`
+lists every byte of TIMES/ALIGN. Byte-column continuations belong to their
+original source statement, not new instruction starts. Bracketed fields are
+section-relative; the reader adds the proved `ORG 0x100` before checking them
+against the final COM. Every byte must be covered and match, and Capstone
+must consume exactly each source instruction's byte count.
+
+The reader deliberately accepts one 16-bit, initialized COM section with
+literal `ORG 0x100`; multi-section binaries, other origins, INCBIN, and TIMES
+of instructions are rejected. Missing or unexpanded listing rows fail with
+a diagnostic rather than prompting a linear disassembly sweep.
+
+bootLogo has 217 executable starts. Two are DB-emitted `BAh` opcodes whose
+MOV DX immediates consume the next two-byte source instruction: BK skips FD's
+`XOR AX,AX`, and PU skips PD's `MOV AL,1`. The checked static-successor rule
+already used by GW-BASIC retains both overlapping paths; command and sine
+tables remain data. `SETCOLOR` writes a single byte of `MOV AX,0C03h` at file
+offset `1AFh`. Absolute COM data/code stores identify this operand; the
+existing emitter reads it live and the copied-code matcher ignores only
+that one byte. Opcode, branch and displacement patches are rejected.
+
+The all-image Unicorn gate includes every distinct bootLogo instruction,
+including those skip paths and randomized live pen colours, with 32 states
+per instruction. A separate test-only Unicorn run supplies keystrokes and
+records the actual BIOS pixel calls. It confirms the square corners
+`(160,100), (160,50), (210,50), (210,100)` from bootLogo's 9.7 fixed-point
+arithmetic; the final turtle XOR does not erase them. Pen-up, backwards,
+colour changes and QUIT are also exercised without using the native BIOS as
+their reference.
+
 ## Linked GW-BASIC modules
 
 `make gwbasic` builds `build/gwbasic/GWBASIC.EXE`, `GWBASIC.MAP`, and every
@@ -52,6 +92,19 @@ Two additional source idioms matter:
 - SYNCHR pops its return address into SI, uses CS:CMPSB, and pushes the
   advanced SI. The full fixed machine-code prefix proves that calls return
   **after one inline token byte**. That token is data, not an instruction.
+
+Graphics exposes one more indirect-entry idiom: DRAW's U/L/G/H dispatch
+targets begin with DB-encoded `NEGDE` macros, unreachable through static
+branches. To preserve the established `gwbasic.c` byte-for-byte, the separate
+`--supplement gwbasic-graphics` build emits `gwbasic_graphics.c` and its
+`run_gwbasic_graphics` exact-start function. It validates all fifteen source
+DB/DW dispatch pairs against their linked labels, requires the missing
+target's `NEGDE` source macro and both explicit `INS86` bytes (`F7 DA`), and
+requires the following boundary to be in the original translation. The
+four starts are `BE5h`, `BECh`, `BF5h`, and `C01h`. Each uses the same native
+per-instruction emitter and the full Unicorn gate; no runtime opcode decoder
+is added. The runtime tries a registered supplement only after the original
+image's ordinary byte match. The sidecar contains no duplicate image bytes.
 
 Four MOV AX,0 instructions are patched with the relocated data segment:
 OEMCBK's CBKDS/IMDS, OEMEV's ITICDS and OEMSND's IRQ0DS. Two DB-emitted far

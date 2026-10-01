@@ -6,7 +6,7 @@ Repeat SBB while planting/restoring a carry bug:
     .venv/bin/python -m pytest -q -s tests/test_translator_ops.py -k sbb
 
 Family parameterization only changes reporting/reproduction: the default suite
-walks every bytes/image-offset instruction from VC and GW-BASIC's validated listings.
+walks every bytes/image-offset instruction from VC, GW-BASIC and bootLogo's validated listings.
 """
 
 from __future__ import annotations
@@ -103,7 +103,8 @@ def test_oracle_detects_truncated_input_port(monkeypatch, opcode):
 @pytest.mark.parametrize("opcode,mutable", [
     (bytes.fromhex("b80000"), (1, 2)),
     (bytes.fromhex("eaffffffff"), (1, 2, 3, 4)),
-], ids=("patched-ds", "patched-isr"))
+    (bytes.fromhex("b8030c"), (1,)),
+], ids=("patched-ds", "patched-isr", "bootlogo-color"))
 def test_oracle_detects_ignored_patched_operand(monkeypatch, opcode, mutable):
     decoder = Cs(CS_ARCH_X86, CS_MODE_16)
     decoder.detail = True
@@ -118,7 +119,7 @@ def test_oracle_detects_ignored_patched_operand(monkeypatch, opcode, mutable):
         return production_emitter(unpatched, relocations, symbol)
 
     # The reference receives random operand bytes in memory, just as the
-    # actual GW-BASIC patch stores supply DS and the previous ISR pointers.
+    # actual patch stores supply GW-BASIC's DS/saved ISR or bootLogo's colour.
     monkeypatch.setattr(ops_build, "emit_instruction_function", deliberately_ignore_patch)
     library = build_library((case,))
     failure = library.ops_check_instruction(0, STATES_PER_INSTRUCTION)

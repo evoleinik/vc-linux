@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 typedef struct Image {
-    const char *name;       /* canonical embedded name; only VC.COM/VC.OVL are name-selected */
+    const char *name;       /* translation label; installed filename may differ */
     int is_exe;             /* 1 = MZ executable, 0 = .COM */
     const uint8_t *bytes;   /* load module exactly as in the file (MZ: after the header), unrelocated */
     uint32_t size;
@@ -34,5 +34,9 @@ typedef struct Image {
 extern const Image image_vc_com;
 extern const Image image_vc_ovl;
 extern const Image image_gwbasic;
+extern const Image image_bootlogo;
+/* Additional source-listed indirect DRAW entries; the original generated
+ * GW-BASIC Image and its bytes remain unchanged. */
+int run_gwbasic_graphics(uint32_t off, uint16_t loadseg);
 
 #endif

@@ -21,10 +21,16 @@
 } } while (0)
 
 static uint64_t now_ns = 1000000000ull, stop_ns;
-static unsigned ticks, breaks, waits, steps;
+static unsigned ticks, breaks, waits, steps, polls, read_waits;
+static uint64_t last_input_poll;
 static uint16_t original_flags;
+static uint16_t read_function;
+static unsigned read_interrupt;
 static int scenario;
-enum { MASKED_TIMER, RATE_TIMER, BREAK_IRQ, HALT_IRQ, MUTABLE_CODE, PRINTER };
+enum {
+    MASKED_TIMER, RATE_TIMER, BREAK_IRQ, HALT_IRQ, MUTABLE_CODE, PRINTER,
+    BUSY_POLL, BLOCKED_READ,
+};
 
 int clock_gettime(clockid_t clock, struct timespec *time) {
     uint64_t ns = now_ns;
@@ -35,9 +41,23 @@ int clock_gettime(clockid_t clock, struct timespec *time) {
 }
 
 void term_idle(int milliseconds) {
+    ++polls;
+    if (scenario == BUSY_POLL) {
+        CHECK(now_ns - last_input_poll <= 50000000ull);
+        last_input_poll = now_ns;
+    }
     if (milliseconds > 0) {
         ++waits;
         now_ns += (uint64_t)milliseconds * 1000000ull;
+        if (scenario == BLOCKED_READ) {
+            if (++read_waits == 1) {
+                bios_request_break();
+            } else if (read_waits == 2) {
+                CHECK(bios_key_push(0x2d78));
+                if (read_function == 0x0a00)
+                    CHECK(bios_key_push(0x1c0d));
+            }
+        }
     }
 }
 void term_shutdown(void) {}
@@ -49,6 +69,7 @@ void dos_casemap_upper(void) {}
 int dos_core_int21(void) { return 0; }
 int dos_run_psp(void) { return 0; }
 int dos_abort_untranslated(void) { return 0; }
+int dos_abort_break(void) { return 0; }
 int dos_fs_int21(void) { return 0; }
 int dos_int_other(uint8_t number) { (void)number; return 1; }
 
@@ -78,11 +99,17 @@ static int fixture_run(uint32_t off, uint16_t loadseg) {
         return 0;
     }
     if (off == 32) {
-        CHECK(scenario == BREAK_IRQ);
+        CHECK(scenario == BREAK_IRQ || scenario == BLOCKED_READ);
         CHECK(!cpu.ifl && !cpu.tf);
-        CHECK(cpu.sp == 0xeffa);
-        CHECK(rd16(cpu.ss, cpu.sp) == 2);
-        CHECK(rd16(cpu.ss, (uint16_t)(cpu.sp + 2)) == 0x2000);
+        if (scenario == BLOCKED_READ) {
+            CHECK(cpu.sp == 0xeff4); /* Keep the interrupted read's frame. */
+            CHECK(rd16(cpu.ss, cpu.sp) == read_interrupt);
+            CHECK(rd16(cpu.ss, (uint16_t)(cpu.sp + 2)) == STUB_SEG);
+        } else {
+            CHECK(cpu.sp == 0xeffa);
+            CHECK(rd16(cpu.ss, cpu.sp) == 2);
+            CHECK(rd16(cpu.ss, (uint16_t)(cpu.sp + 2)) == 0x2000);
+        }
         ++breaks;
         iret();
         return 0;
@@ -152,6 +179,33 @@ static int fixture_run(uint32_t off, uint16_t loadseg) {
             rt_exited = 1;
         }
         break;
+    case BUSY_POLL:
+        CHECK(now_ns - last_input_poll <= 50000000ull);
+        if (now_ns >= stop_ns) {
+            CHECK(polls >= 5 && waits == 0);
+            rt_exited = 1;
+        } else {
+            now_ns += 1000000ull; /* Work that never polls, sleeps or does INTs. */
+        }
+        break;
+    case BLOCKED_READ:
+        if (off == 0) {
+            cpu.a.x = read_function;
+            cpu_int((uint8_t)read_interrupt, 1);
+        } else {
+            CHECK(breaks == 1 && read_waits == 2 && cpu.sp == 0xf000);
+            CHECK(cpu.ifl && rd16(0x40, 0x1a) == rd16(0x40, 0x1c));
+            if (read_function == 0x0a00) {
+                CHECK(rd8(cpu.ds, 0x101) == 2);
+                CHECK(rd8(cpu.ds, 0x102) == 'a' && rd8(cpu.ds, 0x103) == 'x');
+                CHECK(rd8(cpu.ds, 0x104) == '\r');
+            } else {
+                CHECK(cpu.a.l == 'x'); /* The break was never an input byte. */
+                if (read_interrupt == 0x16) CHECK(cpu.a.x == 0x2d78);
+            }
+            rt_exited = 1;
+        }
+        break;
     }
     return 0;
 }
@@ -192,6 +246,46 @@ static void ctrl_break_irq(void) {
     wr16(0, 0x1b * 4 + 2, 0x2000);
     rt_run();
 }
+
+static void busy_dispatch_poll(void) {
+    setup(BUSY_POLL);
+    cpu.ifl = 0; /* Host input remains live even if the guest masks IRQs. */
+    while (bios_key_push(0x2d78)) {} /* Queued keys do not suppress the poll. */
+    last_input_poll = now_ns;
+    stop_ns = now_ns + 250000000ull;
+    rt_run();
+}
+
+static void yield_without_terminal(void) {
+    setup(MUTABLE_CODE);
+    unsigned before = polls;
+    now_ns += 100000000ull;
+    rt_budget = -1;
+    rt_yield();
+    CHECK(rt_budget == 20000 && polls == before);
+}
+
+static void blocked_read(unsigned interrupt, uint16_t function) {
+    setup(BLOCKED_READ);
+    read_interrupt = interrupt;
+    read_function = function;
+    port_out8(0x21, 0xff);
+    wr16(0, 0x1b * 4, 32);
+    wr16(0, 0x1b * 4 + 2, 0x2000);
+    if (function == 0x0a00) {
+        cpu.ds = 0x7000;
+        cpu.d.x = 0x100;
+        wr8(cpu.ds, 0x100, 8);
+        CHECK(bios_key_push(0x1e61)); /* An edited prefix survives INT 1Bh. */
+    }
+    rt_run();
+}
+static void bios_read_break(void) { blocked_read(0x16, 0x0000); }
+static void extended_read_break(void) { blocked_read(0x16, 0x1000); }
+static void dos_echo_read_break(void) { blocked_read(0x21, 0x0100); }
+static void dos_raw_read_break(void) { blocked_read(0x21, 0x0700); }
+static void dos_read_break(void) { blocked_read(0x21, 0x0800); }
+static void dos_line_break(void) { blocked_read(0x21, 0x0a00); }
 
 static void timer_rate(unsigned divisor, unsigned expected) {
     setup(RATE_TIMER);
@@ -265,6 +359,83 @@ static void speaker_ports(void) {
 }
 
 typedef void (*Test)(void);
+static const uint8_t supplemental_code[24] = {
+    0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
+    0xf7, 0xda, 0x90, 0xfb, 0x90, 0xfa, 0x90, 0x99,
+    0x50, 0x51, 0x52, 0x53, 0x58, 0x59, 0x5a, 0x5b,
+};
+static unsigned supplement_calls;
+static int supplement_parent(uint32_t off, uint16_t loadseg) {
+    CHECK(loadseg == 0x2000);
+    if (off != 10) return -1;
+    CHECK(supplement_calls == 1 && cpu.d.x == (uint16_t)-123);
+    rt_exited = 1;
+    return 0;
+}
+static int supplement_body(uint32_t off, uint16_t loadseg) {
+    CHECK(loadseg == 0x2000);
+    if (off != 8) return -1;
+    supplement_calls++;
+    cpu.d.x = (uint16_t)-cpu.d.x;
+    cpu.ip += 2;
+    return 0;
+}
+static const Image supplemented = {
+    .name = "SUPPLEMENT.COM", .bytes = supplemental_code, .size = sizeof supplemental_code,
+    .run = supplement_parent,
+};
+static void supplement_setup(int copied) {
+    setup(MUTABLE_CODE);
+    memcpy(mem + 0x20000, supplemental_code, sizeof supplemental_code);
+    rt_register_image(&supplemented, 0x2000);
+    cpu.d.x = 123;
+    cpu.ip = 8;
+    cpu.ifl = 0;
+    if (copied) {
+        memcpy(mem + 0x30000, supplemental_code, sizeof supplemental_code);
+        cpu.cs = 0x3000;
+    }
+}
+static void image_supplement(void) {
+    supplement_setup(0);
+    rt_register_supplement(&supplemented, supplement_body);
+    rt_register_supplement(&supplemented, supplement_body); /* Idempotent. */
+    rt_run();
+}
+static void copied_image_supplement(void) {
+    supplement_setup(1);
+    rt_register_supplement(&supplemented, supplement_body);
+    rt_run();
+}
+static void changed_supplement_refused(void) {
+    supplement_setup(0);
+    rt_register_supplement(&supplemented, supplement_body);
+    wr8(cpu.cs, cpu.ip, 0xcc);
+    rt_run();
+}
+static void wrong_image_supplement_refused(void) {
+    supplement_setup(0);
+    rt_register_supplement(&fixture, supplement_body);
+    rt_run();
+}
+
+static void cga_color_port(void) {
+    bios_init();
+    cpu.a.x = 4;
+    bios_int10();
+    port_out8(0x3d9, 0x12); /* Intense palette 0, green background. */
+    CHECK(port_in8(0x3d9) == 0x12);
+    CHECK(bios_cga_color_register() == 0x12);
+    CHECK(bios_cga_color(0) == 2 && bios_cga_color(1) == 10);
+    CHECK(bios_cga_color(2) == 12 && bios_cga_color(3) == 14);
+    cpu.a.x = 0x0b00;
+    cpu.b.x = 0x0101; /* BIOS palette selection keeps intensity/background. */
+    bios_int10();
+    CHECK(port_in8(0x3d9) == 0x32);
+    CHECK(bios_cga_color(1) == 11 && bios_cga_color(2) == 13);
+    CHECK(bios_cga_color(3) == 15);
+}
+
 static int run_test(const char *name, Test test, int expected_status) {
     fflush(NULL);
     pid_t child = fork();
@@ -290,11 +461,24 @@ int main(void) {
     failed += run_test("18.2 Hz default PIT", slow_timer, 0);
     failed += run_test("400 Hz reprogrammed PIT", fast_timer, 0);
     failed += run_test("IF-gated Ctrl-Break frame", ctrl_break_irq, 0);
+    failed += run_test("busy dispatcher polls within 50 ms", busy_dispatch_poll, 0);
+    failed += run_test("rt_yield leaves terminal work to dispatcher", yield_without_terminal, 0);
+    failed += run_test("Ctrl-Break retries BIOS read without NUL", bios_read_break, 0);
+    failed += run_test("Ctrl-Break retries extended BIOS read", extended_read_break, 0);
+    failed += run_test("Ctrl-Break retries DOS echoed read", dos_echo_read_break, 0);
+    failed += run_test("Ctrl-Break retries DOS raw read", dos_raw_read_break, 0);
+    failed += run_test("Ctrl-Break retries DOS read", dos_read_break, 0);
+    failed += run_test("Ctrl-Break preserves a buffered line", dos_line_break, 0);
     failed += run_test("HLT yields at dispatcher", halt_irq, 0);
     failed += run_test("speaker ports/frequencies", speaker_ports, 0);
     failed += run_test("declared mutable operand", patched_operand, 0);
     failed += run_test("undeclared opcode refusal", patched_opcode_refused, 70);
     failed += run_test("printer timeout", printer_status, 0);
-    printf("test_machine: 9 cases, %d failures\n", failed);
+    failed += run_test("CGA color-select port and BIOS", cga_color_port, 0);
+    failed += run_test("listing-proved image supplement", image_supplement, 0);
+    failed += run_test("copied listing-proved supplement", copied_image_supplement, 0);
+    failed += run_test("changed supplement bytes refused", changed_supplement_refused, 70);
+    failed += run_test("supplement scoped to its image", wrong_image_supplement_refused, 70);
+    printf("test_machine: 22 cases, %d failures\n", failed);
     return failed ? 1 : 0;
 }

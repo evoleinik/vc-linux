@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -328,7 +329,7 @@ static void test_ctrl_break(void)
         check_number(cpu.ip, 0x5678, "terminal must not change interrupted IP");
         check_number((unsigned)bios_take_break(), 1, "Ctrl-Break latches interrupt request");
         check_number((unsigned)bios_take_break(), 0, "interrupt request consumed once");
-        check_number(pop_raw(), 0, "Ctrl-Break replaces queue with null word");
+        check_number(pop_raw(), 0x10000, "Ctrl-Break clears the queue without a null word");
         feed("z", 120);
         check_number(pop_raw(), 0x2c7a, "Ctrl-Break discards pending old typeahead");
         check_number(pop_raw(), 0x10000, "Ctrl-Break leaves no literal Ctrl-B character");
@@ -1017,6 +1018,349 @@ static void test_renderer_mouse_and_blink(void)
     term_render();
     CHECK(strstr(output, "\033[0;37;100mX") != NULL,
           "disabling blink redraws bit-7 attribute as bright background");
+}
+
+/* Write CGA memory directly, independently of the BIOS pixel routines, as
+ * GW-BASIC does. A renderer must see writes in both interlaced banks. */
+static void graphics_pixel(unsigned width, unsigned x, unsigned y, unsigned value)
+{
+    unsigned per_byte = width == 640 ? 8 : 4;
+    unsigned bits = width == 640 ? 1 : 2;
+    unsigned address = 0xb8000 + (y & 1) * 0x2000 + (y / 2) * 80 + x / per_byte;
+    unsigned shift = (per_byte - 1 - x % per_byte) * bits;
+    unsigned mask = ((1u << bits) - 1) << shift;
+    mem[address] = (uint8_t)((mem[address] & ~mask) | (value << shift));
+}
+
+static void test_renderer_graphics(void)
+{
+    static const unsigned dots[8] = {1, 8, 2, 16, 4, 32, 64, 128};
+    for (unsigned mode = 4; mode <= 6; ++mode) {
+        reset();
+        video(mode, 0, 0, 0);
+        unsigned width = mode == 6 ? 640 : 320, scale = width / 160;
+        for (unsigned i = 0; i < 8; ++i) {
+            memset(mem + 0xb8000, 0, 0x4000);
+            graphics_pixel(width, (i % 2 + 1) * scale - 1, (i / 2) * 2 + 1, 1);
+            clear_output();
+            term_render();
+            unsigned code = 0x2800 | dots[i];
+            char glyph[] = {(char)0xe2, (char)(0x80 | ((code >> 6) & 63)),
+                            (char)(0x80 | (code & 63)), 0};
+            CHECK(strstr(output, glyph) != NULL,
+                  "each braille dot includes the last source pixel of its rectangle");
+            CHECK(strstr(output, "\033[?25h") == NULL,
+                  "graphics never show the terminal's text cursor");
+        }
+        memset(mem + 0xb8000, 0, 0x4000);
+        graphics_pixel(width, width - 1, 199, 1);
+        clear_output();
+        term_render();
+        CHECK(strstr(output, "\033[25;80H") != NULL,
+              "bottom-right graphics pixel reaches cell 80,25 in every mode");
+        clear_output();
+        term_render();
+        check_number((unsigned)output_size, 0, "unchanged graphics frame emits no bytes");
+    }
+
+    reset();
+    video(4, 0, 0, 0);
+    video(0x0b00, 0, 0, 0);      /* black background, low intensity */
+    video(0x0b00, 0x0100, 0, 0); /* green / red / brown */
+    /* Four brown pixels in one dot beat three green pixels in three dots:
+     * majority is by original pixels, not by reduced dots. */
+    for (unsigned y = 0; y < 2; ++y)
+        for (unsigned x = 0; x < 2; ++x)
+            graphics_pixel(320, x, y, 3);
+    for (unsigned y = 0; y <= 4; y += 2)
+        graphics_pixel(320, 2, y, 1);
+    term_render();
+    CHECK(strstr(output, "\033[0;38;5;130;48;5;16m") != NULL,
+          "source-pixel majority picks CGA brown in the fixed 256-colour cube");
+    video(0x0b00, 0x0101, 0, 0); /* cyan / magenta / white */
+    clear_output();
+    term_render();
+    CHECK(strstr(output, "\033[0;38;5;248;48;5;16m") != NULL,
+          "palette-only updates repaint unchanged braille glyphs");
+    term_set_truecolor(1);
+    video(0x0b00, 1, 0, 0);     /* blue background */
+    clear_output();
+    term_render();
+    CHECK(strstr(output, "38;2;170;170;170;48;2;0;0;170m") != NULL,
+          "truecolor graphics show exact CGA foreground and background RGB");
+    video(3, 0, 0, 0);
+    put_word(cell(0, 0), 0x0758);
+    clear_output();
+    term_render();
+    CHECK(strstr(output, "\033[2J") != NULL && strstr(output, "mX") != NULL,
+          "return to mode 3 clears braille and redraws text even at the same dimensions");
+    CHECK(strstr(output, "\033[?25h") != NULL,
+          "return to mode 3 restores the BIOS text cursor");
+}
+
+static void test_renderer_graphics_palette_aliases(void)
+{
+    reset();
+    video(4, 0, 0, 0);
+    video(0x0b00, 0x001b, 0, 0); /* bright-cyan background, bright palette */
+    video(0x0b00, 0x0101, 0, 0); /* bright cyan / magenta / white */
+    term_set_truecolor(1);
+    for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x)
+            graphics_pixel(320, x, y, 1);
+    graphics_pixel(320, 3, 7, 2);
+    term_render();
+    CHECK(strstr(output, "38;2;255;85;255;48;2;85;255;255m\342\242\200") != NULL,
+          "background-colour aliases do not hide a lone magenta pixel or add braille dots");
+    CHECK(strstr(output, "\342\243\277") == NULL,
+          "a cell filled with nonzero pixels of the background colour stays blank");
+    term_set_truecolor(0);
+    clear_output();
+    term_render();
+    CHECK(strstr(output, "38;5;207;48;5;87m\342\242\200") != NULL,
+          "background-colour aliases are excluded before 256-colour reduction too");
+    video(0x0b00, 0x0010, 0, 0); /* black background; raw cyan now becomes visible */
+    clear_output();
+    term_render();
+    CHECK(strstr(output, "38;5;87;48;5;16m\342\243\277") != NULL,
+          "a palette-only change can make the previously aliased pixels visible");
+
+    reset();
+    video(6, 0, 0, 0);
+    video(0x0b00, 0, 0, 0); /* mode-6 foreground selected black */
+    graphics_pixel(640, 0, 0, 1);
+    term_render();
+    CHECK(strstr(output, "\342\240\201") == NULL,
+          "mode-6 set bits with black foreground are background, not braille dots");
+    video(0x0b00, 15, 0, 0); /* selected foreground becomes white */
+    clear_output();
+    term_render();
+    CHECK(strstr(output, "38;5;231;48;5;16m\342\240\201") != NULL,
+          "mode-6 pixels become visible when the selected foreground leaves black");
+}
+
+static void graphics_polls(unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i) {
+        cpu.a.h = 1;
+        bios_int16();
+    }
+}
+
+static void test_renderer_graphics_idle(void)
+{
+    for (unsigned mode = 4; mode <= 6; ++mode) {
+        reset();
+        term_render();
+        video(mode, 0, 0, 0);
+        unsigned before = term_graphics_decode_count();
+        term_render();
+        check_number(term_graphics_decode_count() - before, 1,
+                     "first graphics frame performs one full CGA decode");
+        clear_output();
+        graphics_polls(16);
+        check_number(term_graphics_decode_count() - before, 1,
+                     "idle INT16 polls perform no further CGA decodes");
+        check_number((unsigned)output_size, 0,
+                     "idle INT16 polls do not redraw graphics");
+    }
+}
+
+static void test_renderer_graphics_cache_sources(void)
+{
+    reset();
+    term_render();
+    video(4, 0, 0, 0);
+    term_render();
+    /* Both banks, their last visible bytes, and their unused tails: cache
+     * the entire 16 KB aperture, not just bytes reached by the pixel loop. */
+    static const unsigned addresses[] = {
+        0xb8000, 0xb9f3f, 0xba000, 0xbbf3f, 0xb9fff, 0xbbfff
+    };
+    for (unsigned i = 0; i < sizeof(addresses) / sizeof(addresses[0]); ++i) {
+        unsigned before = term_graphics_decode_count();
+        mem[addresses[i]] ^= 0xc0;
+        term_render();
+        check_number(term_graphics_decode_count() - before, 1,
+                     "direct writes anywhere in CGA memory trigger a decode");
+        term_render();
+        check_number(term_graphics_decode_count() - before, 1,
+                     "changed CGA memory is cached after one decode");
+    }
+    unsigned before = term_graphics_decode_count();
+    mem[0x466] ^= 0x21;
+    clear_output();
+    term_render();
+    check_number(term_graphics_decode_count() - before, 1,
+                 "direct BDA palette-only change triggers a decode");
+    CHECK(output_size != 0, "direct BDA palette change redraws cached pixels");
+    graphics_polls(2);
+    check_number(term_graphics_decode_count() - before, 1,
+                 "BDA palette-only change is cached after one decode");
+
+    before = term_graphics_decode_count();
+    mem[0x449] = 5; /* Same width as mode 4; no BIOS invalidation call. */
+    clear_output();
+    term_render();
+    check_number(term_graphics_decode_count() - before, 1,
+                 "same-width direct BDA mode change triggers a decode");
+    CHECK(output_size != 0, "mode 5 colour mapping redraws unchanged VRAM");
+    graphics_polls(2);
+    check_number(term_graphics_decode_count() - before, 1,
+                 "same-width direct BDA mode change is cached");
+
+    before = term_graphics_decode_count();
+    mem[0x449] = 6;
+    term_render();
+    check_number(term_graphics_decode_count() - before, 1,
+                 "direct BDA width change triggers a decode");
+    graphics_polls(2);
+    check_number(term_graphics_decode_count() - before, 1,
+                 "direct BDA width change is cached");
+
+    before = term_graphics_decode_count();
+    mem[0xbc000] ^= 1;
+    mem[0x46c] ^= 1; /* Timer ticks are not part of the graphics cache. */
+    term_render();
+    check_number(term_graphics_decode_count() - before, 0,
+                 "memory outside CGA and unrelated BDA bytes do not decode");
+}
+
+static void test_renderer_graphics_cache_repaint(void)
+{
+    reset();
+    term_render();
+    video(4, 0, 0, 0);
+    graphics_pixel(320, 0, 0, 1);
+    term_render();
+    unsigned before = term_graphics_decode_count();
+    clear_output();
+    term_invalidate();
+    term_render();
+    CHECK(output_size > 6000, "invalidated terminal repaints cached braille cells");
+    check_number(term_graphics_decode_count() - before, 0,
+                 "terminal invalidation does not decode unchanged CGA memory");
+    clear_output();
+    term_set_truecolor(1);
+    term_render();
+    CHECK(strstr(output, "38;2;85;255;255;48;2;0;0;0m") != NULL,
+          "truecolor change repaints cached cells with new ANSI attributes");
+    check_number(term_graphics_decode_count() - before, 0,
+                 "host truecolor change does not decode unchanged CGA memory");
+
+    term_set_output(NULL, NULL);
+    graphics_pixel(320, 1, 1, 2);
+    before = term_graphics_decode_count();
+    term_render();
+    check_number(term_graphics_decode_count() - before, 1,
+                 "headless renderer still decodes changed CGA for dumps");
+    graphics_polls(2);
+    check_number(term_graphics_decode_count() - before, 1,
+                 "headless renderer caches graphics without a terminal shadow");
+    clear_output();
+    term_set_output(capture, NULL);
+    term_render();
+    CHECK(output_size > 6000, "new output sink receives a complete cached graphics frame");
+    check_number(term_graphics_decode_count() - before, 1,
+                 "new output sink does not decode unchanged CGA memory");
+
+    video(0x83, 0, 0, 0); /* Preserve video bytes while briefly in text mode. */
+    term_render();
+    video(0x84, 0, 0, 0);
+    before = term_graphics_decode_count();
+    term_render();
+    check_number(term_graphics_decode_count() - before, 1,
+                 "return from text starts a new graphics frame even with preserved VRAM");
+}
+
+static size_t read_dump(const char *path, uint8_t *data, size_t capacity)
+{
+    FILE *f = fopen(path, "rb");
+    CHECK(f != NULL, "renderer created requested dump");
+    if (!f)
+        return 0;
+    size_t n = fread(data, 1, capacity, f);
+    CHECK(!ferror(f), "reading renderer dump succeeds");
+    fclose(f);
+    return n;
+}
+
+static void check_idle_dump(const char *path)
+{
+    /* Holding the original inode open makes replacement detectable without
+     * timing or inode reuse, even when its replacement has identical bytes. */
+    int fd = open(path, O_RDONLY);
+    CHECK(fd >= 0, "hold existing dump open for deterministic identity check");
+    if (fd < 0)
+        return;
+    struct stat before, after;
+    int have_before = fstat(fd, &before) == 0;
+    CHECK(have_before, "read original dump identity");
+    graphics_polls(2);
+    int have_after = stat(path, &after) == 0;
+    CHECK(have_after, "dump remains available after idle polls");
+    CHECK(have_before && have_after && before.st_dev == after.st_dev &&
+          before.st_ino == after.st_ino,
+          "idle graphics polls do not rewrite an unchanged dump");
+    close(fd);
+}
+
+static void test_renderer_graphics_dumps(void)
+{
+    char directory[] = "/tmp/vc-cga-dump-XXXXXX", frame[128], screen[128];
+    char *created = mkdtemp(directory);
+    CHECK(created != NULL, "create isolated graphics dump directory");
+    if (!created)
+        return;
+    snprintf(frame, sizeof(frame), "%s/frame.pgm", directory);
+    snprintf(screen, sizeof(screen), "%s/screen.txt", directory);
+    CHECK(setenv("VC_FRAME_DUMP", frame, 1) == 0, "enable exact frame dump");
+    CHECK(setenv("VC_SCREEN_DUMP", screen, 1) == 0, "enable braille screen dump");
+    uint8_t data[640 * 200 + 32] = {0};
+    for (unsigned mode = 4; mode <= 6; ++mode) {
+        reset();
+        video(mode, 0, 0, 0);
+        unsigned width = mode == 6 ? 640 : 320, maxval = mode == 6 ? 1 : 3;
+        graphics_pixel(width, 0, 0, 1);
+        graphics_pixel(width, width - 1, 199, maxval);
+        if (mode != 6)
+            graphics_pixel(width, 20, 3, 2);
+        term_render();
+        size_t length = read_dump(frame, data, sizeof(data));
+        char header[32];
+        int header_length = snprintf(header, sizeof(header), "P5\n%u 200\n%u\n", width, maxval);
+        check_number((unsigned)length, (unsigned)header_length + width * 200,
+                     "PGM has exactly one byte per CGA pixel and no padding");
+        CHECK(!memcmp(data, header, (size_t)header_length),
+              "PGM dimensions and maximum encode raw palette-index semantics");
+        if (length >= (size_t)header_length + width * 200) {
+            check_number(data[header_length], 1, "PGM preserves first source pixel index");
+            check_number(data[header_length + 1], 0, "PGM preserves zero background");
+            check_number(data[length - 1], maxval, "PGM deinterlaces bottom-right source pixel");
+            if (mode != 6)
+                check_number(data[header_length + width * 3 + 20], 2,
+                             "PGM retains index 2 exactly, not scaled or palette-mapped");
+        }
+        length = read_dump(screen, data, sizeof(data));
+        check_number((unsigned)length, 25 * (80 * 3 + 1),
+                     "braille dump is 80 UTF-8 cells by 25 newline-terminated rows");
+        CHECK(!memcmp(data, "\342\240\201", 3),
+              "screen dump contains the same top-left braille dot as the renderer");
+        CHECK(length >= 4 && !memcmp(data + length - 4, "\342\242\200\n", 4),
+              "screen dump contains the bottom-right braille dot");
+        check_idle_dump(frame);
+        check_idle_dump(screen);
+    }
+    video(3, 0, 0, 0);
+    term_render();
+    size_t length = read_dump(frame, data, sizeof(data));
+    check_number((unsigned)length, 13 + 640 * 200,
+                 "text mode preserves the final graphics frame for inspection");
+    unsetenv("VC_FRAME_DUMP");
+    unsetenv("VC_SCREEN_DUMP");
+    unlink(frame);
+    unlink(screen);
+    rmdir(directory);
 }
 
 /* A click delivered in one read (press then release) must still show the
@@ -2050,6 +2394,12 @@ int main(void)
     RUN(test_renderer_palette);
     RUN(test_renderer_diffs_and_glyphs);
     RUN(test_renderer_mouse_and_blink);
+    RUN(test_renderer_graphics);
+    RUN(test_renderer_graphics_palette_aliases);
+    RUN(test_renderer_graphics_idle);
+    RUN(test_renderer_graphics_cache_sources);
+    RUN(test_renderer_graphics_cache_repaint);
+    RUN(test_renderer_graphics_dumps);
     RUN(test_mouse_quick_click);
     RUN(test_mouse);
     RUN(test_sgr_mouse_input);

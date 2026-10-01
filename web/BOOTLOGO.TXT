@@ -1,0 +1,48 @@
+bootLogo: turtle graphics in a real DOS COM program.
+
+Type BOOTLOGO on VC's command line, or select BOOTLOGO.COM and press Enter.
+Type one line at a time and finish each line with Enter.
+QUIT exits. VC then asks for one more Enter to restore its panels.
+
+Commands (names can be lower case):
+  CLEARSCREEN       Clear the screen; center the turtle facing north.
+                    Use this command alone on its line.
+  FD 40 / BK 40     Move forward / backward, drawing unless the pen is up.
+  RT 25 / LT 25     Turn right / left in degrees.
+  REPEAT 10 FD 10   Repeat a command, or a list inside [ and ].
+  PU / PD          Pen up / pen down.
+  SETCOLOR 1       Pen color 0-3; 0 is the background.
+  TO name ... END  Define a procedure. Only its first two letters matter.
+                    Use a command or [list]; at most 120 characters.
+  QUIT             Exit (use alone on its line).
+
+This is a tiny interpreter: always close brackets, avoid zero distances
+or repeat counts (zero means 65536), and keep command lines short.
+Procedures cannot be redefined. CLEARSCREEN does not erase procedures.
+
+Three programs to type, one line at a time:
+
+1. Square
+  CLEARSCREEN
+  REPEAT 4 [FD 50 RT 90]
+
+2. Star
+  CLEARSCREEN
+  REPEAT 36 [FD 60 RT 170]
+
+3. Flower (from bootLogo's original README)
+  CLEARSCREEN
+  TO CURVE REPEAT 4 [LT 10 FD 10] END
+  TO PETAL [CURVE LT 140 CURVE] END
+  TO FLOWER REPEAT 4 [PETAL LT 50] END
+  FLOWER
+  RT 180
+  FD 50
+  RT 140
+  PETAL
+  PU
+  FD 50
+
+By Oscar Toledo G. (nanochess.org), 2024. BSD-2 licence in LOGOLIC.TXT.
+The same CGA screen works in GW-BASIC: SCREEN 1, DRAW, LINE, CIRCLE,
+PSET. SCREEN 0 returns BASIC to text. Try GAMES\SPIRAL.BAS.
