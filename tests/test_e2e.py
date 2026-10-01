@@ -444,6 +444,109 @@ def test_mouse_click_moves_the_cursor(vc):
     until(vc, lambda: "subdir" in status(vc)[40:])
 
 
+# VC's own keys. In a plain terminal Ctrl-[ sends the same byte as Esc, Ctrl-I
+# as Tab and Ctrl-M as Enter, so those three need a terminal that reports
+# keys: the kitty keyboard protocol, or xterm's modifyOtherKeys.
+CMD_ROW = 23
+KITTY_REPLY = b"\x1b[?0u"  # what a kitty-protocol terminal answers to CSI ? u
+CTRL_UP = b"\x1b[57442;1:3u"  # kitty: left Ctrl released
+CTRL_KEYS = {
+    "kitty": {"[": b"\x1b[91;5u", "i": b"\x1b[105;5u", "m": b"\x1b[109;5u"},
+    "modifyOtherKeys": {"[": b"\x1b[27;5;91~", "i": b"\x1b[27;5;105~", "m": b"\x1b[27;5;109~"},
+}
+
+
+@pytest.fixture(params=sorted(CTRL_KEYS))
+def reporting(request, work, tmp_path):
+    """VC in a terminal that tells Ctrl-[ from Esc, both kinds."""
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home)
+    if request.param == "kitty":
+        s.send(KITTY_REPLY)
+    s.wait_for("10Quit", timeout=15)
+    s.protocol = request.param
+    yield s
+    s.close()
+
+
+def ctrl(s: VcSession, key: str) -> None:
+    s.send(CTRL_KEYS[s.protocol][key])
+    if s.protocol == "kitty":
+        s.send(CTRL_UP)
+
+
+def command_line(s: VcSession) -> str:
+    return s.text().splitlines()[CMD_ROW].rstrip()
+
+
+def panel_title(s: VcSession, left: bool) -> str:
+    half = s.text().splitlines()[0][:40] if left else s.text().splitlines()[0][40:]
+    return half.strip("╔╗═╤ ").split(" ═")[0].strip()
+
+
+def test_ctrl_h_toggles_hidden_files(vc):
+    # Backspace sends DEL in this pty (its VERASE), so 08h is Ctrl-H
+    assert ".hidden" in vc.text()
+    vc.send(b"\x08")
+    until(vc, lambda: ".hidden" not in vc.text())
+    vc.send(b"\x08")
+    until(vc, lambda: ".hidden" in vc.text())
+
+
+def test_backspace_still_edits_the_command_line(vc):
+    vc.send(b"echo xy", "bs")
+    until(vc, lambda: command_line(vc).endswith(">echo x"))
+
+
+def test_ctrl_backslash_goes_to_the_root(vc):
+    vc.send(b"\x1c")
+    until(vc, lambda: command_line(vc) == "C:\\>")
+
+
+def test_ctrl_right_bracket_inserts_the_right_panel_path(vc, work):
+    vc.send(b"\x1d")
+    until(vc, lambda: command_line(vc).endswith(f"\\{work.name}\\"))
+
+
+def test_ctrl_left_bracket_inserts_the_left_panel_path(reporting):
+    s = reporting
+    title = panel_title(s, left=True)
+    assert title.startswith("C:\\"), s.text()
+    s.pump(0.3)
+    ctrl(s, "[")
+    want = title if title.endswith("\\") else title + "\\"
+    until(s, lambda: command_line(s).endswith(">" + want))
+    assert "10Quit" in s.text()  # Esc would have hidden or closed something
+
+
+def test_ctrl_i_inserts_marked_files_and_ctrl_m_marks_them_again(reporting):
+    s = reporting
+    select(s, "hello.txt")
+    s.send("ins")
+    until(s, lambda: "1 selected file" in status(s))
+    ctrl(s, "i")
+    until(s, lambda: "hello.txt" in command_line(s) and "selected" not in status(s))
+    ctrl(s, "m")
+    until(s, lambda: "1 selected file" in status(s))
+
+
+def test_speed_search_takes_a_wildcard(work, tmp_path):
+    (work / "ab.txt").write_text("")
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home)
+    try:
+        s.wait_for("10Quit", timeout=15)
+        select(s, "hello.txt")
+        s.send(b"\x1ba")  # Alt-A opens the search box with "a"
+        until(s, lambda: "Search: a" in s.text() and "markdown" in status(s))
+        s.send(b"*txt")  # skips "a long file name.markdown"
+        until(s, lambda: "ab.txt" in status(s))
+    finally:
+        s.close()
+
+
 def test_f10_quits(vc):
     vc.send("f10")
     vc.pump(0.3)

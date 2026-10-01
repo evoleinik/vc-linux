@@ -228,8 +228,15 @@ static void test_ascii_keys(void)
     }
     expect_sequence("Enter", "\r", 0x1c0d);
     expect_sequence("Ctrl-Enter / LF", "\n", 0x1c0a);
-    expect_sequence("Backspace", "\b", 0x0e08);
+    /* The tty's erase character says which byte Backspace sends. The other
+     * one is Ctrl-H, which VC binds to showing hidden files. */
+    term_set_erase_byte(0x7f);
     expect_sequence("terminal DEL Backspace", "\177", 0x0e08);
+    expect_sequence("Ctrl-H when Backspace sends DEL", "\b", 0x2308);
+    term_set_erase_byte(0x08);
+    expect_sequence("Backspace when the tty erases with ^H", "\b", 0x0e08);
+    expect_sequence("DEL stays Backspace when the tty erases with ^H", "\177", 0x0e08);
+    term_set_erase_byte(0x7f);
     expect_sequence("Tab", "\t", 0x0f09);
     expect_sequence("Shift-Tab", "\033[Z", 0x0f00);
     expect_sequence("keypad Enter", "\033OM", 0xe00d);
@@ -280,6 +287,16 @@ static void test_control_alt_keys(void)
     expect_sequence("Ctrl-minus", "\033[45;5u", 0x0c1f);
     expect_sequence("CSI-u Ctrl-Enter", "\033[13;5u", 0x1c0a);
     expect_sequence("modifyOtherKeys Ctrl-Enter", "\033[27;5;13~", 0x1c0a);
+    /* VC's own keys that share a byte with Esc, Tab and Enter in a plain
+     * terminal. Both protocols must give their real Ctrl scan codes, since
+     * VC tells ^[ from Esc, ^I from Tab and ^M from Enter by the scan alone. */
+    expect_sequence("CSI-u Ctrl-[ (insert left path)", "\033[91;5u", 0x1a1b);
+    expect_sequence("CSI-u Ctrl-I (insert files)", "\033[105;5u", 0x1709);
+    expect_sequence("CSI-u Ctrl-M (restore marks)", "\033[109;5u", 0x320d);
+    expect_sequence("modifyOtherKeys Ctrl-[", "\033[27;5;91~", 0x1a1b);
+    expect_sequence("modifyOtherKeys Ctrl-I", "\033[27;5;105~", 0x1709);
+    expect_sequence("modifyOtherKeys Ctrl-M", "\033[27;5;109~", 0x320d);
+    expect_sequence("modifyOtherKeys Shift-a", "\033[27;2;97~", 0x1e41);
     clear_input();
     {
         static const uint8_t controls[] = {0x00,0x01,0x02,0x03,0x1c,0x1d,0x1e,0x1f};
@@ -1706,6 +1723,8 @@ static void check_enter_modes(void)
     CHECK(strstr(output, "\033[?u") != NULL, "PTY queries kitty support");
     CHECK(strstr(output, "\033[>11u") == NULL,
           "PTY must not enable kitty before an affirmative query reply");
+    CHECK(strstr(output, "\033[>4;2m") != NULL,
+          "PTY asks xterm-style terminals for modifyOtherKeys");
 }
 
 static void check_leave_modes(int kitty)
@@ -1717,6 +1736,7 @@ static void check_leave_modes(int kitty)
     CHECK(strstr(output, "\033[?25h") != NULL, "cleanup makes host cursor visible");
     CHECK(strstr(output, "\033[0m") != NULL, "cleanup resets character attributes");
     CHECK(strstr(output, "\033[?7h") != NULL, "cleanup restores terminal autowrap");
+    CHECK(strstr(output, "\033[>4m") != NULL, "cleanup resets modifyOtherKeys");
     if (kitty)
         CHECK(strstr(output, "\033[<u") != NULL, "cleanup pops negotiated kitty flags");
 }

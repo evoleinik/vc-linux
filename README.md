@@ -46,13 +46,24 @@ goes to `~/.cache/vc-linux/vc.log`.
 | F4 | Edit | opens `$EDITOR` (VC 4.99.09's own editor is disabled in its source) |
 | F5, F6 | Copy, rename or move | long and Cyrillic names kept |
 | F7, F8 | Make directory, delete | F8 on a symlink removes only the link |
-| Alt-F10 | Directory tree | scans the whole drive, so use it on `H:` |
+| Alt-F10, Ctrl-Z | Directory tree | scans the whole drive, so use it on `H:` |
+| Ctrl-Q, Ctrl-L | Quick view, info panel | |
 | Ins, Grey + − * | Select files | grey keys need application keypad mode, which vc turns on |
+| Ctrl-[, Ctrl-] | Put the left or right panel's path on the command line | Ctrl-[ needs a terminal that reports keys |
+| Ctrl-I, Ctrl-M | Put the selected names on the command line, then select them again | need a terminal that reports keys |
+| Ctrl-H | Show or hide dotfiles | dotfiles carry the DOS hidden attribute |
+| Ctrl-\\ | Go to the root of the drive | |
+| Alt-letter | Speed search | takes a `*` wildcard |
 | Command line | Runs in `/bin/sh` | `cd` moves VC's panel like `COMMAND.COM` did; `cd ~` works |
 | Mouse | Click to move the cursor | SGR mouse reporting |
 
 Drives: `C:` is `/` and `H:` is your home directory. Names are shown in code page 866, so Cyrillic
 displays correctly.
+
+In a plain terminal, Ctrl-[ sends the same byte as Esc. Ctrl-I sends the same byte as Tab, and
+Ctrl-M the same as Enter. VC gives each of them a different job, so vc asks the terminal to report
+keys in full. kitty, foot, Ghostty, Alacritty and iTerm2 do it through the kitty keyboard protocol.
+WezTerm does too once `enable_kitty_keyboard` is on. xterm does it through modifyOtherKeys.
 
 ## Why shouldn't I use it?
 
@@ -65,7 +76,7 @@ displays correctly.
 - **The screen is 80×25.** It does not resize with your terminal.
 - **Ctrl-O shows VC's own screen.** It does not show what your last shell command printed.
 - **Holding Shift, Ctrl or Alt changes the key bar** only on terminals that speak the kitty
-  keyboard protocol.
+  keyboard protocol. Elsewhere, Ctrl-[, Ctrl-I and Ctrl-M act as Esc, Tab and Enter.
 - **Only Linux on x86-64 is tested.**
 
 ## How it works
@@ -102,10 +113,10 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 | Suite | What it proves |
 |---|---|
 | `test-translator` | All 43,000 distinct instructions in both programs match the unicorn CPU emulator from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
-| `test-fs` | The DOS file layer, register by register: about 3,500 checks against a temporary tree. |
-| `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,500 checks. |
+| `test-fs` | The DOS file layer, register by register: about 4,100 checks against a temporary tree. |
+| `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,600 checks. |
 | `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
-| `test-e2e` | `build/vc` in a pseudo-terminal: the terminal shows exactly what is in video memory, and view, copy, rename, delete, F4, the mouse and shell commands work on disk. |
+| `test-e2e` | `build/vc` in a pseudo-terminal: the terminal shows exactly what is in video memory, and view, copy, rename, delete, F4, the mouse, shell commands and VC's own Ctrl keys work. |
 
 Every finding from the three code reviews was fixed with a test that failed on the old code first.
 
@@ -126,6 +137,26 @@ Every finding from the three code reviews was fixed with a test that failed on t
   `social_preview.py`.
 - `tests/` all suites. `tests/spike_puttime/` is the first proof that translation works.
 - `docs/` the plan and the work briefs that built this.
+
+## History
+
+Vsevolod Volkov wrote VC as a student at Kyiv Polytechnic, where he studied electronics. It first
+appeared in the Softpanorama Bulletin, a monthly magazine on floppy disks, in December 1992. It
+came as a New Year gift to readers. A stable beta had circulated for about six months before
+that. In May 2026 Volkov told Danila Sukharev how it began:
+
+> Initially, the program was conceived simply as a joke: a tiny assembler program that looked
+> like NC 3.0, whose only function was to list directory contents. Then, in my spare time, I
+> added individual functions: copying, viewing, and so on. After a while, I had something usable.
+> Moreover, on those PC/XT-class computers, the program ran significantly faster and took up less
+> precious RAM. I began developing it for my own use. Other users noticed the program, and it
+> began to spread around the world. Back then, it didn't have its own name. Users came up with the
+> name Volkov Commander.
+
+VC 4 fits in one COM file under 64 KB. It added keys that later file managers copied. Ctrl-[ and
+Ctrl-] put a panel's path on the command line. Ctrl-I puts the selected names there. Nikolai
+Bezroukov, who ran Softpanorama, tells the story in
+[Volkov Commander: a masterpiece of assembler programming](https://softpanorama.org/OFM/Paradigm/Ch03/volkov_commander.shtml).
 
 ## Credits and license
 

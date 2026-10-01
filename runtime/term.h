@@ -21,5 +21,8 @@ void term_clear_pending(void);
 void term_flush_input(void);
 void term_feed_input(const uint8_t *data, size_t n, uint64_t now_ms);
 void term_expire_input(uint64_t now_ms);
+/* The byte the host terminal sends for Backspace (its termios VERASE). The
+ * other of 08h and 7Fh is then Ctrl-H. Read from the tty at start. */
+void term_set_erase_byte(uint8_t byte);
 
 #endif

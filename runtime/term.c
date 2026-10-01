@@ -59,6 +59,7 @@ static void *output_opaque;
 static int truecolor, initialized, exit_registered, handlers_installed;
 static volatile sig_atomic_t active, kitty_enabled, resize_pending;
 static struct termios saved_termios;
+static uint8_t erase_byte = 0x7f; /* what this tty's Backspace sends */
 static unsigned host_columns, host_rows;
 static uint16_t shadow[MAX_CELLS]; /* Always raw guest cells, never mouse XOR. */
 static int shadow_valid, cursor_known, old_mouse_visible, old_blink;
@@ -96,7 +97,7 @@ static const int fatal_signals[] = {
 static struct sigaction saved_fatal[NSIG], saved_winch;
 static sigset_t installed_fatal;
 static const char leave_modes[] =
-    "\033[?1006l\033[?1002l\033>\033[0m\033[?25h\033[?7h\033[?1049l";
+    "\033[>4m\033[?1006l\033[?1002l\033>\033[0m\033[?25h\033[?7h\033[?1049l";
 
 static int is_fatal_signal(int number)
 {
@@ -443,6 +444,8 @@ static void acquire_terminal(void)
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO) ||
         tcgetattr(STDIN_FILENO, &saved_termios) != 0)
         return;
+    if (saved_termios.c_cc[VERASE] == 0x08 || saved_termios.c_cc[VERASE] == 0x7f)
+        erase_byte = saved_termios.c_cc[VERASE];
     struct termios raw = saved_termios;
     raw.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR |
                      ICRNL | IXON | IXOFF | IXANY);
@@ -463,7 +466,11 @@ static void acquire_terminal(void)
     input_eof = 0;
     term_reset_input();
     read_host_size();
-    emit_string("\033[?1049h\033[?7l\033=\033[?1002h\033[?1006h\033[?25l\033[?u");
+    /* Ask kitty-protocol terminals what they support, and ask xterm-style
+     * ones for modifyOtherKeys. Either one tells Ctrl-[ from Esc, Ctrl-I
+     * from Tab and Ctrl-M from Enter, which VC binds to different jobs. */
+    emit_string("\033[?1049h\033[?7l\033=\033[?1002h\033[?1006h\033[?25l\033[?u"
+                "\033[>4;2m");
     term_invalidate();
     sigprocmask(SIG_SETMASK, &previous, NULL);
 }
@@ -578,6 +585,11 @@ static void feed_ring(void)
     }
 }
 
+void term_set_erase_byte(uint8_t byte)
+{
+    erase_byte = byte;
+}
+
 void term_clear_pending(void)
 {
     pending_head = pending_count = 0;
@@ -622,6 +634,10 @@ static void queue_character(unsigned code, unsigned modifiers)
             queue_word(0x94, 0);
         else
             queue_word(0x0f, modifiers & MOD_SHIFT ? 0 : 9);
+        return;
+    }
+    if (code == 8 && erase_byte != 8 && !(modifiers & (MOD_ALT | MOD_CTRL))) {
+        queue_word(0x23, 8); /* Backspace sends DEL here, so 08h is Ctrl-H. */
         return;
     }
     if (code == 8 || code == 127) {
@@ -924,7 +940,8 @@ static void control_sequence(const uint8_t *bytes, size_t n, int ss3,
             /* Negotiate, do not blindly enable a protocol on older ttys. */
             sigset_t previous;
             block_lifecycle_signals(&previous);
-            emit_string("\033[>11u");
+            /* Kitty reports keys itself, so modifyOtherKeys is not needed. */
+            emit_string("\033[>4m\033[>11u");
             kitty_enabled = 1;
             sigprocmask(SIG_SETMASK, &previous, NULL);
         }

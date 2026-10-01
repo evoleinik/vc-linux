@@ -40,6 +40,9 @@ the runtime and the DOS/BIOS layer. Change them deliberately, never in passing.
 - **Change `data/VC.INI` with `tools/vcini.py` or by saving from VC (Shift-F9).** A bad checksum
   makes VC ignore the whole file. `ConvCase` must stay off, or VC uppercases 8.3 names it creates.
 - **DOS paths on a command line stay under 126 bytes.** Tests use short temporary paths.
+- **Ctrl-[, Ctrl-I and Ctrl-M share bytes with Esc, Tab and Enter.** VC tells them apart by scan
+  code, so they work only through the kitty protocol or modifyOtherKeys. A raw 08h is Ctrl-H
+  unless the tty's VERASE says Backspace sends 08h.
 
 ## Debugging
 
