@@ -1,0 +1,23 @@
+# One-off pod for first-time setup: copy the image's default art, mods and config into the
+# volume, then run `./oputil.js config new`. Delete it before starting the Deployment.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: enigma-setup
+  namespace: bbs
+spec:
+  restartPolicy: Never
+  containers:
+    - name: setup
+      image: enigmabbs/enigma-bbs@sha256:e754957e26879db247d3e3d32f826d23fa9607ed85e3a87f252b0aea6ccaa13d
+      command: [sleep, infinity]
+      volumeMounts:
+        - {name: data, mountPath: /enigma-bbs/config, subPath: config}
+        - {name: data, mountPath: /enigma-bbs/mods, subPath: mods}
+        - {name: data, mountPath: /enigma-bbs/art, subPath: art}
+        - {name: data, mountPath: /enigma-bbs/db, subPath: db}
+        - {name: data, mountPath: /enigma-bbs/filebase, subPath: filebase}
+        - {name: data, mountPath: /enigma-bbs/logs, subPath: logs}
+  volumes:
+    - name: data
+      persistentVolumeClaim: {claimName: enigma-data}

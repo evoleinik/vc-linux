@@ -76,3 +76,12 @@ people log in (a handle and password, or GitHub), and what saved state means.
    `wss://axis.tail85247.ts.net:8443`, since the Oracle API key on axis returns 401 and opening
    ports needs a console sign-in. `bbs.notanemulator.com` can follow once ports 80 and 443 are open.
    Funnel on axis already serves another app on 443, which stays untouched.
+
+## Outcome so far — 2026-10-01
+
+- The server side is live. ENiGMA½ 0.5.1-beta runs on `axis` (`infra/bbs/`). Its WebSocket
+  answers publicly at `wss://axis.tail85247.ts.net:8443/` through Tailscale Funnel. Telnet stays
+  inside the tailnet.
+- The sysop account `eugene` (user 1) was registered before anything was exposed, since the first
+  account to apply becomes the sysop.
+- Still to build: MS-DOS Kermit translated, and the virtual modem bridging `ATDT` to that WebSocket.

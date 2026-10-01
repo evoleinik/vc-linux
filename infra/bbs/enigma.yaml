@@ -1,0 +1,67 @@
+# ENiGMA½ BBS for notanemulator.com, on the axis k3s node.
+# Design: docs/plans/2026-10-01-bbs-experience.md. Setup steps: README.md beside this file.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bbs
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: enigma-data
+  namespace: bbs
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enigma
+  namespace: bbs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: enigma}
+  template:
+    metadata:
+      labels: {app: enigma}
+    spec:
+      containers:
+        - name: enigma
+          image: enigmabbs/enigma-bbs@sha256:e754957e26879db247d3e3d32f826d23fa9607ed85e3a87f252b0aea6ccaa13d
+          ports:
+            - {name: telnet, containerPort: 8888}
+            - {name: ws, containerPort: 8810}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 768Mi}
+          volumeMounts: &mounts
+            - {name: data, mountPath: /enigma-bbs/config, subPath: config}
+            - {name: data, mountPath: /enigma-bbs/mods, subPath: mods}
+            - {name: data, mountPath: /enigma-bbs/art, subPath: art}
+            - {name: data, mountPath: /enigma-bbs/db, subPath: db}
+            - {name: data, mountPath: /enigma-bbs/filebase, subPath: filebase}
+            - {name: data, mountPath: /enigma-bbs/logs, subPath: logs}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: enigma-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: enigma
+  namespace: bbs
+spec:
+  type: NodePort
+  selector: {app: enigma}
+  ports:
+    # Tailscale Funnel on axis maps https://axis.tail85247.ts.net:8443 to this node port.
+    - {name: ws, port: 8810, targetPort: 8810, nodePort: 30810}
+    # Telnet stays inside the node: the cloud firewall blocks it, and Funnel does not expose it.
+    - {name: telnet, port: 8888, targetPort: 8888, nodePort: 30888}
