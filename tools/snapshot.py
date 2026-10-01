@@ -28,7 +28,8 @@ def main() -> None:
     keys = sys.argv[3:]
     os.environ["COLORTERM"] = "truecolor"
     with tempfile.TemporaryDirectory(dir=ROOT / "build") as home:
-        s = VcSession(where, Path(home))
+        # settings in a throwaway dir, but the real $HOME, so H: is your home
+        s = VcSession(where, Path(home), extra_env={"HOME": os.environ.get("HOME", home)})
         try:
             s.wait_for("10Quit", timeout=15)
             for k in keys:
