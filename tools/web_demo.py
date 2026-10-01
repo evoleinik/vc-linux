@@ -13,9 +13,9 @@ from vz_defaults import installed_definition
 
 
 ROOT = Path(__file__).resolve().parent.parent
-# Brief 20's combined Rogue/PDCurses and VZ drive measures 577,179 bytes
-# across 37 files. VZ's eight files add 78,001 bytes; the complete payload
-# remains below the finite 600 KB packaging budget introduced for Rogue.
+# Brief 20's combined Rogue/PDCurses and VZ drive measured 577,179 bytes
+# across 37 files. The CP866 Russian guide adds 1,512 bytes; the complete
+# payload stays below the finite 600 KB packaging budget introduced for Rogue.
 LIMIT = 600_000
 
 
@@ -42,6 +42,9 @@ def main() -> None:
     destination = Path(sys.argv[1])
     files = {
         "README.TXT": (ROOT / "web/README.TXT").read_text(encoding="ascii").encode("ascii"),
+        # Keep a readable UTF-8 source in git; only Russian has a complete
+        # CP866 alphabet. Ukrainian remains on the Unicode browser page.
+        "ПРОЧТИ.TXT": (ROOT / "web/README-RU.TXT").read_text(encoding="utf-8").replace("\n", "\r\n").encode("cp866"),
         "HISTORY.TXT": history_text((ROOT / "README.md").read_text(encoding="utf-8")),
         "GWBASIC.EXE": Path(sys.argv[2]).read_bytes(),
         "GWBASIC.TXT": (ROOT / "third_party/gwbasic/LICENSE").read_bytes(),

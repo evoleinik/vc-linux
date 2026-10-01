@@ -227,6 +227,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "vc: cannot prepare browser home: %s\n", strerror(errno));
         return 1;
     }
+    /* Emscripten's packager requires ASCII symbol names. Only its staging
+     * name is Latin: H: exposes the actual Cyrillic name before the first
+     * directory scan, with the guide's original CP866 bytes unchanged. */
+    if (rename("READMERU.TXT", "ПРОЧТИ.TXT")) {
+        fprintf(stderr, "vc: cannot install Russian guide: %s\n", strerror(errno));
+        return 1;
+    }
 #else
     if (argc > 2 || (argc == 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")))) {
         usage();
@@ -259,7 +266,9 @@ int main(int argc, char **argv) {
     snprintf(host_prog, sizeof host_prog, "%s/VC.COM", dir);
 
     dos_core_init();
+#ifndef __EMSCRIPTEN__
     rt_register_supplement(&image_gwbasic, run_gwbasic_graphics);
+#endif
     bios_init();
     dos_fs_init();
     term_init();

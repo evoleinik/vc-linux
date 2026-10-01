@@ -166,9 +166,15 @@ input active.
 directory, or press Enter on that EXE. Its saves, like all browser files, vanish
 on reload.
 
+The page first downloads VC alone, about 1.3 MB gzipped. Each translated program is a separate
+wasm module, fetched the first time DOS runs it and kept for the session. On a phone held upright,
+a key pad appears under the screen with F1 to F10, arrows, Esc, Tab, Ins, Enter, sticky Ctrl, Alt
+and Shift, and a button that opens the phone's keyboard. The page text follows the browser's
+language in English, Russian or Ukrainian, and `H:\ПРОЧТИ.TXT` is the README in Russian.
+
 To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
 
-    make web          # build/web/: index.html, vc.mjs, vc.wasm
+    make web          # build/web/: index.html, vc.mjs, vc.wasm and one wasm per program
     make test-web     # Node checks VC, VZ edits/saves, Rogue, BASIC, Logo, CGA pixels and sound
 
 Serve `build/web/` over HTTP to open it. The design is in `docs/plans/2026-10-01-browser-build.md`.

@@ -1,8 +1,10 @@
 // The real translated VC in Emscripten's MEMFS, with the same byte hooks as
 // the page. Actions wait for screen state; timers only put a bound on failure.
+// Add --fetch-failure, --fetch-timeout or --memory-limit for recovery gates.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isMainThread, parentPort, Worker } from 'node:worker_threads';
 
@@ -32,9 +34,31 @@ if (isMainThread) {
   await new Promise(() => {});
 }
 
-const modulePath = process.argv[2]
-  ? resolve(process.argv[2])
+const moduleArgument = process.argv.slice(2).find((argument) => !argument.startsWith('--'));
+const modulePath = moduleArgument
+  ? resolve(moduleArgument)
   : fileURLToPath(new URL('../build/web/vc.mjs', import.meta.url));
+const fetchFailure = process.argv.includes('--fetch-failure');
+const fetchTimeout = process.argv.includes('--fetch-timeout');
+const memoryLimit = process.argv.includes('--memory-limit');
+const programDeadlines = [];
+const realSetTimeout = globalThis.setTimeout;
+if (fetchTimeout) {
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    // Advance only the production download deadline, not guest idle waits
+    // or test watchdogs. Check its actual 30-second default/cap without
+    // spending a minute waiting for two deliberately stalled downloads.
+    if (delay >= 30000) {
+      programDeadlines.push(delay);
+      return realSetTimeout(callback, 100, ...args);
+    }
+    return realSetTimeout(callback, delay, ...args);
+  };
+}
+const moduleURL = pathToFileURL(modulePath);
+const loader = readFileSync(resolve(dirname(modulePath), 'vc-web.js'), 'utf8');
+const buildHash = loader.match(/locateFile:[^\n]*\?v=([0-9a-f]+)/)?.[1];
+assert.ok(buildHash, 'the built page must supply a versioned wasm URL resolver');
 const { default: createVC } = await import(pathToFileURL(modulePath));
 const screenPath = '/tmp/vc-screen.txt';
 const encoder = new TextEncoder();
@@ -43,9 +67,22 @@ let vc;
 let screen = '';
 let pending = new Uint8Array();
 let inputReads = 0;
+let outputCalls = 0;
+let startupHeapBytes = 0;
+let startupHeapTop = 0;
+let wasmExports;
 let exitCode;
 let exitCalls = 0;
 let stage = '1 startup';
+const programModules = ['gwbasic.wasm', 'bootlogo.wasm', 'rogue.wasm', 'vz.wasm'];
+const programFiles = new Map(readdirSync(dirname(modulePath)).flatMap((name) => {
+  const match = name.match(/^(gwbasic|bootlogo|rogue|vz)\.([0-9a-f]{12})\.wasm$/);
+  return match ? [[`${match[1]}.wasm`, name]] : [];
+}));
+assert.equal(programFiles.size, 4, 'all side modules have immutable build-hash filenames');
+const moduleFetches = [];
+const expectedFetches = [];
+let heldDownload = null;
 const speakerEvents = [];
 const faultMessage = 'No translated code at 0000:0000. GWBASIC.EXE stopped.';
 let sawFaultMessage = false;
@@ -110,12 +147,68 @@ function until(description, predicate) {
     const check = () => {
       if (predicate(screen)) finish();
     };
-    const deadline = setTimeout(() => {
+    // Never accelerate the harness watchdog, even when a slow-run timeout
+    // equals the production download deadline being tested.
+    const deadline = realSetTimeout(() => {
       finish(new Error(`Timed out waiting for ${description}`));
     }, timeout);
     observers.add(check);
     observe();
   });
+}
+
+function assertFetches() {
+  assert.deepEqual(moduleFetches.map(({ name }) => name), expectedFetches,
+    'programs fetch only at their first EXEC; subsequent runs use the loaded module');
+}
+
+async function programRequest(url) {
+  // Record even malformed/unexpected requests before an assertion can
+  // reject: the production loader deliberately catches transport errors.
+  const index = moduleFetches.length;
+  const request = { name: String(url), url, bodyReads: 0 };
+  moduleFetches.push(request);
+  const resource = new URL(url);
+  const filename = basename(resource.pathname);
+  const name = filename.replace(/\.[0-9a-f]{12}\.wasm$/, '.wasm');
+  request.name = name;
+  request.filename = filename;
+  assert.equal(resource.protocol, 'file:', 'Node tests read only local program files');
+  assert.equal(resource.search, `?v=${buildHash}`, 'every lazy request has the page build hash');
+  assert.ok(programModules.includes(name), `unexpected lazy asset ${name}`);
+  assert.equal(filename, programFiles.get(name), 'main requests the exact shipped immutable module filename');
+  assert.equal(name, expectedFetches[index], 'the request belongs to this EXEC');
+  const attempt = moduleFetches.filter((entry) => entry.name === name).length;
+  const ready = new Promise((release) => {
+    heldDownload = { name, release, screen, inputReads, outputCalls };
+  });
+  observe();
+  await ready;
+  heldDownload = null;
+  return { request, resource, attempt };
+}
+
+const programBytes = async (resource) => new Uint8Array(await readFile(resource));
+
+async function fetchProgramBytes(url) {
+  const { resource } = await programRequest(url);
+  return programBytes(resource);
+}
+
+async function releaseProgramFetch(name) {
+  await until(`${name} first-use download request`, () => heldDownload?.name === name);
+  assertFetches();
+  const held = heldDownload;
+  // This checkpoint cannot run while a synchronous guest blocks Node. Keep
+  // the actual module bytes withheld until it proves Asyncify has yielded.
+  await new Promise((done) => setImmediate(done));
+  observe();
+  assert.equal(screen, held.screen, 'the guest screen stays unchanged while the download is held');
+  assert.equal(inputReads, held.inputReads, 'the guest is suspended, not polling while downloading');
+  assert.equal(outputCalls, held.outputCalls, 'a held download produces no new guest output');
+  assert.equal(exitCalls, 0, 'waiting for a module must not terminate VC');
+  held.release();
+  console.log(`PASS lazy: ${programFiles.get(name)}?v=${buildHash} first EXEC waits quietly and yields to Node`);
 }
 
 async function basicLine(command) {
@@ -166,6 +259,221 @@ async function selectFile(name) {
   assert.fail(`${name} was not reachable in the active panel`);
 }
 
+async function quitVC() {
+  send('\x1b[21~');
+  await until('the quit confirmation', (text) =>
+    text.includes('Do you want to quit the Volkov Commander?') && text.includes('Yes'));
+  send('\r');
+  await until('the JavaScript exit hook', () => exitCalls > 0);
+  assert.equal(exitCalls, 1, 'the exit hook fires exactly once');
+  assert.equal(exitCode, 0, 'VC exits successfully');
+}
+
+async function checkFetchFailures() {
+  const markerPath = '/home/vc/KEEP.TXT';
+  vc.FS.writeFile(markerPath, 'the same MEMFS survives all failed downloads');
+  const errors = () => {
+    try {
+      return (vc.FS.readFile('/var/vc/cache/vc-linux/vc.log', { encoding: 'utf8' })
+        .match(/DOS command error 5/g) || []).length;
+    } catch { return 0; }
+  };
+  for (const failure of ['rejected fetch', 'HTTP 503', 'HTTP 404 (stale deploy)', 'malformed wasm']) {
+    stage = `fetch failure: ${failure}`;
+    const before = errors();
+    expectedFetches.push('gwbasic.wasm');
+    send('gwbasic\r');
+    await releaseProgramFetch('gwbasic.wasm');
+    await until(`DOS access-denied error and restored VC panels after ${failure}`, (text) =>
+      errors() > before && isPanel(text));
+    // VC normally restores its panels immediately. Its saved user screen
+    // retains the ordinary DOS diagnostic, reachable with the real Ctrl-O.
+    send('\x0f');
+    await until(`the saved user screen contains the DOS error after ${failure}`, (text) =>
+      !hasPanels(text) && text.includes('Access denied'));
+    send('\x0f');
+    await until(`VC panels after showing the ${failure} DOS error`, isPanel);
+    assert.equal(exitCalls, 0, 'failed EXEC must not exit VC');
+    assert.equal(vc.FS.readFile(markerPath, { encoding: 'utf8' }),
+      'the same MEMFS survives all failed downloads');
+    assertFetches();
+    console.log(`PASS failure: ${failure} returns DOS error 5 and VC restores its panels`);
+  }
+  assert.equal(moduleFetches[1].bodyReads, 0, 'an HTTP error must be rejected before reading its body');
+  assert.equal(moduleFetches[2].bodyReads, 0, 'a stale-tab 404 must be rejected without linking a newer module');
+
+  stage = 'fetch failure: VC remains usable';
+  await selectFile('README.TXT');
+  const firstLine = vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' }).split(/\r?\n/)[0];
+  send('\x1bOR');
+  await until('working F3 after all failed EXECs', (text) => text.includes(firstLine));
+  send('\x1b');
+  await until('VC panels after the post-failure viewer', isPanel);
+
+  stage = 'fetch failure: successful retry';
+  expectedFetches.push('gwbasic.wasm');
+  send('gwbasic\r');
+  await releaseProgramFetch('gwbasic.wasm');
+  await until('GW-BASIC starts after failed and malformed downloads', (text) =>
+    text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+  send('PRINT 2+2\r');
+  await until('the recovered BASIC executes arithmetic', (text) => /^\s*4\s*$/m.test(text));
+  send('SYSTEM\r');
+  await until('VC panels after the recovered BASIC', isPanel);
+
+  stage = 'fetch failure: cached rerun';
+  send('gwbasic\r');
+  await until('the successfully retried module runs from cache', (text) =>
+    text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+  assertFetches();
+  assert.equal(moduleFetches.length, 5, 'four failed attempts and one successful fetch, no cached fetch');
+  assert.deepEqual(moduleFetches.map(({ bodyReads }) => bodyReads), [0, 0, 0, 1, 1],
+    'the production fetch path reads only HTTP-success bodies, including its successful retry');
+  send('SYSTEM\r');
+  await until('VC panels after the cached recovered module', isPanel);
+  await quitVC();
+  console.log('web fetch failure: rejected/HTTP-503/stale-deploy-404/malformed downloads, DOS errors, working F3, retry and cache passed');
+}
+
+function dosErrors(code) {
+  try {
+    const log = vc.FS.readFile('/var/vc/cache/vc-linux/vc.log', { encoding: 'utf8' });
+    return (log.match(new RegExp(`DOS command error ${code}\\b`, 'g')) || []).length;
+  } catch { return 0; }
+}
+
+async function checkUsableAfterFailedLoad(message) {
+  send('\x0f');
+  await until(`the saved DOS diagnostic: ${message}`, (text) =>
+    !hasPanels(text) && text.includes(message));
+  send('\x0f');
+  await until('VC panels after the DOS diagnostic', isPanel);
+  await selectFile('README.TXT');
+  const firstLine = vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' }).split(/\r?\n/)[0];
+  send('\x1bOR');
+  await until('F3 still works after the failed load', (text) => text.includes(firstLine));
+  send('\x1b');
+  await until('panels after the post-failure F3 viewer', isPanel);
+  assert.equal(exitCalls, 0, 'a failed load must not end VC');
+  assert.deepEqual(vc.FS.readdir('/var/vc').filter((name) => name.endsWith('.wasm')), [],
+    'failed loads leave no staged module files');
+}
+
+async function checkSuccessfulRetry() {
+  expectedFetches.push('gwbasic.wasm');
+  send('gwbasic\r');
+  await releaseProgramFetch('gwbasic.wasm');
+  await until('BASIC starts on a later EXEC', (text) => text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+  send('PRINT 6*7\r');
+  await until('the retried BASIC executes correctly', (text) => /^\s*42\s*$/m.test(text));
+  send('SYSTEM\r');
+  await until('panels after the successfully retried BASIC', isPanel);
+  send('gwbasic\r');
+  await until('the retried module is cached', (text) => text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+  assertFetches();
+  send('SYSTEM\r');
+  await until('panels after the cached retry', isPanel);
+}
+
+async function checkStalledDownloads() {
+  for (const [failure, configured] of [
+    ['stalled response', 100], ['stalled response body', 100],
+    ['default deadline', undefined], ['capped deadline', 60000],
+  ]) {
+    stage = failure;
+    vc.vcProgramFetchTimeoutMs = configured;
+    const before = dosErrors(5);
+    const deadlinesBefore = programDeadlines.length;
+    expectedFetches.push('gwbasic.wasm');
+    send('gwbasic\r');
+    await releaseProgramFetch('gwbasic.wasm');
+    await until(`${failure} aborts with DOS error 5 and restores panels`, (text) =>
+      dosErrors(5) > before && isPanel(text));
+    assert.equal(moduleFetches.at(-1).signal?.aborted, true, 'the timeout aborts the actual transport');
+    await checkUsableAfterFailedLoad('Access denied');
+    if (configured !== 100) {
+      assert.deepEqual(programDeadlines.slice(deadlinesBefore), [30000],
+        'the production deadline defaults to and is capped at exactly 30 seconds');
+    }
+    const request = moduleFetches.at(-1);
+    if (request.finishLate) {
+      const bytes = await programBytes(new URL(request.url));
+      request.finishLate(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      await new Promise((done) => setImmediate(done));
+      assert.deepEqual(vc.FS.readdir('/var/vc').filter((name) => name.endsWith('.wasm')), [],
+        'a response body arriving after timeout cannot stage or link a module');
+      assert.equal(dosErrors(5), before + 1, 'late completion cannot resume the failed EXEC again');
+      assert.ok(isPanel(screen));
+    }
+    console.log(`PASS timeout: ${failure}; aborted transport, DOS error 5, F3 usable`);
+  }
+  assert.deepEqual(moduleFetches.map(({ bodyReads }) => bodyReads), [0, 1, 0, 0]);
+  vc.vcProgramFetchTimeoutMs = 100;
+  await checkSuccessfulRetry();
+  await quitVC();
+  console.log('web fetch timeout: response/body stalls, 30s default/cap, late bytes, DOS errors, F3, retry and cache passed');
+}
+
+async function checkMemoryLimit() {
+  stage = 'memory-limited EXEC';
+  const markerPath = '/home/vc/KEEP.TXT';
+  vc.FS.writeFile(markerPath, 'files survive exhausted wasm memory');
+  // A real fixed-capacity WebAssembly.Memory, not a mocked availability
+  // counter. Consume its free heap, retaining about 1-2 MiB for VC to recover.
+  const reservations = [];
+  for (;;) {
+    const pointer = wasmExports.malloc(1024 * 1024);
+    if (!pointer) break;
+    reservations.push(pointer);
+  }
+  assert.ok(reservations.length > 1, 'the test consumes real heap allocations');
+  wasmExports.free(reservations.pop());
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const before = dosErrors(8);
+    expectedFetches.push('gwbasic.wasm');
+    send('gwbasic\r');
+    await releaseProgramFetch('gwbasic.wasm');
+    await until('insufficient heap gives DOS error 8 and restores VC', (text) =>
+      dosErrors(8) > before && isPanel(text));
+    assert.equal(vc.FS.readFile(markerPath, { encoding: 'utf8' }), 'files survive exhausted wasm memory');
+    await checkUsableAfterFailedLoad('Not enough memory');
+    console.log(`PASS memory limit: attempt ${attempt + 1} returns DOS error 8, preserves files and working F3`);
+  }
+  for (const pointer of reservations) wasmExports.free(pointer);
+
+  // Enough aggregate free space is not enough for dylink's raw-file copy.
+  // Make many separated holes in the same fixed memory to exercise the
+  // contiguous-allocation check rather than only the free-byte threshold.
+  stage = 'fragmented-memory EXEC';
+  const fragments = [];
+  const fragmentSize = 128 * 1024;
+  for (;;) {
+    const pointer = wasmExports.malloc(fragmentSize);
+    if (!pointer) break;
+    fragments.push(pointer);
+  }
+  let freed = 0;
+  for (let index = 0; index < fragments.length; index += 2) {
+    wasmExports.free(fragments[index]);
+    fragments[index] = 0;
+    freed += fragmentSize;
+  }
+  const moduleSize = readFileSync(resolve(dirname(modulePath), programFiles.get('gwbasic.wasm'))).length;
+  assert.ok(freed >= moduleSize * 2 + 64 * 1024, 'fragmented free bytes exceed the whole module allowance');
+  const before = dosErrors(8);
+  expectedFetches.push('gwbasic.wasm');
+  send('gwbasic\r');
+  await releaseProgramFetch('gwbasic.wasm');
+  await until('fragmented heap is refused with DOS error 8', (text) => dosErrors(8) > before && isPanel(text));
+  await checkUsableAfterFailedLoad('Not enough memory');
+  for (const pointer of fragments) if (pointer) wasmExports.free(pointer);
+  console.log(`PASS memory fragmentation: ${freed} aggregate free bytes in 128 KiB holes; DOS error 8 and F3 usable`);
+  await checkSuccessfulRetry();
+  assert.equal(vc.HEAPU8.byteLength, startupHeapBytes, 'the constrained memory never grew');
+  await quitVC();
+  console.log(`web memory limit: ${startupHeapBytes} fixed bytes, exhausted/fragmented refusals, retry and cache passed`);
+}
+
 function fail(error) {
   let log = '';
   try {
@@ -183,7 +491,56 @@ process.on('uncaughtException', fail);
 process.on('unhandledRejection', fail);
 
 try {
+  if (fetchFailure || fetchTimeout) {
+    // Exercise the browser's real fetch/status/arrayBuffer branch entirely
+    // in memory. No listener, HTTP server, or network request is involved.
+    globalThis.fetch = async (url, options) => {
+      const { request, resource, attempt } = await programRequest(url);
+      if (fetchTimeout) {
+        request.signal = options?.signal;
+        // Ignore cancellation deliberately: Promise.race must bound both
+        // fetch() and arrayBuffer(), even with an uncooperative transport.
+        if (attempt === 1 || attempt === 3 || attempt === 4) return new Promise(() => {});
+        return {
+          ok: true,
+          status: 200,
+          async arrayBuffer() {
+            request.bodyReads++;
+            if (attempt === 2) return new Promise((resolveLate) => { request.finishLate = resolveLate; });
+            const bytes = await programBytes(resource);
+            return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+          },
+        };
+      }
+      if (attempt === 1) throw new Error('simulated offline module fetch');
+      return {
+        ok: attempt !== 2 && attempt !== 3,
+        status: attempt === 2 ? 503 : attempt === 3 ? 404 : 200,
+        async arrayBuffer() {
+          request.bodyReads++;
+          // The 503 body is valid wasm if accidentally read, so ignoring
+          // response.ok would start BASIC instead of returning a DOS error.
+          const bytes = attempt === 4 ? new Uint8Array([0, 1, 2, 3]) : await programBytes(resource);
+          return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        },
+      };
+    };
+  }
+  const wasmBinary = await readFile(new URL('./vc.wasm', moduleURL));
   await createVC({
+    wasmBinary,
+    // Match main's declared minimum, but prohibit all growth. The pressure
+    // and fragmentation scenarios then consume real allocations in this cap.
+    ...(memoryLimit ? { wasmMemory: new WebAssembly.Memory({ initial: 768, maximum: 768 }) } : {}),
+    instantiateWasm(imports, receiveInstance) {
+      const compiled = new WebAssembly.Module(wasmBinary);
+      const instance = new WebAssembly.Instance(compiled, imports);
+      wasmExports = instance.exports;
+      return receiveInstance(instance, compiled);
+    },
+    locateFile: (name) => new URL(`${name}?v=${buildHash}`, moduleURL).href,
+    vcFetchProgram: fetchFailure || fetchTimeout ? undefined : fetchProgramBytes,
+    ...(fetchTimeout ? { vcProgramFetchTimeoutMs: 100 } : {}),
     preRun: [(module) => {
       vc = module;
       module.ENV.VC_SCREEN_DUMP = screenPath;
@@ -197,6 +554,7 @@ try {
       return bytes;
     },
     vcOutput() {
+      outputCalls++;
       observe();
     },
     vcExit(code) {
@@ -220,6 +578,10 @@ try {
 
   await until('10Quit and README in the H: listing', (text) =>
     isPanel(text) && text.includes('H:\\'));
+  assertFetches();
+  assert.equal(moduleFetches.length, 0, 'VC reaches its first screen before any program module is fetched');
+  startupHeapBytes = vc.HEAPU8.byteLength;
+  startupHeapTop = wasmExports.sbrk(0);
   assert.equal(vc.FS.cwd(), '/home/vc');
   assert.ok(!screen.includes('.config') && !screen.includes('.cache'),
     'VC keeps its settings and log off the H: demo drive');
@@ -227,6 +589,14 @@ try {
     'GW-BASIC is an actual MZ file on H:');
   assert.ok(!vc.FS.analyzePath('/home/vc/GAMES/NOTHING.TXT').exists);
   console.log('PASS 1: startup shows 10Quit and README on H:');
+
+  if (fetchFailure || fetchTimeout || memoryLimit) {
+    if (fetchFailure) await checkFetchFailures();
+    else if (fetchTimeout) await checkStalledDownloads();
+    else if (memoryLimit) await checkMemoryLimit();
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
 
   stage = '2 F3 viewer';
   await selectFile('README.TXT');
@@ -238,6 +608,22 @@ try {
   console.log(`PASS 2: F3 displays ${JSON.stringify(firstLine)}`);
   send('\x1b');
   await until('the panels after closing F3', isPanel);
+
+  stage = '2b Russian F3 viewer';
+  const russianBytes = vc.FS.readFile('/home/vc/ПРОЧТИ.TXT');
+  const russian = new TextDecoder('ibm866').decode(russianBytes);
+  assert.equal(russian,
+    readFileSync(new URL('../web/README-RU.TXT', import.meta.url), 'utf8').replaceAll('\n', '\r\n'),
+    'the actual MEMFS Russian README is complete CP866, not UTF-8');
+  const russianFirstLine = 'Volkov Commander в вашем браузере.';
+  assert.equal(russian.split('\r\n')[0], russianFirstLine);
+  await selectFile('ПРОЧТИ.TXT');
+  send('\x1bOR');
+  await until('the Russian first line and Cyrillic text in F3', (text) =>
+    text.includes(russianFirstLine) && text.includes('Это не эмулятор.'));
+  console.log('PASS Russian: F3 displays H:\\ПРОЧТИ.TXT correctly from its CP866 bytes');
+  send('\x1b');
+  await until('the panels after the Russian viewer', isPanel);
 
   stage = '3 no shell';
   send('echo hi\r');
@@ -262,7 +648,9 @@ try {
     commandLine(text).trimEnd() === 'H:\\>');
 
   stage = '5 GW-BASIC banner';
+  expectedFetches.push('gwbasic.wasm');
   send('gwbasic\r');
+  await releaseProgramFetch('gwbasic.wasm');
   await until('GW-BASIC banner and Ok from its own code', (text) =>
     text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
   console.log('PASS 5: DOS PATH/EXEC starts H:\\GWBASIC.EXE and shows Ok');
@@ -324,6 +712,7 @@ try {
   await sound('SOUND 440,1', [440], 'sound after child recovery');
   send('SYSTEM\r');
   await until('VC panels after the recovered child exits', isPanel);
+  assertFetches();
   console.log('PASS 11: untranslated CALL stops only GW-BASIC; VC and a second BASIC still work');
 
   stage = '12 bootLogo command';
@@ -331,7 +720,9 @@ try {
   assert.ok(!vc.FS.analyzePath('/home/vc/LOGO.COM').exists, 'the old LOGO.COM alias is not installed');
   assert.ok(!vc.FS.analyzePath('/home/vc/LOGO.TXT').exists, 'the guide is installed under its own name');
   assert.match(vc.FS.readFile('/home/vc/BOOTLOGO.TXT', { encoding: 'utf8' }), /TO FLOWER REPEAT 4 \[PETAL LT 50\] END/);
+  expectedFetches.push('bootlogo.wasm');
   send('bootlogo\r');
+  await releaseProgramFetch('bootlogo.wasm');
   await until('bootLogo prompt in the graphics canvas', () =>
     graphics?.mode === 4 && graphicsText(graphics).split('\n')[21].trimEnd() === '>');
   assert.equal(graphics.width, 320);
@@ -440,6 +831,7 @@ try {
     assert.equal(vc.FS.readFile(keptFile, { encoding: 'utf8' }),
       'survives Ctrl-Break without a page reload', 'H: files survive child cancellation');
   }
+  assertFetches();
   console.log('PASS 17: both Ctrl-Break shortcuts stop a busy bootLogo, with live canvas updates and H: preserved');
 
   stage = '18 GW-BASIC retains its own Ctrl-Break handler';
@@ -465,7 +857,9 @@ try {
   assert.match(vc.FS.readFile('/home/vc/GAMES/ROGUELIC.TXT', { encoding: 'utf8' }),
     /Michael Toy, Ken Arnold and Glenn Wichman/);
   assert.match(vc.FS.readFile('/home/vc/GAMES/PDCLIC.TXT', { encoding: 'utf8' }), /public domain/);
+  expectedFetches.push('rogue.wasm');
   send('rogue\r');
+  await releaseProgramFetch('rogue.wasm');
   await until('Rogue dungeon and Level: 1 Gold: Hp: status', (text) =>
     isRogue(text) && rogueStatus.exec(text)[1] === '1');
   assert.equal(graphics, null, 'PDCurses uses the real DOS text screen');
@@ -536,6 +930,7 @@ try {
   await quitRogue();
   send('cd ..\r');
   await until('H: root panel after Rogue Enter launch', isPanel);
+  assertFetches();
   console.log('PASS 23: Enter on H:\\GAMES\\ROGUE.EXE plays and returns to VC');
 
   stage = '24 F4 VZ edit, save, and quit';
@@ -559,7 +954,9 @@ try {
   }
   await selectFile('README.TXT');
   const originalReadme = vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' });
+  expectedFetches.push('vz.wasm');
   send('\x1bOS');
+  await releaseProgramFetch('vz.wasm');
   await until('VZ showing the original README first line after F4', (text) =>
     !hasPanels(text) && text.includes(firstLine) && text.includes('File'));
   const editorRow = screen.split('\n').findIndex((line) => line.includes(firstLine));
@@ -626,18 +1023,40 @@ try {
     text.includes('Quit from editor? (Y/N)'));
   send('Y');
   await until('VC panels after the second VZ child', isPanel);
+  assertFetches();
+  assert.deepEqual(expectedFetches, programModules, 'all four programs fetched exactly once');
   console.log('PASS 25: typed vz NEW.TXT creates and saves a real H: file');
 
+  stage = '25b cached BASIC after loading every side module';
+  send('gwbasic\r');
+  await until('an early-loaded side runs after loading all later libraries', (text) =>
+    text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+  send('PRINT 6*7\r');
+  await until('the cached BASIC still uses the shared CPU and memory', (text) => /^\s*42\s*$/m.test(text));
+  send('SYSTEM\r');
+  await until('VC panels after the final cached BASIC', isPanel);
+  assertFetches();
+  // emmalloc never trims its arenas here: sbrk(0) is the allocator high-water,
+  // including statics/stack, retained bytes and the guard's temporary probe.
+  const peak = wasmExports.sbrk(0);
+  console.log(`PASS memory: peak ${peak} bytes; INITIAL_MEMORY ${startupHeapBytes} bytes; headroom ${startupHeapBytes - peak} bytes; heap ${startupHeapBytes} -> ${vc.HEAPU8.byteLength}`);
+  assert.equal(vc.HEAPU8.byteLength, startupHeapBytes,
+    'INITIAL_MEMORY must cover loading all four programs without heap growth');
+  // The measured peak depends on load order: emmalloc asks sbrk for a whole
+  // new block when no free block fits. Bound every order: each load's guard
+  // may take a fresh 2N + 64 KiB above the startup heap top.
+  const sideBytes = [...programFiles.values()].reduce((sum, name) =>
+    sum + statSync(join(dirname(modulePath), name)).size, 0);
+  const worst = startupHeapTop + 2 * sideBytes + programFiles.size * 64 * 1024;
+  assert.ok(startupHeapBytes - worst >= Math.max(4 * 1024 * 1024, worst * 0.2),
+    `INITIAL_MEMORY leaves at least 4 MiB and 20% headroom above the any-order bound ${worst}`);
+  console.log(`PASS memory: any-order bound ${worst} bytes; headroom ${startupHeapBytes - worst} bytes`);
+
   stage = '26 quit and exit hook';
-  send('\x1b[21~');
-  await until('the quit confirmation', (text) =>
-    text.includes('Do you want to quit the Volkov Commander?') && text.includes('Yes'));
-  send('\r');
-  await until('the JavaScript exit hook', () => exitCalls > 0);
-  assert.equal(exitCalls, 1, 'the exit hook fires exactly once');
-  assert.equal(exitCode, 0, 'VC exits successfully');
+  await quitVC();
   console.log('PASS 26: F10, Enter quits and fires the exit hook');
-  console.log('web smoke: all 26 checks passed');
+  assertFetches();
+  console.log('web smoke: all 26 checks, Russian F3, and first-use/cached module fetches passed');
   exitAfterOutput(0);
 } catch (error) {
   fail(error);

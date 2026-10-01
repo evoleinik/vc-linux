@@ -1,16 +1,25 @@
-import { Terminal } from "./vendor/xterm.mjs";
+import { Terminal } from "./vendor/xterm.mjs?v=__V__";
 // __V__ is replaced per build, so a cached page never mixes two builds.
 import createVC from "./vc.mjs?v=__V__";
 import { createSpeaker } from "./speaker.js?v=__V__";
 import { createGraphics } from "./graphics.js?v=__V__";
+import { initialInput, reduceInput, bindKeypad } from "./vc-keypad.js?v=__V__";
+import { pageText } from "./vc-language.js?v=__V__";
 
 const container = document.getElementById("terminal");
 const layout = document.querySelector("main");
 const footer = document.querySelector("footer");
 const exitMessage = document.getElementById("exit-message");
+const strings = pageText(navigator.language);
+document.documentElement.lang = strings.language;
+document.getElementById("page-description").textContent = strings.footer;
+document.getElementById("linux-version").textContent = strings.linux;
+document.getElementById("font-credit-label").textContent = strings.fontCredit;
+document.getElementById("keyboard-button").textContent = strings.keyboard;
 const encoder = new TextEncoder();
 const input = [];
-const heldModifiers = new Set();
+let keyState = initialInput();
+let keypad;
 let inputHead = 0;
 let inputOffset = 0;
 let inputBytes = 0;
@@ -19,8 +28,14 @@ let terminal;
 const speaker = createSpeaker();
 let graphics;
 
-function enqueue(data) {
+function enqueue(data, raw = false) {
   if (exited || !data) return;
+  if (!raw) {
+    const result = reduceInput(keyState, { type: "text", data });
+    keyState = result.state;
+    keypad?.setSticky(keyState.sticky);
+    data = result.bytes;
+  }
   const bytes = encoder.encode(data);
   input.push(bytes);
   inputBytes += bytes.length;
@@ -48,57 +63,23 @@ function readInput(maxBytes) {
   return bytes;
 }
 
-const modifierCodes = {
-  ShiftLeft: 57441, ControlLeft: 57442, AltLeft: 57443,
-  ShiftRight: 57447, ControlRight: 57448, AltRight: 57449,
-};
-const controlCodes = { "[": 91, i: 105, m: 109, h: 104 };
-
-function modifiers(event) {
-  return 1 + (event.shiftKey ? 1 : 0) + (event.altKey ? 2 : 0)
-    + (event.ctrlKey ? 4 : 0) + (event.metaKey ? 8 : 0)
-    + (event.getModifierState("CapsLock") ? 64 : 0)
-    + (event.getModifierState("NumLock") ? 128 : 0);
+function dispatchInput(action) {
+  const result = reduceInput(keyState, action);
+  keyState = result.state;
+  keypad?.setSticky(keyState.sticky);
+  enqueue(result.bytes, true);
+  return result;
 }
 
 function handleKey(event) {
   if (exited) return false;
-  if (event.type !== "keydown" && event.type !== "keyup") return true;
-  const modifier = modifierCodes[event.code];
-  if (modifier) {
-    const release = event.type === "keyup";
-    if (release) heldModifiers.delete(modifier);
-    else heldModifiers.add(modifier);
-    enqueue(`\x1b[${modifier};${modifiers(event)}:${release ? 3 : event.repeat ? 2 : 1}u`);
-    event.preventDefault();
-    return false;
-  }
-
-  // The ordinary terminal bytes confuse these Ctrl keys with Esc, Tab,
-  // Enter and Backspace. Kitty reports preserve their actual scan codes.
-  if (event.type === "keydown" && event.ctrlKey && !event.altKey && !event.metaKey) {
-    if (event.code === "Pause" || (event.shiftKey && event.code === "KeyB")) {
-      // Kitty's Pause key (57362), with Ctrl, reaches BIOS INT 1Bh. Using
-      // the same report for both shortcuts keeps it distinct from Ctrl+B.
-      enqueue("\x1b[57362;5u");
-      event.preventDefault();
-      return false;
-    }
-    const code = controlCodes[event.key.toLowerCase()];
-    if (code !== undefined) {
-      enqueue(`\x1b[${code};${modifiers(event)}u`);
-      event.preventDefault();
-      return false;
-    }
-  }
-  if (/^F(?:[1-9]|1[0-2])$/.test(event.key) || event.ctrlKey) event.preventDefault();
-  // xterm still translates F keys, ordinary Ctrl keys and Alt-letter search.
-  return true;
+  const result = dispatchInput({ type: "key", event });
+  if (result.preventDefault) event.preventDefault();
+  return !result.handled;
 }
 
 function releaseModifiers() {
-  for (const code of heldModifiers) enqueue(`\x1b[${code};1:3u`);
-  heldModifiers.clear();
+  dispatchInput({ type: "reset" });
 }
 
 function screenText() {
@@ -145,9 +126,10 @@ function onExit() {
   exited = true;
   input.length = 0;
   inputBytes = inputOffset = inputHead = 0;
-  heldModifiers.clear();
+  keyState = initialInput();
+  keypad?.setSticky(0);
   terminal.options.disableStdin = true;
-  exitMessage.textContent = "VC has quit. Press any key to start it again.";
+  exitMessage.textContent = strings.quit;
   exitMessage.hidden = false;
   document.documentElement.dataset.vcState = "quit";
   fit();
@@ -197,6 +179,20 @@ async function start() {
   terminal.onData(enqueue);
   terminal.attachCustomKeyEventHandler(handleKey);
   terminal.open(container);
+  keypad = bindKeypad(document.getElementById("keypad"), {
+    matchMedia: query => window.matchMedia(query),
+    onKey(key) {
+      if (exited) return window.location.reload();
+      speaker.unlock();
+      dispatchInput({ type: /^(Control|Alt|Shift)$/.test(key) ? "toggle" : "pad", key });
+    },
+    onKeyboard() {
+      if (exited) return window.location.reload();
+      speaker.unlock();
+      terminal?.textarea?.focus({ preventScroll: true });
+    },
+    onHide: () => dispatchInput({ type: "clearSticky" }),
+  });
   const canvas = document.createElement("canvas");
   canvas.id = "graphics";
   canvas.hidden = true;

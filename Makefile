@@ -198,13 +198,40 @@ WEB_WORK := $(WEB_OUT)-work
 WEB_DEMO := $(WEB_WORK)/demo
 # DOS path handling and the translated editor exceed Emscripten's default
 # 64 KiB C stack. Checked builds exercise the same smoke test with 1 MiB.
-WEB_FLAGS := $(WEB_OPT) -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 \
-             -sSTACK_SIZE=1048576 \
+# PIC expands inlined translation helpers. Keeping them out of line makes
+# -O2 smaller than -Os/-Oz here without editing the generated C. Side modules
+# retain their ordinary -O2 build. Measurements are in the mobile plan.
+# All-four-program smoke measured 20,185,088 bytes before the allocation guard.
+# 48 MiB covers the guard's 2N + 64 KiB for every module in any load order,
+# with headroom. test-web prints that bound and fails if memory would grow.
+WEB_FLAGS := $(WEB_OPT) -fno-inline-functions -sMALLOC=emmalloc -sMAIN_MODULE=2 -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 \
+             -sSTACK_SIZE=1048576 -sINITIAL_MEMORY=50331648 -sALLOW_MEMORY_GROWTH=1 -sABORTING_MALLOC=0 \
              -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,node -sFORCE_FILESYSTEM \
-             -sEXPORTED_RUNTIME_METHODS='["FS","ENV"]'
-WEB_DEMO_INPUT := web/README.TXT web/BOOTLOGO.TXT web/GAMES/SPIRAL.BAS README.md asm/VC.ASM asm/VCOVL.ASM asm/LICENSE.TXT tools/web_demo.py tools/vz_defaults.py $(BASIC_GAME_FILES) $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/rogue/OWLIC.TXT third_party/rogue/LICENSE.TXT third_party/pdcurses/README.md $(B)/vz/VZ.COM $(VZ_DATA) third_party/gwbasic/LICENSE third_party/bootlogo/LICENSE
-WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT HISTORY.TXT SRC/VC.ASM SRC/VCOVL.ASM SRC/LICENSE.TXT GWBASIC.EXE GWBASIC.TXT BOOTLOGO.COM BOOTLOGO.TXT LOGOLIC.TXT GAMES/SPIRAL.BAS GAMES/ROGUE.EXE GAMES/ROGUELIC.TXT GAMES/PDCLIC.TXT GAMES/OWLIC.TXT VZ.COM VZ.DEF $(VZ_DEF_NAMES) VZLIC.TXT) $(patsubst $(B)/games/%,$(WEB_DEMO)/GAMES/%,$(BASIC_GAME_FILES))
-WEB_ASSETS := web/index.html web/vc-web.js web/speaker.js web/graphics.js $(wildcard web/vendor/*)
+             -sEXPORTED_RUNTIME_METHODS='["FS","ENV"]' \
+             -sEXPORTED_FUNCTIONS='["_main","_cpu","_mem","_cpu_int","_flags_get","_flags_set","_port_in8","_port_out8","_rt_budget","_rt_code_delta","_rt_fault","_rt_halted","_sbrk"]'
+# Retain only the host ABI the unedited side modules import. MAIN_MODULE=1
+# would keep all of libc; linking side files into the main link would make
+# them eager dylink dependencies. tests/web_modules.mjs guards both choices.
+WEB_MAIN_SRC := $(RT_SRC) runtime/web_programs.c $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/files.c
+WEB_PROGRAMS := gwbasic bootlogo rogue vz
+# Unversioned side binaries are build inputs only, never published. Their
+# content-derived generation hash is independent of the page's ?v= hash:
+# putting the latter into main's strings would create a circular hash.
+WEB_MODULES := $(addprefix $(WEB_WORK)/,$(addsuffix .wasm,$(WEB_PROGRAMS)))
+WEB_MODULE_HEADER := $(WEB_WORK)/web_program_names.h
+WEB_BINARIES := $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm $(WEB_MODULES)
+WEB_SIDE_FLAGS := $(WEB_OPT) -sSIDE_MODULE=2 -std=gnu11 -Iruntime
+WEB_DEMO_INPUT := web/README.TXT web/README-RU.TXT web/BOOTLOGO.TXT web/GAMES/SPIRAL.BAS README.md asm/VC.ASM asm/VCOVL.ASM asm/LICENSE.TXT tools/web_demo.py tools/vz_defaults.py $(BASIC_GAME_FILES) $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/rogue/OWLIC.TXT third_party/rogue/LICENSE.TXT third_party/pdcurses/README.md $(B)/vz/VZ.COM $(VZ_DATA) third_party/gwbasic/LICENSE third_party/bootlogo/LICENSE
+WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT ПРОЧТИ.TXT HISTORY.TXT SRC/VC.ASM SRC/VCOVL.ASM SRC/LICENSE.TXT GWBASIC.EXE GWBASIC.TXT BOOTLOGO.COM BOOTLOGO.TXT LOGOLIC.TXT GAMES/SPIRAL.BAS GAMES/ROGUE.EXE GAMES/ROGUELIC.TXT GAMES/PDCLIC.TXT GAMES/OWLIC.TXT VZ.COM VZ.DEF $(VZ_DEF_NAMES) VZLIC.TXT) $(patsubst $(B)/games/%,$(WEB_DEMO)/GAMES/%,$(BASIC_GAME_FILES))
+# main.c already installs these exact files from gen/files.c. Do not embed
+# a second copy in MEMFS's startup package. Keep the complete demo directory
+# for the packaging/content gates, including the byte-matched executables.
+WEB_INSTALLED := GWBASIC.EXE BOOTLOGO.COM GAMES/ROGUE.EXE GAMES/ROGUELIC.TXT GAMES/PDCLIC.TXT GAMES/OWLIC.TXT VZ.COM VZ.DEF $(VZ_DEF_NAMES) VZLIC.TXT
+WEB_PACKED_FILES := $(filter-out $(addprefix $(WEB_DEMO)/,$(WEB_INSTALLED)),$(WEB_DEMO_FILES))
+# Emscripten 4.0.2's file_packager emits invalid assembler symbols for a
+# Cyrillic destination. Use an ASCII staging name, renamed before DOS starts.
+WEB_EMBED_FLAGS := $(foreach f,$(WEB_PACKED_FILES),--embed-file $(f)@/home/vc/$(subst ПРОЧТИ.TXT,READMERU.TXT,$(patsubst $(WEB_DEMO)/%,%,$(f))))
+WEB_ASSETS := web/index.html web/vc-web.js web/vc-keypad.js web/vc-language.js web/speaker.js web/graphics.js $(wildcard web/vendor/*)
 WEB_COPIES := $(patsubst web/%,$(WEB_OUT)/%,$(WEB_ASSETS))
 
 # Grouped targets keep both the demo preparation and the single emcc link safe
@@ -212,29 +239,58 @@ WEB_COPIES := $(patsubst web/%,$(WEB_OUT)/%,$(WEB_ASSETS))
 $(WEB_DEMO_FILES) &: $(WEB_DEMO_INPUT)
 	$(PY) tools/web_demo.py $(WEB_DEMO) $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/vz/VZ.COM
 
-$(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm &: $(RT_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(GEN_SRC) $(WEB_DEMO_FILES) Makefile
+$(WEB_MODULE_HEADER): $(WEB_MODULES) tools/web_modules.py
+	$(PY) tools/web_modules.py $(WEB_WORK) $(WEB_OUT)
+
+$(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm &: $(WEB_MAIN_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(WEB_DEMO_FILES) $(WEB_MODULE_HEADER) Makefile
 	@mkdir -p $(WEB_OUT)
 	$(EMCC) $(WEB_FLAGS) \
-	  -std=gnu11 -Iruntime $(RT_SRC) $(GEN_SRC) --embed-file $(WEB_DEMO)@/home/vc -o $(WEB_OUT)/vc.mjs
+	  -std=gnu11 -Iruntime -I$(WEB_WORK) $(WEB_MAIN_SRC) $(WEB_EMBED_FLAGS) -o $(WEB_OUT)/vc.mjs
+
+# Translated code never suspends. BASIC's source-proved graphics supplement
+# travels with its image; VC.COM and VC.OVL stay in the main wasm above.
+$(WEB_WORK)/gwbasic.wasm: $(B)/gen/gwbasic.c $(B)/gen/gwbasic_graphics.c runtime/cpu.h runtime/image.h Makefile
+	@mkdir -p $(WEB_WORK)
+	$(EMCC) $(WEB_SIDE_FLAGS) $(B)/gen/gwbasic.c $(B)/gen/gwbasic_graphics.c -sEXPORTED_FUNCTIONS='["_image_gwbasic","_run_gwbasic_graphics"]' -o $@
+
+$(WEB_WORK)/bootlogo.wasm: $(B)/gen/bootlogo.c runtime/cpu.h runtime/image.h Makefile
+	@mkdir -p $(WEB_WORK)
+	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_bootlogo"]' -o $@
+
+$(WEB_WORK)/rogue.wasm: $(B)/gen/rogue.c runtime/cpu.h runtime/image.h Makefile
+	@mkdir -p $(WEB_WORK)
+	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_rogue"]' -o $@
+
+$(WEB_WORK)/vz.wasm: $(B)/gen/vz.c runtime/cpu.h runtime/image.h Makefile
+	@mkdir -p $(WEB_WORK)
+	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_vz"]' -o $@
 
 $(WEB_OUT)/%: web/%
 	@mkdir -p $(dir $@)
 	cp $< $@
 
-# The page and its loader name every file with this build's hash, so a browser holding cached files
-# from an older build never mixes the two. GitHub Pages caches each file for 10 minutes.
+# Startup assets keep today's ?v= stamp. Lazy modules instead carry their
+# side-generation hash in the filename, which Pages cannot ignore on deploy.
 WEB_VERSIONED := $(WEB_OUT)/index.html $(WEB_OUT)/vc-web.js
-$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm web/index.html web/vc-web.js web/speaker.js web/graphics.js
+$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_BINARIES) $(WEB_ASSETS)
 	@mkdir -p $(dir $@)
-	v=$$(cat $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm web/index.html web/vc-web.js web/speaker.js web/graphics.js | sha256sum | cut -c1-12); \
+	v=$$(cat $(WEB_BINARIES) $(WEB_ASSETS) | sha256sum | cut -c1-12); \
 	  sed "s/__V__/$$v/g" $< > $@
 
-web: $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm $(WEB_COPIES)
+web: $(WEB_BINARIES) $(WEB_COPIES)
+	@$(PY) tools/web_modules.py $(WEB_WORK) $(WEB_OUT)
 
 test-web: web
 	$(NODE) tests/web_assets.mjs $(WEB_OUT)
+	$(NODE) tests/web_size.mjs $(WEB_OUT)
+	$(NODE) tests/web_modules.mjs $(WEB_OUT)
+	$(NODE) tests/test_web_keypad.mjs $(WEB_OUT)
+	$(NODE) tests/web_language.mjs $(WEB_DEMO)
 	$(NODE) tests/test_web_speaker.mjs
 	$(NODE) tests/test_web_graphics.mjs
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --fetch-failure
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --fetch-timeout
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --memory-limit
 
 .PHONY: web test-web

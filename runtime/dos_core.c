@@ -21,6 +21,10 @@
 #include "hle.h"
 #include "rt.h"
 
+#ifdef __EMSCRIPTEN__
+#include "web_programs.h"
+#endif
+
 #define DOS_SEG     0x0070u   /* DOS data */
 #define INDOS_OFF   0x0011u
 #define LOL_OFF     0x0026u   /* List of Lists; first MCB word just below */
@@ -345,15 +349,25 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
 /* Non-built-in EXECs select a translation by the complete original file,
  * including its MZ header and relocation table: comparing only the load module
  * would accept a damaged header. VC.COM and VC.OVL bypass this disk check. */
+#ifdef __EMSCRIPTEN__
+#define IMAGE_COUNT WEB_IMAGE_COUNT
+#else
 static const Image *const images[] = {
     &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue, &image_vz
 };
+#define IMAGE_COUNT (sizeof images / sizeof images[0])
+#endif
 
-static const EmbeddedFile *image_file(const Image *img) {
+static const EmbeddedFile *image_file(size_t index) {
     /* Installation names locate trusted reference bytes, not the program
      * being EXECed. bootLogo's translation keeps its original NASM label;
      * the candidate on disk is still matched only by its complete bytes. */
+#ifdef __EMSCRIPTEN__
+    const char *name = web_image_filename(index);
+#else
+    const Image *img = images[index];
     const char *name = img == &image_bootlogo ? "BOOTLOGO.COM" : img->name;
+#endif
     for (int i = 0; i < embedded_file_count; i++)
         if (!strcmp(embedded_files[i].name, name)) return &embedded_files[i];
     return NULL;
@@ -375,8 +389,8 @@ static int known_image(const char *host, const Image **out) {
     FILE *file = fdopen(fd, "rb");
     if (!file) { int err = file_error(); close(fd); return err; }
     int possible = 0;
-    for (size_t i = 0; i < sizeof images / sizeof images[0]; i++) {
-        const EmbeddedFile *f = image_file(images[i]);
+    for (size_t i = 0; i < IMAGE_COUNT; i++) {
+        const EmbeddedFile *f = image_file(i);
         if (f && st.st_size == f->size) possible = 1;
     }
     if (!possible) {
@@ -390,19 +404,35 @@ static int known_image(const char *host, const Image **out) {
     size_t got = fread(bytes, 1, size, file);
     int extra = fgetc(file);
     int err = ferror(file) ? 5 : 11;
+    size_t matched = IMAGE_COUNT;
     if (!ferror(file) && got == size && extra == EOF)
-        for (size_t i = 0; i < sizeof images / sizeof images[0]; i++) {
-            const EmbeddedFile *f = image_file(images[i]);
+        for (size_t i = 0; i < IMAGE_COUNT; i++) {
+            const EmbeddedFile *f = image_file(i);
             if (f && size == f->size && !memcmp(bytes, f->data, size)) {
-                *out = images[i];
+                matched = i;
                 err = 0;
                 break;
             }
         }
     free(bytes);
     fclose(file);
+    if (matched != IMAGE_COUNT) {
+#ifdef __EMSCRIPTEN__
+        err = web_load_image(matched, out);
+#else
+        *out = images[matched];
+#endif
+    }
     if (err == 11) rt_log("unsupported executable %s: no matching translation", host);
     return err;
+}
+
+static int is_vz_image(const Image *img) {
+#ifdef __EMSCRIPTEN__
+    return web_image_is_vz(img);
+#else
+    return img == &image_vz;
+#endif
 }
 
 static int start_child(const Image *img, const char *dos_prog, const uint8_t *tail, uint16_t envseg);
@@ -754,6 +784,11 @@ static int dos_program_command(const uint8_t *cmd, size_t len) {
     if (!found) return association ? command_error(2) : -1;
     const Image *img;
     int err = known_image(host, &img);
+#ifdef __EMSCRIPTEN__
+    /* A recognized DOS file whose download failed must not fall through to
+     * the no-shell message. EXEC reports its ordinary DOS access error. */
+    if (err && err != 11) return command_error(err);
+#endif
     if (err) return association ? command_error(err) : -1;
     if (association) {
         /* A shipped association names its interpreter, not any translation.
@@ -804,7 +839,7 @@ static int edit_in_vz(const char *original_host) {
     if (found <= 0) return command_error(found < 0 ? -found : 2);
     const Image *img;
     err = known_image(host, &img);
-    if (err || img != &image_vz) return command_error(err ? err : 11);
+    if (err || !is_vz_image(img)) return command_error(err ? err : 11);
     /* Generated 8.3 names normally follow the current directory contents.
      * Hold this spelling to the selected file until the editor exits, so a
      * neighbor's creation/deletion cannot redirect a later save. */
@@ -1066,7 +1101,7 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     char short_program[128];
     uint8_t short_tail[128] = {0};
     DosPathLease *executable = NULL, *directory = NULL;
-    if (img == &image_vz) {
+    if (is_vz_image(img)) {
         /* VZ derives its DEF name from this environment path with the same
          * 8.3 parser it uses for documents. Host config directories can
          * contain spaces, commas and '+', even when the COM name is short. */
@@ -1098,7 +1133,7 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     uint16_t parent_psp = cur_psp;
     static char envbuf[32768];
     size_t elen = env_strings(envseg ? envseg : rd16(cur_psp, 0x2C), envbuf, sizeof envbuf);
-    int err = img == &image_vz ? vz_environment(envbuf, &elen, sizeof envbuf, p) : 0;
+    int err = is_vz_image(img) ? vz_environment(envbuf, &elen, sizeof envbuf, p) : 0;
     if (!err) err = load_image(img, envbuf, elen, tail, dos_prog, parent_psp, ret_cs, ret_ip);
     if (err) {
         dos_fs_release_path(directory);
