@@ -74,6 +74,17 @@ let wasmExports;
 let exitCode;
 let exitCalls = 0;
 let stage = '1 startup';
+let sourcePanel;
+let sourceButton;
+let sourceElement;
+let sourceSnapshot;
+let sourceResolved;
+let sourceDraws = 0;
+let sourcePageKey;
+let sourceKeyReducer;
+let sourceInitialInput;
+const sourceFetches = [];
+const originalSources = new Map();
 const programModules = ['gwbasic.wasm', 'bootlogo.wasm', 'rogue.wasm', 'vz.wasm'];
 const programFiles = new Map(readdirSync(dirname(modulePath)).flatMap((name) => {
   const match = name.match(/^(gwbasic|bootlogo|rogue|vz)\.([0-9a-f]{12})\.wasm$/);
@@ -155,6 +166,253 @@ function until(description, predicate) {
     observers.add(check);
     observe();
   });
+}
+
+// Only DOM storage and events are doubled. The published Source controller,
+// mapper, fetch path and renderer run unchanged against the real guest CPU.
+function sourceNode(document, tagName) {
+  const listeners = new Map();
+  const attributes = new Map();
+  const classes = new Set();
+  let ownText = '';
+  return {
+    ownerDocument: document, tagName, children: [], hidden: false, dataset: {},
+    className: '',
+    classList: {
+      add: (...names) => names.forEach((name) => classes.add(name)),
+      remove: (...names) => names.forEach((name) => classes.delete(name)),
+      contains: (name) => classes.has(name),
+      toggle(name, force = !classes.has(name)) {
+        if (force) classes.add(name);
+        else classes.delete(name);
+        return force;
+      },
+    },
+    append(...nodes) { this.children.push(...nodes); },
+    appendChild(node) { this.append(node); return node; },
+    replaceChildren(...nodes) { ownText = ''; this.children = [...nodes]; },
+    get textContent() {
+      return ownText + this.children.map((node) => typeof node === 'string' ? node : node.textContent).join('');
+    },
+    set textContent(value) { ownText = String(value); this.children = []; },
+    get innerHTML() { throw new Error('Source must never use innerHTML'); },
+    set innerHTML(_value) { throw new Error('Original source must be rendered as plain text, never HTML'); },
+    setAttribute(name, value) { attributes.set(name, String(value)); },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    removeAttribute(name) { attributes.delete(name); },
+    addEventListener(name, callback) {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name).add(callback);
+    },
+    removeEventListener(name, callback) { listeners.get(name)?.delete(callback); },
+    dispatch(name, event = {}) {
+      for (const callback of listeners.get(name) || [])
+        callback({ type: name, target: this, preventDefault() {}, ...event });
+    },
+  };
+}
+
+function takeSourceSnapshot() {
+  sourceSnapshot = undefined;
+  vc._vc_source_snapshot();
+  assert.equal(sourceSnapshot?.version, 1, 'the real wasm publishes a read-only guest snapshot');
+  return sourceSnapshot;
+}
+
+function resolveSourceAddress(cs, ip, preceding = false) {
+  sourceResolved = undefined;
+  vc._vc_source_resolve(cs, ip, Number(preceding));
+  assert.notEqual(sourceResolved, undefined, 'the wasm address resolver answers synchronously');
+  return sourceResolved;
+}
+
+async function installSourcePanel() {
+  const sourceScript = readFileSync(join(dirname(modulePath), 'vc-source.js'), 'utf8');
+  const { createSourcePanel } = await import(`data:text/javascript,${encodeURIComponent(sourceScript)}`);
+  const indexName = loader.match(/source-index\.[0-9a-f]{12}\.json(?:\?v=[0-9a-f]+)?/)?.[0];
+  assert.ok(indexName, 'the published loader names an immutable source index');
+  const indexURL = new URL(indexName, moduleURL);
+  const document = { createElement: (tagName) => sourceNode(document, tagName) };
+  sourceButton = document.createElement('button');
+  sourceElement = document.createElement('aside');
+  sourceElement.hidden = true;
+  sourcePanel = createSourcePanel({
+    button: sourceButton, panel: sourceElement,
+    getSnapshot: takeSourceSnapshot, resolveAddress: resolveSourceAddress, indexURL,
+    async fetchFile(url) {
+      const resource = new URL(url, indexURL);
+      assert.equal(resource.protocol, 'file:', 'Source smoke reads only local published files');
+      assert.equal(dirname(fileURLToPath(resource)), dirname(modulePath), 'source requests stay in the web build');
+      assert.match(basename(resource.pathname), /\.[0-9a-f]{12}\.(?:json|txt)$/,
+        'source maps and text have immutable build-hash names');
+      const bytes = await readFile(resource);
+      sourceFetches.push({ url: resource.href, bytes: bytes.length });
+      return new Response(bytes, { status: 200 });
+    },
+    onChange() { sourceDraws++; observe(); },
+  });
+  const keypadScript = readFileSync(join(dirname(modulePath), 'vc-keypad.js'), 'utf8');
+  const { initialInput, reduceInput } = await import(`data:text/javascript,${encodeURIComponent(keypadScript)}`);
+  sourceInitialInput = initialInput;
+  sourceKeyReducer = reduceInput;
+  // Execute the published capture handler itself, including its keyup/repeat
+  // latch. Only its DOM listener registration and lazy import are outside
+  // this Node harness; the already-created production panel is the target.
+  const captureCode = loader.match(/let sourceShortcutHeld = false;[\s\S]*?(?=\nwindow\.addEventListener\("keydown", sourceKey)/)?.[0];
+  assert.ok(captureCode, 'the page captures the Source shortcut before xterm');
+  sourcePageKey = new Function('toggleSource', 'exited', `${captureCode}\nreturn sourceKey;`)(
+    () => sourcePanel.toggle(), false);
+}
+
+function originalSource(path) {
+  assert.match(path, /^(?:asm|third_party)\//, 'source provenance names a vendored original');
+  if (!originalSources.has(path)) {
+    const bytes = readFileSync(new URL(`../${path}`, import.meta.url));
+    let decoded;
+    try { decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+    catch {
+      const encoding = path.startsWith('third_party/vzeditor/') ? 'shift_jis' : 'ibm866';
+      const decoder = new TextDecoder(encoding, { fatal: true });
+      // ICU swaps a few legacy control characters (notably DOS EOF 1Ah).
+      // Preserve those bytes before decoding possibly multibyte comments.
+      decoded = bytes.toString('latin1').split(/([\x00-\x1f\x7f])/).map((part) =>
+        part.length === 1 && (part.charCodeAt(0) < 32 || part.charCodeAt(0) === 127)
+          ? part : decoder.decode(Buffer.from(part, 'latin1'))).join('');
+    }
+    originalSources.set(path, decoded.split('\n').map((line) => line.replace(/\r$/, '')));
+  }
+  return originalSources.get(path);
+}
+
+function assertSourceLine(line) {
+  assert.ok(line && typeof line.path === 'string', 'an assembly row identifies its original source file');
+  assert.ok(Number.isInteger(line.line) && line.line > 0, 'source line numbers are one-based integers');
+  assert.equal(line.file, basename(line.path), 'the displayed filename is the actual source filename');
+  assert.equal(line.text, originalSource(line.path)[line.line - 1], `${line.path}:${line.line} matches the original, including comments`);
+  let expanded = '';
+  for (const character of line.text)
+    expanded += character === '\t' ? ' '.repeat(8 - expanded.length % 8) : character;
+  const descendants = node => [node, ...node.children.flatMap(descendants)];
+  const rows = descendants(sourceElement).filter(node =>
+    /^source-(?:line|current)$/.test(node.className)
+    && node.textContent === `${line.file}:${line.line}  ${expanded}`);
+  assert.ok(rows.length, 'a visible row contains only its file:line and literal source with eight-column tabs');
+  if (line.via?.length) {
+    const chain = [...line.via.map(origin => `${origin.name}:${origin.line}`), `${line.file}:${line.line}`].join(' → ');
+    assert.ok(rows.some(row => row.getAttribute('title') === chain), 'the matching source row keeps its include chain in its title');
+  }
+  for (const [index, origin] of (line.via || []).entries()) {
+    assert.equal(origin.name, basename(origin.path), 'include provenance names the actual parent source');
+    const directive = originalSource(origin.path)[origin.line - 1];
+    assert.match(directive, /\bINCLUDE\b/i, 'include provenance points to the original INCLUDE directive');
+    assert.ok(directive.toUpperCase().includes((line.via[index + 1]?.name || line.file).toUpperCase()),
+      'the original parent directive includes this child source file');
+  }
+}
+
+function assertVCSource(view) {
+  assert.ok(['VC.COM', 'VC.OVL'].includes(view.current.image), 'Now belongs to the running VC image');
+  assertSourceLine(view.current);
+  for (const line of [view.current, ...view.callers]) {
+    const roots = [line.file, ...(line.via || []).map((via) => via.name)];
+    assert.ok(roots.some((name) => name === 'VC.ASM' || name === 'VCOVL.ASM'),
+      'each VC row truthfully names VC.ASM/VCOVL.ASM, including include-file provenance');
+  }
+  assert.ok(view.callers.length > 0 && view.callers.length <= 8, 'Called from shows one to eight real CALL sites');
+  for (const caller of view.callers) {
+    assert.ok(['VC.COM', 'VC.OVL'].includes(caller.image), 'a VC caller belongs to VC');
+    assertSourceLine(caller);
+  }
+  assert.ok(view.now.length >= 9 && view.now.length <= 17, 'Now includes about eight source lines either side');
+  for (const line of view.now) assertSourceLine(line);
+  assert.ok(view.recent.length > 0 && view.recent.length <= 32, 'Just ran is bounded to 32 entered source lines');
+  assert.equal(new Set(view.recent.map((line) => `${line.path}:${line.line}`)).size, view.recent.length,
+    'Just ran contains distinct source lines');
+  for (const line of view.recent) assertSourceLine(line);
+  for (const heading of ['Now', 'Called from', 'Just ran'])
+    assert.ok(sourceElement.textContent.includes(heading), `the panel renders ${heading}`);
+  const nodes = (node) => [node, ...node.children.flatMap((child) => typeof child === 'string' ? [] : nodes(child))];
+  const highlighted = nodes(sourceElement).filter((node) => node.className === 'source-current');
+  assert.equal(highlighted.length, 1, 'exactly the current source line is highlighted');
+  assert.ok(highlighted[0].textContent.includes(`${view.current.file}:${view.current.line}`));
+}
+
+async function openSource(image) {
+  const images = Array.isArray(image) ? image : [image];
+  sourceButton.dispatch('click');
+  await until(`Source panel maps ${images.join(' or ')}`, () => sourcePanel.opened
+    && images.includes(sourcePanel.view?.current?.image));
+  assert.equal(sourceElement.hidden, false, 'the Source button reveals the real panel');
+  return sourcePanel.view;
+}
+
+function sourceShortcut() {
+  let prevented = 0;
+  const consumed = sourcePanel.handleKey({
+    type: 'keydown', key: 'F12', code: 'F12', ctrlKey: true, altKey: false,
+    shiftKey: true, metaKey: false, repeat: false,
+    preventDefault() { prevented++; }, stopPropagation() {}, stopImmediatePropagation() {},
+  });
+  assert.equal(consumed, true, 'Ctrl-Shift-F12 is consumed by the Source panel');
+  assert.ok(prevented > 0, 'the Source shortcut prevents the browser default');
+}
+
+async function closeSourceWithShortcut() {
+  const before = screen;
+  const reads = inputReads;
+  const bytes = pending.slice();
+  sourceShortcut();
+  assert.equal(sourcePanel.opened, false, 'the same shortcut closes Source');
+  assert.equal(sourceElement.hidden, true);
+  assert.deepEqual(pending, bytes, 'toggling Source queues no DOS key');
+  await until('the guest polls normally after Source closes', () => inputReads > reads);
+  assert.equal(screen, before, 'closing Source preserves every VC screen row and its key bar');
+}
+
+async function checkSourceModifierRelease() {
+  let state = sourceInitialInput();
+  const pageKey = (type, key, flags, repeat = false) => {
+    let captured = false;
+    const event = {
+      type, key, code: key === 'Control' ? 'ControlLeft' : key === 'Shift' ? 'ShiftLeft' : key,
+      ctrlKey: !!(flags & 4), shiftKey: !!(flags & 1), altKey: false, metaKey: false, repeat,
+      preventDefault() {}, stopImmediatePropagation() { captured = true; },
+    };
+    sourcePageKey(event);
+    if (key === 'F12') assert.equal(captured, true, 'the real page capture keeps every Source F12 event out of DOS');
+    if (!captured) {
+      const result = sourceKeyReducer(state, { type: 'key', event });
+      state = result.state;
+      assert.equal(result.handled, true, 'modifier events use the real shared keyboard reducer');
+      send(result.bytes);
+    }
+  };
+  for (const releaseFirst of ['Control', 'Shift']) {
+    const before = screen;
+    pageKey('keydown', 'Control', 4);
+    await until('the real Ctrl press changes VC\'s key bar', (text) =>
+      text.split('\n')[24] !== before.split('\n')[24]);
+    const reads = inputReads;
+    pageKey('keydown', 'Shift', 5);
+    await until('the real combined modifier report reaches VC', () => pending.length === 0 && inputReads > reads + 1);
+    const modified = screen;
+    const wasOpen = sourcePanel.opened;
+    pageKey('keydown', 'F12', 5);
+    await until(`the page Ctrl-Shift-F12 handler ${wasOpen ? 'closes' : 'opens'} Source`, () =>
+      sourcePanel.opened !== wasOpen && (wasOpen || sourcePanel.view?.status === 'ready'));
+    assert.equal(screen, modified, 'toggling with physical modifiers leaves the guest screen untouched');
+    pageKey('keydown', 'F12', 5, true);
+    assert.equal(sourcePanel.opened, !wasOpen, 'holding the shortcut does not toggle repeatedly');
+    pageKey('keyup', 'F12', 5);
+    const releaseReads = inputReads;
+    pageKey('keyup', releaseFirst, releaseFirst === 'Control' ? 1 : 4);
+    await until(`VC processes the ${releaseFirst} release before the other modifier`, () =>
+      pending.length === 0 && inputReads > releaseReads + 1);
+    pageKey('keyup', releaseFirst === 'Control' ? 'Shift' : 'Control', 0);
+    await until(`VC's exact screen/key bar after releasing ${releaseFirst} first`, (text) => text === before);
+    assert.deepEqual(state, sourceInitialInput(), 'neither modifier remains held after the Source shortcut');
+  }
+  assert.equal(sourcePanel.opened, false, 'two physical shortcuts opened and closed Source');
 }
 
 function assertFetches() {
@@ -482,6 +740,13 @@ function fail(error) {
   } catch { /* A startup failure may precede the screen/log. */ }
   console.error(`FAIL [${stage}]: ${error?.stack || error}\n${screen}\n--- VC log ---\n${log}`);
   console.error(`Speaker events in current stage: ${JSON.stringify(speakerEvents)}`);
+  if (sourcePanel) {
+    const view = sourcePanel.view;
+    console.error(`Source view: ${JSON.stringify(view && {
+      status: view.status, message: view.message, current: view.current,
+      callers: view.callers, recentLines: view.recent?.length,
+    })}`);
+  }
   exitAfterOutput(1);
 }
 
@@ -526,6 +791,7 @@ try {
       };
     };
   }
+  if (!fetchFailure && !fetchTimeout && !memoryLimit) await installSourcePanel();
   const wasmBinary = await readFile(new URL('./vc.wasm', moduleURL));
   await createVC({
     wasmBinary,
@@ -572,6 +838,8 @@ try {
       else textTransitions++;
       observe();
     },
+    vcSourceSnapshot(snapshot) { sourceSnapshot = snapshot; },
+    vcSourceResolved(location) { sourceResolved = location; },
     print: (text) => console.log(`[VC stdout] ${text}`),
     printErr: (text) => console.error(`[VC stderr] ${text}`),
   });
@@ -580,6 +848,7 @@ try {
     isPanel(text) && text.includes('H:\\'));
   assertFetches();
   assert.equal(moduleFetches.length, 0, 'VC reaches its first screen before any program module is fetched');
+  assert.equal(sourceFetches.length, 0, 'no source index, maps or source text load before the first VC screen');
   startupHeapBytes = vc.HEAPU8.byteLength;
   startupHeapTop = wasmExports.sbrk(0);
   assert.equal(vc.FS.cwd(), '/home/vc');
@@ -597,6 +866,45 @@ try {
     exitAfterOutput(0);
     await new Promise(() => {});
   }
+
+  stage = 'Source VC, F9 and unchanged screen';
+  const beforeSource = screen;
+  let sourceView = await openSource(['VC.COM', 'VC.OVL']);
+  assertVCSource(sourceView);
+  assert.equal(screen, beforeSource, 'opening Source does not change VC or its key bar');
+  assert.ok(sourceFetches.length > 1, 'opening Source fetches its maps and original source text lazily');
+  const openedSources = sourceFetches.filter(({ url }) => new URL(url).pathname.endsWith('.txt'));
+  console.log(`PASS Source first open: ${openedSources.length} original text files, ${openedSources.reduce((sum, item) => sum + item.bytes, 0)} bytes; ${sourceFetches.reduce((sum, item) => sum + item.bytes, 0)} bytes including maps/index`);
+  sourceButton.dispatch('click');
+  assert.equal(sourcePanel.opened, false, 'the same Source button closes the panel');
+  assert.equal(sourceElement.hidden, true);
+  assert.equal(screen, beforeSource);
+  sourceShortcut();
+  await until('Ctrl-Shift-F12 reopens Source from the cached maps', () =>
+    sourcePanel.opened && sourcePanel.view?.status === 'ready');
+  assertVCSource(sourcePanel.view);
+  assert.equal(screen, beforeSource);
+  const drawsBeforeF9 = sourceDraws;
+  send('\x1b[20~');
+  await until('F9 shows the real VC menu bar', (text) =>
+    /Left\s+Files\s+Commands\s+Options\s+Right/.test(text.split('\n')[0]));
+  // Do not invoke refresh here: the production panel must notice this key
+  // and sample the caller chain after the menu itself has taken over input.
+  await until('Source refresh after F9 identifies the original menu caller', () =>
+    sourceDraws > drawsBeforeF9 && sourcePanel.view?.callers?.some((line) => line.path === 'asm/VCMENU.INC'));
+  sourceView = sourcePanel.view;
+  assertVCSource(sourceView);
+  assert.ok(sourceView.callers.some((line) => /\bCALL\s+Input\b/i.test(line.text)),
+    'Called from shows the original CALL that entered the F9 menu keyboard loop');
+  await closeSourceWithShortcut();
+  send('\x1b');
+  await until('VC panels after closing the F9 menu', isPanel);
+  assert.equal(screen, beforeSource, 'Escape still closes F9 and restores the exact pre-Source VC screen');
+  console.log('PASS Source VC: lazy open, exact Now/Called from text, F9 auto-refresh, distinct history, unchanged screen and Escape');
+
+  stage = 'Source physical modifiers';
+  await checkSourceModifierRelease();
+  console.log('PASS Source shortcut: actual page handler, physical Ctrl/Shift, both release orders, repeat suppression and unchanged VC keys');
 
   stage = '2 F3 viewer';
   await selectFile('README.TXT');
@@ -654,6 +962,13 @@ try {
   await until('GW-BASIC banner and Ok from its own code', (text) =>
     text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
   console.log('PASS 5: DOS PATH/EXEC starts H:\\GWBASIC.EXE and shows Ok');
+
+  stage = 'Source GW-BASIC and unchanged input';
+  sourceView = await openSource('GWBASIC.EXE');
+  assertSourceLine(sourceView.current);
+  assert.match(sourceView.current.path, /^third_party\/gwbasic\//, 'BASIC maps to its own vendored assembly');
+  await closeSourceWithShortcut();
+  console.log('PASS Source BASIC: the real child maps to its assembly and closing preserves its screen/input');
 
   stage = '6 BASIC arithmetic';
   send('PRINT 2+2\r');
@@ -730,6 +1045,13 @@ try {
   assert.equal(graphics.pixels.length, 64000);
   assert.deepEqual([...graphics.palette], [0, 0, 0, 85, 255, 255, 255, 85, 255, 255, 255, 255]);
   console.log('PASS 12: bootlogo starts the real H:\\BOOTLOGO.COM with a CGA canvas frame');
+
+  stage = 'Source bootLogo';
+  sourceView = await openSource('LOGO.COM');
+  assertSourceLine(sourceView.current);
+  assert.match(sourceView.current.path, /^third_party\/bootlogo\//, 'bootLogo maps to its own NASM source');
+  await closeSourceWithShortcut();
+  console.log('PASS Source bootLogo: the running graphics program maps to its original assembly');
 
   stage = '13 bootLogo square pixels and dumps';
   send('REPEAT 4 [FD 50 RT 90]\r');
@@ -865,6 +1187,27 @@ try {
   assert.equal(graphics, null, 'PDCurses uses the real DOS text screen');
   console.log('PASS 19: rogue resolves the real H:\\GAMES\\ROGUE.EXE and shows a level-1 dungeon');
 
+  stage = 'Source Rogue function map';
+  sourceView = await openSource('ROGUE.EXE');
+  assert.equal(typeof sourceView.current.function, 'string', 'Rogue reports a compiled C function');
+  assert.ok(sourceView.current.function.length > 0);
+  assert.ok(Number.isInteger(sourceView.current.offset) && sourceView.current.offset >= 0,
+    'Rogue reports the real non-negative offset into its C function');
+  assert.equal(sourceView.current.label, 'C function (map)', 'Rogue is explicitly labelled as a map-file C function');
+  assert.ok(sourceView.current.line == null, 'Rogue must not invent C line numbers');
+  assert.ok(sourceView.current.path == null, 'the linker map does not invent a C source filename');
+  const rogueMap = readFileSync(new URL('../build/rogue/ROGUE.MAP', import.meta.url), 'utf8');
+  const symbols = [...rogueMap.matchAll(/^([0-9a-f]{4}):([0-9a-f]{4})[*+]?\s+(\S+)\s*$/gim)];
+  assert.equal(sourceView.current.address, sourceView.snapshot.current.offset,
+    'Rogue function lookup uses the real current canonical address');
+  assert.ok(symbols.some(([, segment, offset, name]) => name === sourceView.current.function
+    && parseInt(segment, 16) * 16 + parseInt(offset, 16) + sourceView.current.offset === sourceView.current.address),
+    'the reported Rogue function name and offset agree with the original linker map');
+  assert.ok(sourceElement.textContent.includes(sourceView.current.function));
+  assert.match(sourceElement.textContent, /C function[^\n]*map/, 'the visible panel labels the C function as map-derived');
+  await closeSourceWithShortcut();
+  console.log('PASS Source Rogue: truthful C function name/offset and map label, no invented source line');
+
   stage = '20 Rogue movement';
   const [oldRow, oldColumn] = roguePlayers(screen)[0];
   const rogueLines = screen.split('\n');
@@ -959,6 +1302,13 @@ try {
   await releaseProgramFetch('vz.wasm');
   await until('VZ showing the original README first line after F4', (text) =>
     !hasPanels(text) && text.includes(firstLine) && text.includes('File'));
+  stage = 'Source VZ';
+  sourceView = await openSource('VZ.COM');
+  assertSourceLine(sourceView.current);
+  assert.match(sourceView.current.path, /^third_party\/vzeditor\//, 'VZ maps to its vendored assembly');
+  await closeSourceWithShortcut();
+  console.log('PASS Source VZ: F4 child maps to its original assembly without changing editor input');
+  stage = '24 F4 VZ edit, save, and quit';
   const editorRow = screen.split('\n').findIndex((line) => line.includes(firstLine));
   const editorLine = 'Edited with VZ in the browser.';
   for (let start = 0; start < editorLine.length; start += 8) {
@@ -1052,11 +1402,16 @@ try {
     `INITIAL_MEMORY leaves at least 4 MiB and 20% headroom above the any-order bound ${worst}`);
   console.log(`PASS memory: any-order bound ${worst} bytes; headroom ${startupHeapBytes - worst} bytes`);
 
+  assert.equal(new Set(sourceFetches.map(({ url }) => url)).size, sourceFetches.length,
+    'reopening Source reuses every previously fetched map and original source file');
+  console.log(`PASS Source cache: ${sourceFetches.length} immutable lazy assets, ${sourceFetches.reduce((sum, item) => sum + item.bytes, 0)} fetched bytes`);
+  sourcePanel.dispose();
+
   stage = '26 quit and exit hook';
   await quitVC();
   console.log('PASS 26: F10, Enter quits and fires the exit hook');
   assertFetches();
-  console.log('web smoke: all 26 checks, Russian F3, and first-use/cached module fetches passed');
+  console.log('web smoke: all 26 checks, Russian F3, Source for all five programs, and first-use/cached module fetches passed');
   exitAfterOutput(0);
 } catch (error) {
   fail(error);

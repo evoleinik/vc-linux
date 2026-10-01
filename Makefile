@@ -231,8 +231,23 @@ WEB_PACKED_FILES := $(filter-out $(addprefix $(WEB_DEMO)/,$(WEB_INSTALLED)),$(WE
 # Emscripten 4.0.2's file_packager emits invalid assembler symbols for a
 # Cyrillic destination. Use an ASCII staging name, renamed before DOS starts.
 WEB_EMBED_FLAGS := $(foreach f,$(WEB_PACKED_FILES),--embed-file $(f)@/home/vc/$(subst ПРОЧТИ.TXT,READMERU.TXT,$(patsubst $(WEB_DEMO)/%,%,$(f))))
-WEB_ASSETS := web/index.html web/vc-web.js web/vc-keypad.js web/vc-language.js web/speaker.js web/graphics.js $(wildcard web/vendor/*)
+WEB_ASSETS := web/index.html web/vc-web.js web/vc-layout.js web/vc-source.js web/vc-keypad.js web/vc-language.js web/speaker.js web/graphics.js $(wildcard web/vendor/*)
 WEB_COPIES := $(patsubst web/%,$(WEB_OUT)/%,$(WEB_ASSETS))
+WEB_SOURCE_INDEX := $(WEB_WORK)/source-index-name.txt
+WEB_SOURCE_INPUTS := $(B)/VC.COM $(B)/VC.OVL $(B)/gen/VC.COM.lst $(B)/gen/VC.OVL.lst \
+                    $(B)/gwbasic/GWBASIC.EXE $(B)/gwbasic/GWBASIC.MAP $(GWB_LISTINGS) \
+                    $(B)/bootlogo/LOGO.COM $(B)/bootlogo/LOGO.lst \
+                    $(B)/rogue/ROGUE.EXE $(B)/rogue/ROGUE.MAP \
+                    $(B)/vz/VZ.COM $(B)/vz/VZ.MAP $(VZ_LISTINGS) \
+                    $(wildcard asm/* third_party/gwbasic/* third_party/vzeditor/SRC/*) \
+                    third_party/bootlogo/bootlogo.asm tools/source_maps.py tools/web_modules.py \
+                    tools/build_gwbasic.py tools/build_vz.py $(wildcard translator/*.py)
+
+# Source data is never embedded in the main wasm or eagerly imported by the
+# page. Every map and original-text payload, including its index, is immutable.
+$(WEB_SOURCE_INDEX): $(WEB_SOURCE_INPUTS)
+	$(PY) tools/source_maps.py --build $(B) --out $(WEB_OUT) --work $(WEB_WORK)
+	@touch $@
 
 # Grouped targets keep both the demo preparation and the single emcc link safe
 # under make -j.
@@ -272,17 +287,29 @@ $(WEB_OUT)/%: web/%
 # Startup assets keep today's ?v= stamp. Lazy modules instead carry their
 # side-generation hash in the filename, which Pages cannot ignore on deploy.
 WEB_VERSIONED := $(WEB_OUT)/index.html $(WEB_OUT)/vc-web.js
-$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_BINARIES) $(WEB_ASSETS)
+$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_BINARIES) $(WEB_ASSETS) $(WEB_SOURCE_INDEX)
 	@mkdir -p $(dir $@)
-	v=$$(cat $(WEB_BINARIES) $(WEB_ASSETS) | sha256sum | cut -c1-12); \
-	  sed "s/__V__/$$v/g" $< > $@
+	v=$$(cat $(WEB_BINARIES) $(WEB_ASSETS) $(WEB_SOURCE_INDEX) | sha256sum | cut -c1-12); \
+	  source_index=$$(cat $(WEB_SOURCE_INDEX)); \
+	  sed "s/__V__/$$v/g; s/__SOURCE_INDEX__/$$source_index/g" $< > $@
 
 web: $(WEB_BINARIES) $(WEB_COPIES)
 	@$(PY) tools/web_modules.py $(WEB_WORK) $(WEB_OUT)
+	@$(PY) tools/source_maps.py --restore --out $(WEB_OUT) --work $(WEB_WORK)
 
-test-web: web
+$(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/source-runtime.wasm &: tests/source_runtime.c runtime/rt.c $(wildcard runtime/*.h)
+	@mkdir -p $(WEB_WORK)
+	$(EMCC) -O2 -sENVIRONMENT=node -sMODULARIZE -sEXPORT_ES6 -sASSERTIONS \
+	  -sSTACK_SIZE=1048576 -Iruntime tests/source_runtime.c -o $(WEB_WORK)/source-runtime.mjs
+
+test-web: web $(WEB_WORK)/source-runtime.mjs
 	$(NODE) tests/web_assets.mjs $(WEB_OUT)
 	$(NODE) tests/web_size.mjs $(WEB_OUT)
+	$(NODE) tests/test_source_maps.mjs $(WEB_OUT)
+	$(NODE) tests/test_web_source.mjs $(WEB_OUT)
+	$(NODE) tests/test_web_layout.mjs $(WEB_OUT)
+	$(NODE) tests/test_web_source_wiring.mjs $(WEB_OUT)
+	$(NODE) tests/source_runtime.mjs $(WEB_WORK)/source-runtime.mjs
 	$(NODE) tests/web_modules.mjs $(WEB_OUT)
 	$(NODE) tests/test_web_keypad.mjs $(WEB_OUT)
 	$(NODE) tests/web_language.mjs $(WEB_DEMO)

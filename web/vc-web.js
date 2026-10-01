@@ -5,11 +5,15 @@ import { createSpeaker } from "./speaker.js?v=__V__";
 import { createGraphics } from "./graphics.js?v=__V__";
 import { initialInput, reduceInput, bindKeypad } from "./vc-keypad.js?v=__V__";
 import { pageText } from "./vc-language.js?v=__V__";
+import { screenLayout } from "./vc-layout.js?v=__V__";
 
 const container = document.getElementById("terminal");
 const layout = document.querySelector("main");
 const footer = document.querySelector("footer");
 const exitMessage = document.getElementById("exit-message");
+const sourceButton = document.getElementById("source-button");
+const sourceElement = document.getElementById("source-panel");
+const touchControls = document.getElementById("keypad");
 const strings = pageText(navigator.language);
 document.documentElement.lang = strings.language;
 document.getElementById("page-description").textContent = strings.footer;
@@ -27,6 +31,86 @@ let exited = false;
 let terminal;
 const speaker = createSpeaker();
 let graphics;
+let vc, sourcePanel, sourceLoad, sourceSnapshot, sourceResolved;
+let sourceWasOpen = false, sourceScroll;
+let closedFit, sourceRootStyle;
+
+function layoutSource() {
+  const opened = !!sourcePanel?.opened;
+  // Content refreshes cannot change the geometry or scroll a text selection.
+  if (opened === sourceWasOpen) return;
+  if (opened) sourceScroll = { left: window.scrollX, top: window.scrollY };
+  sourceWasOpen = opened;
+  fit(true);
+  if (opened && sourceElement.dataset.position === "below")
+    sourceElement.scrollIntoView({ block: "nearest" });
+  else if (!opened && sourceScroll) window.scrollTo(sourceScroll);
+}
+
+async function toggleSource() {
+  if (!vc || exited) return;
+  try {
+    if (!sourceLoad) sourceLoad = import("./vc-source.js?v=__V__").then(module => {
+      if (exited) return null;
+      sourcePanel = module.createSourcePanel({
+        button: sourceButton, panel: sourceElement,
+        indexURL: new URL("./__SOURCE_INDEX__?v=__V__", import.meta.url).href,
+        getSnapshot() { vc._vc_source_snapshot(); return sourceSnapshot; },
+        resolveAddress(cs, ip, preceding) { vc._vc_source_resolve(cs, ip, preceding); return sourceResolved; },
+        getTextarea: () => terminal?.textarea, onLayout: layoutSource,
+      });
+      sourceButton.title = "Show original source (Ctrl-Shift-F12)";
+      sourceButton.removeAttribute("aria-label");
+      sourceButton.removeEventListener("click", firstSourceClick);
+      sourceButton.removeEventListener("pointerdown", firstSourcePointerDown);
+      return sourcePanel;
+    }).catch(error => { sourceLoad = null; throw error; });
+    const binding = await sourceLoad;
+    if (!exited && binding) await binding.toggle();
+  } catch (error) {
+    if (exited) return;
+    // If even the panel module is unavailable, keep the screen unobscured.
+    // The same button retries; its tooltip/accessibility label explains why.
+    sourceElement.hidden = true;
+    sourceButton.setAttribute("aria-expanded", "false");
+    sourceButton.title = `Source could not load (${error.message}). Click Source to retry.`;
+    sourceButton.setAttribute("aria-label", sourceButton.title);
+  }
+}
+let firstSourceTextarea = null;
+function firstSourcePointerDown(event) {
+  const textarea = terminal?.textarea;
+  // Only a mouse press can move focus here; pointerdown is cancelled. A focus()
+  // inside a touch tap opens Android's soft keyboard, so touch never refocuses.
+  firstSourceTextarea = event.pointerType === "mouse" && textarea
+    && document.activeElement === textarea ? textarea : null;
+  event.preventDefault();
+}
+const firstSourceClick = () => {
+  const textarea = firstSourceTextarea;
+  firstSourceTextarea = null;
+  void toggleSource();
+  textarea?.focus({ preventScroll: true });
+};
+sourceButton.addEventListener("pointerdown", firstSourcePointerDown);
+sourceButton.addEventListener("click", firstSourceClick);
+
+// Ctrl-Alt-S is VC's Alt-S speed search. Ctrl-Shift-F12 (8A00h) is unbound
+// and avoids VC's Alt-release menu latch. Neither toggle sends guest bytes.
+let sourceShortcutHeld = false;
+function sourceKey(event) {
+  if (exited || (event.code !== "F12" && event.key !== "F12")) return;
+  const shortcut = event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey;
+  if (!shortcut && !sourceShortcutHeld) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if (event.type === "keyup") sourceShortcutHeld = false;
+  else if (!event.repeat) { sourceShortcutHeld = true; void toggleSource(); }
+}
+window.addEventListener("keydown", sourceKey, { capture: true });
+window.addEventListener("keyup", sourceKey, { capture: true });
+window.addEventListener("blur", () => { sourceShortcutHeld = false; });
+document.addEventListener("visibilitychange", () => { sourceShortcutHeld = false; });
 
 function enqueue(data, raw = false) {
   if (exited || !data) return;
@@ -93,35 +177,94 @@ function screenText() {
 // exposing the wasm heap or adding a second input path.
 Object.defineProperty(window, "vcScreen", { value: screenText });
 
-function fit() {
+function fit(reuseClosed = false) {
   if (!terminal?.element) return;
-  const style = getComputedStyle(layout);
-  const width = layout.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
-  const height = layout.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
-    - footer.getBoundingClientRect().height - parseFloat(style.rowGap);
   const screen = terminal.element.querySelector(".xterm-screen");
   const original = screen.getBoundingClientRect();
   if (!original.width || !original.height) return;
-  const estimate = Math.max(1, Math.floor(terminal.options.fontSize
-    * Math.min(width / original.width, height / original.height)));
-  let size = estimate >= 16 ? Math.floor(estimate / 16) * 16 : estimate;
-  const fits = () => {
-    const rect = screen.getBoundingClientRect();
-    return rect.width <= width && rect.height <= height;
-  };
-  terminal.options.fontSize = size;
-  while (!fits() && size > 1) {
-    size = size > 16 ? size - 16 : size - 1;
-    terminal.options.fontSize = size;
+  const opened = !!sourcePanel?.opened;
+  const scroll = { left: window.scrollX, top: window.scrollY };
+  const rootStyle = document.documentElement.style;
+  if (opened && !sourceRootStyle) sourceRootStyle = { overflowY: rootStyle.overflowY || "" };
+  if (sourceRootStyle) rootStyle.overflowY = sourceRootStyle.overflowY;
+  if (!opened) sourceRootStyle = null;
+  // Measure main's unchanged flex layout, including naturally wrapped footer
+  // text. No open-panel positioning survives a close or a viewport resize.
+  sourceElement.hidden = true;
+  for (const node of [container, touchControls, footer])
+    for (const property of ["position", "left", "top", "width"])
+      node.style.removeProperty(property);
+  let scrollbarSize;
+  if (opened) {
+    // Native bars differ by platform (including zero-width overlay bars).
+    // Measure only while opening/resizing Source, never on the closed page.
+    rootStyle.overflowY = "scroll";
+    scrollbarSize = Math.max(0, window.innerWidth - document.documentElement.clientWidth);
+    rootStyle.overflowY = sourceRootStyle.overflowY;
   }
-  // Test the next preferred size too: device-pixel rounding can make the
-  // proportional estimate conservative, especially below the native 16px.
-  const next = size >= 16 ? size + 16 : size + 1;
-  terminal.options.fontSize = next;
-  if (!fits()) terminal.options.fontSize = size;
+  const dimensions = node => {
+    const rect = node.getBoundingClientRect();
+    return { width: rect.width, height: rect.height };
+  };
+  const currentFont = terminal.options.fontSize;
+  // main's estimate is not necessarily idempotent for every fallback font.
+  // Toggles reuse its original anchor; a resize starts from its closed size.
+  const fontSize = reuseClosed && closedFit ? closedFit.anchor
+    : opened && closedFit ? closedFit.fontSize : currentFont;
+  const measurements = { [currentFont]: { width: original.width, height: original.height } };
+  const input = () => {
+    const style = getComputedStyle(layout);
+    return {
+      width: layout.clientWidth, height: layout.clientHeight,
+      padding: parseFloat(style.paddingLeft), gap: parseFloat(style.rowGap),
+      footer: dimensions(footer),
+      controls: getComputedStyle(touchControls).display === "none" ? null : dimensions(touchControls),
+      safeCenter: style.justifyContent.includes("safe"), fontSize, measurements, scrollbarSize,
+    };
+  };
+  // Font fallback and device-pixel rounding are measured, not approximated.
+  // All size choices and box arithmetic live in the pure function.
+  const resolveLayout = input => {
+    let result = screenLayout(input);
+    while (result.measure !== undefined) {
+      terminal.options.fontSize = result.measure;
+      measurements[result.measure] = dimensions(screen);
+      result = screenLayout(input);
+    }
+    return result;
+  };
+  const base = input();
+  const closed = resolveLayout({ ...base, open: false });
+  closedFit = { anchor: fontSize, fontSize: closed.fontSize };
+  let result = opened ? resolveLayout({ ...base, open: true }) : closed;
+  if (result.panel?.side === "below") {
+    // This layout puts the footer beyond the viewport. Establish its real
+    // scrollbar width before measuring wrapping/boxes, even while hidden.
+    // The original root policy is restored on close and before each resize.
+    rootStyle.overflowY = "scroll";
+    result = resolveLayout({ ...input(), open: true });
+  }
+  terminal.options.fontSize = result.fontSize;
+  if (result.panel) {
+    const place = (node, box) => Object.assign(node.style, {
+      position: "absolute", left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`,
+    });
+    place(container, result.screen);
+    place(footer, result.footer);
+    if (result.controls) place(touchControls, result.controls);
+    place(sourceElement, result.panel);
+    sourceElement.style.height = `${result.panel.height}px`;
+    sourceElement.dataset.position = result.panel.side;
+  }
+  sourceElement.hidden = !opened;
+  // A layout read with the panel hidden can temporarily clamp root scroll.
+  if (opened && (window.scrollX !== scroll.left || window.scrollY !== scroll.top))
+    window.scrollTo(scroll);
 }
 
 function onExit() {
+  sourcePanel?.close();
+  sourceButton.disabled = true;
   speaker.silence();
   exited = true;
   input.length = 0;
@@ -151,7 +294,7 @@ document.addEventListener("visibilitychange", () => {
 let resizeFrame = 0;
 window.addEventListener("resize", () => {
   cancelAnimationFrame(resizeFrame);
-  resizeFrame = requestAnimationFrame(fit);
+  resizeFrame = requestAnimationFrame(() => fit());
 });
 
 async function start() {
@@ -217,12 +360,15 @@ async function start() {
     });
   });
   await createVC({
+    preRun: [module => { vc = module; sourceButton.disabled = false; }],
     locateFile: (path, prefix) => `${prefix}${path}?v=__V__`,
     vcOutput: (bytes) => terminal.write(bytes),
     vcReadInput: readInput,
     vcExit: onExit,
     vcSpeaker: (frequency) => speaker.setFrequency(frequency),
     vcGraphics: (frame) => graphics.draw(frame),
+    vcSourceSnapshot: snapshot => { sourceSnapshot = snapshot; },
+    vcSourceResolved: address => { sourceResolved = address; },
   });
 }
 

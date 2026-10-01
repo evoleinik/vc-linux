@@ -177,7 +177,8 @@ assert.match(buttonRule, /-webkit-touch-callout:\s*none\s*;/,
 assert.match(page, /@media\s*\(pointer: coarse\) and \(orientation: portrait\)/);
 assert.ok(page.indexOf('id="terminal"') < page.indexOf('id="keypad"'));
 const app = await readFile(new URL('../web/vc-web.js', import.meta.url), 'utf8');
-const fit = app.slice(app.indexOf('function fit()'), app.indexOf('function onExit()'));
+const fit = app.slice(app.indexOf('function fit('), app.indexOf('function onExit()'));
+assert.ok(fit.includes('function fit('), 'inspect the actual fitting adapter');
 assert.doesNotMatch(fit, /keypad/i, 'the original screen fit never subtracts keypad height');
 assert.match(app, /terminal\.onData\(enqueue\)/, 'phone text keeps the existing input queue');
 assert.match(app, /pointerdown.*terminal\?\.focus/, 'screen taps keep their mouse path');

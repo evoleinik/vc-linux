@@ -73,7 +73,10 @@ for (const language of ['ru-RU', 'uk-UA', 'en-US', 'de-DE', undefined]) {
     addEventListener() {},
     fonts: { load: () => new Promise(() => {}) },
   };
+  // This non-module VM supplies the real script URL for lazy Source URLs;
+  // font loading remains pending, so no dynamic import or wasm can run.
   runInNewContext(app.replace(/^import .*;\r?\n/gm, '')
+    .replaceAll('import.meta.url', JSON.stringify(new URL('../web/vc-web.js', import.meta.url).href))
     + '\nterminal = { options: {} }; onExit();', {
     document,
     window: { addEventListener() {} },

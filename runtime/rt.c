@@ -16,6 +16,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include "web_source.h"
 EM_JS(void, browser_speaker, (double hz), {
     if (Module['vcSpeaker']) Module['vcSpeaker'](hz);
 });
@@ -314,6 +315,73 @@ static int nknown;
 static struct { const Image *image; RtImageRunner run; } supplements[MAX_KNOWN];
 static unsigned nsupplements;
 
+#ifdef __EMSCRIPTEN__
+/* A ring of distinct canonical block addresses in recency order. Hash chains
+ * make a repeated idle-loop entry an O(1)-expected move to the ring's head,
+ * so a long keyboard wait cannot erase all history outside that loop. No
+ * listing or source-line lookup happens in the dispatch path. */
+#define SOURCE_HISTORY 1024u
+#define SOURCE_HASH 2048u
+#define SOURCE_STACK_WORDS 1024u
+typedef struct {
+    const Image *image;
+    uint32_t offset;
+    uint16_t cs, ip;
+    unsigned older, newer, hash_next;
+} SourceEntry;
+static SourceEntry source_history[SOURCE_HISTORY];
+static unsigned source_hash[SOURCE_HASH]; /* indices plus one; zero is empty */
+static unsigned source_count, source_newest;
+
+static unsigned source_bucket(const Image *image, uint32_t offset) {
+    return (unsigned)(((uintptr_t)image >> 2) ^ (offset * 2654435761u)) &
+           (SOURCE_HASH - 1);
+}
+
+static void source_enter(const Image *image, uint32_t offset,
+                         uint16_t cs, uint16_t ip) {
+    unsigned bucket = source_bucket(image, offset), index;
+    for (unsigned link = source_hash[bucket]; link; link = source_history[link - 1].hash_next) {
+        SourceEntry *entry = &source_history[link - 1];
+        if (entry->image != image || entry->offset != offset) continue;
+        index = link - 1;
+        entry->cs = cs;
+        entry->ip = ip;
+        if (index == source_newest) return;
+        source_history[entry->older].newer = entry->newer;
+        source_history[entry->newer].older = entry->older;
+        goto newest;
+    }
+    if (source_count < SOURCE_HISTORY) {
+        index = source_count++;
+    } else {
+        index = source_history[source_newest].newer; /* oldest in the ring */
+        SourceEntry *old = &source_history[index];
+        unsigned *link = &source_hash[source_bucket(old->image, old->offset)];
+        while (*link != index + 1) link = &source_history[*link - 1].hash_next;
+        *link = old->hash_next;
+        source_history[old->older].newer = old->newer;
+        source_history[old->newer].older = old->older;
+    }
+    source_history[index] = (SourceEntry){
+        .image = image, .offset = offset, .cs = cs, .ip = ip,
+        .hash_next = source_hash[bucket]
+    };
+    source_hash[bucket] = index + 1;
+    if (source_count == 1) {
+        source_history[index].older = source_history[index].newer = index;
+        source_newest = index;
+        return;
+    }
+newest:
+    source_history[index].older = source_newest;
+    source_history[index].newer = source_history[source_newest].newer;
+    source_history[source_history[index].newer].older = index;
+    source_history[source_newest].newer = index;
+    source_newest = index;
+}
+#endif
+
 void rt_register_supplement(const Image *img, RtImageRunner run) {
     if (!img || !run) rt_fault("invalid image supplement");
     for (unsigned i = 0; i < nsupplements; ++i) {
@@ -334,6 +402,19 @@ static int run_image(Known *k, uint32_t off) {
             return supplements[i].run(off, k->loadseg);
     return result;
 }
+
+#ifdef __EMSCRIPTEN__
+/* A rejected entry has no guest side effects and must not appear in the
+ * history. Image.run cannot suspend, so recording immediately after its
+ * successful return still describes the entry at the saved CS:IP. */
+static int source_run_image(Known *k, uint32_t off) {
+    uint16_t cs = cpu.cs, ip = cpu.ip;
+    int result = run_image(k, off);
+    if (!result) source_enter(k->img, off, cs, ip);
+    return result;
+}
+#define run_image source_run_image
+#endif
 
 void rt_register_image(const Image *img, uint16_t loadseg) {
     uint32_t base = (uint32_t)loadseg << 4;
@@ -419,6 +500,177 @@ static int code_matches(const Known *k, uint32_t off, uint32_t L, uint32_t n) {
     }
     return 1;
 }
+
+#ifdef __EMSCRIPTEN__
+/* Four wasm32 words; browser_source_snapshot copies every value before
+ * returning, so callers never retain aliases into the wasm heap. */
+typedef struct {
+    const char *image;
+    uint32_t offset, cs, ip;
+} SourceLocation;
+typedef struct {
+    uint32_t sp, word;
+    SourceLocation near, far;
+} SourceStackWord;
+_Static_assert(sizeof(SourceLocation) == 16, "source location JS wire layout");
+_Static_assert(sizeof(SourceStackWord) == 40, "source stack JS wire layout");
+
+static int source_matches(const Known *k, uint32_t off, uint32_t L,
+                          int preceding, uint32_t width) {
+    if (off > k->img->size) return 0;
+    uint32_t n;
+    if (preceding) {
+        n = off < 3 ? off : 3;
+        if (!n || L < n) return 0;
+        return code_matches(k, off - n, L - n, n);
+    }
+    n = k->img->size - off < width ? k->img->size - off : width;
+    return n && code_matches(k, off, L, n);
+}
+
+static SourceLocation source_location(uint16_t cs, uint16_t ip, int preceding) {
+    SourceLocation out = {.cs = cs, .ip = ip};
+    uint32_t L = lin(cs, ip);
+    /* Preserve dispatch order: most recently loaded live image, exact
+     * cached copy, then already-observed deltas. Unlike run_at, never probe
+     * a translation to discover an instruction boundary. The fetched map
+     * makes that final check without changing guest state. */
+    for (int i = nknown - 1; i >= 0; --i) {
+        Known *k = &known[i];
+        if (L < k->base || L > k->base + k->img->size) continue;
+        uint32_t off = L - k->base;
+        if (!source_matches(k, off, L, preceding, 6)) continue;
+        out.image = k->img->name;
+        out.offset = off;
+        return out;
+    }
+    for (int i = 0; i < nmoved; ++i) {
+        Moved *m = &moved[i];
+        if (m->lin != L) continue;
+        Known *k = find_known(m->img);
+        if (!k || !source_matches(k, m->off, L, preceding, 3)) continue;
+        out.image = k->img->name;
+        out.offset = m->off;
+        return out;
+    }
+    for (int i = nknown - 1; i >= 0; --i) {
+        Known *k = &known[i];
+        for (int j = 0; j < k->ndeltas; ++j) {
+            int64_t off = (int64_t)L - k->base - k->deltas[j];
+            if (off < 0 || off > k->img->size ||
+                !source_matches(k, (uint32_t)off, L, preceding, 3)) continue;
+            out.image = k->img->name;
+            out.offset = (uint32_t)off;
+            return out;
+        }
+    }
+    return out;
+}
+
+EM_JS(void, browser_source_resolved,
+      (const char *name, unsigned offset, unsigned cs, unsigned ip), {
+    if (Module['vcSourceResolved']) Module['vcSourceResolved'](name ? {
+        image: UTF8ToString(name), offset: offset, cs: cs, ip: ip,
+    } : null);
+});
+
+EMSCRIPTEN_KEEPALIVE void vc_source_resolve(unsigned cs, unsigned ip, int preceding) {
+    SourceLocation where = source_location((uint16_t)cs, (uint16_t)ip, preceding);
+    browser_source_resolved(where.image, where.offset, where.cs, where.ip);
+}
+
+EM_JS(void, browser_source_snapshot,
+      (unsigned cs, unsigned ip, unsigned ss, unsigned sp,
+       const SourceLocation *current, unsigned kind, unsigned return_cs, unsigned return_ip,
+       const SourceStackWord *stack, unsigned words,
+       const SourceLocation *entries, unsigned count, unsigned truncated), {
+    if (!Module['vcSourceSnapshot']) return;
+    function location(pointer) {
+        var p = pointer >>> 2, name = HEAPU32[p];
+        return {
+            image: name ? UTF8ToString(name) : null,
+            offset: HEAPU32[p + 1], cs: HEAPU32[p + 2], ip: HEAPU32[p + 3],
+        };
+    }
+    var now = location(current), frames = [], recent = [];
+    now.kind = ['instruction', 'interrupt', 'continuation'][kind];
+    now.returnCS = return_cs;
+    now.returnIP = return_ip;
+    for (var i = 0; i < words; ++i) {
+        var at = stack + i * 40, p = at >>> 2;
+        var near = location(at + 8), far = location(at + 24);
+        frames.push({sp: HEAPU32[p], word: HEAPU32[p + 1],
+                     near: near.image ? near : null, far: far.image ? far : null});
+    }
+    for (var i = 0; i < count; ++i) recent.push(location(entries + i * 16));
+    Module['vcSourceSnapshot']({version: 1,
+        raw: {cs: cs, ip: ip, ss: ss, sp: sp}, current: now,
+        stack: frames, recent: recent, stackTruncated: !!truncated,
+        historyCapacity: 1024, historyFull: count === 1024,
+    });
+});
+
+EMSCRIPTEN_KEEPALIVE void vc_source_snapshot(void) {
+    uint16_t cs = cpu.cs, ip = cpu.ip, return_cs = cs, return_ip = ip;
+    uint16_t stack_sp = cpu.sp;
+    uint32_t L = lin(cs, ip);
+    unsigned kind = 0;
+    if (L >= (STUB_SEG << 4) && L < (STUB_SEG << 4) + STUB_END) {
+        /* The CPU is really in the host BIOS/DOS stub. Its guest interrupt
+         * frame supplies the truthful suspended context, not the previous
+         * block's first instruction. Only call it an INT when its live
+         * opcode and vector agree; hardware IRQ continuations stay labelled
+         * continuations instead of fabricating a guest INT instruction. */
+        unsigned stub_off = L - (STUB_SEG << 4);
+        ip = return_ip = rd16(cpu.ss, cpu.sp);
+        cs = return_cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
+        /* The suspended context already accounts for this stub's return.
+         * Its IP/CS/(FLAGS) words are not older CALL frames. Advance just
+         * the snapshot cursor, with the same 16-bit wrap as pop16(). */
+        if (stub_off < 0x100 || stub_off == STUB_INT8_RETURN)
+            stack_sp = (uint16_t)(stack_sp + 6);
+        else if (stub_off == STUB_CASEMAP)
+            stack_sp = (uint16_t)(stack_sp + 4);
+        kind = 2;
+        if (stub_off < 0x100 && rd8(cs, (uint16_t)(ip - 2)) == 0xcd &&
+            rd8(cs, (uint16_t)(ip - 1)) == stub_off) {
+            ip -= 2;
+            kind = 1;
+        } else if ((stub_off == 3 && rd8(cs, (uint16_t)(ip - 1)) == 0xcc) ||
+                   (stub_off == 4 && rd8(cs, (uint16_t)(ip - 1)) == 0xce)) {
+            --ip;
+            kind = 1;
+        }
+    }
+    SourceLocation current = source_location(cs, ip, 0);
+    SourceStackWord stack[SOURCE_STACK_WORDS];
+    unsigned available = (0x10000u - stack_sp) / 2u;
+    unsigned words = available < SOURCE_STACK_WORDS ? available : SOURCE_STACK_WORDS;
+    for (unsigned i = 0; i < words; ++i) {
+        uint16_t sp = (uint16_t)(stack_sp + i * 2);
+        uint16_t word = rd16(cpu.ss, sp);
+        uint16_t far_cs = rd16(cpu.ss, (uint16_t)(sp + 2));
+        stack[i] = (SourceStackWord){
+            .sp = sp, .word = word,
+            .near = source_location(cs, word, 1),
+            .far = source_location(far_cs, word, 1),
+        };
+    }
+    SourceLocation entries[SOURCE_HISTORY];
+    unsigned index = source_newest;
+    for (unsigned i = 0; i < source_count; ++i) {
+        SourceEntry *entry = &source_history[index];
+        entries[i] = (SourceLocation){
+            .image = entry->image->name, .offset = entry->offset,
+            .cs = entry->cs, .ip = entry->ip,
+        };
+        index = entry->older;
+    }
+    browser_source_snapshot(cpu.cs, cpu.ip, cpu.ss, cpu.sp, &current, kind,
+                            return_cs, return_ip, stack, words, entries, source_count,
+                            available > words);
+}
+#endif
 
 static void note_moved(Known *k, uint32_t off, uint32_t L) {
     int32_t d = (int32_t)(L - (k->base + off));

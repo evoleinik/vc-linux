@@ -8,7 +8,7 @@ import { runInNewContext } from "node:vm";
 
 const dir = process.argv[2] || "build/web";
 const sources = Object.fromEntries([
-  "index.html", "vc-web.js", "vc-keypad.js", "vc-language.js", "speaker.js", "graphics.js",
+  "index.html", "vc-web.js", "vc-layout.js", "vc-source.js", "vc-keypad.js", "vc-language.js", "speaker.js", "graphics.js",
 ].map(file => [file, readFileSync(join(dir, file), "utf8")]));
 const failures = [];
 const versions = new Set();

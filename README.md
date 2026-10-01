@@ -166,6 +166,12 @@ input active.
 directory, or press Enter on that EXE. Its saves, like all browser files, vanish
 on reload.
 
+The Source button, or Ctrl-Shift-F12, shows the original assembly behind the running code. It
+shows the line the CPU is on, with Volkov's comments and the lines around it. Below that are the
+callers that led there, found from real return addresses on the stack, and the last 32 lines that
+ran. It works for VC, GW-BASIC, bootLogo and VZ. For Rogue, compiled from C, it names the function.
+The sources load the first time the panel opens.
+
 The page first downloads VC alone, about 1.3 MB gzipped. Each translated program is a separate
 wasm module, fetched the first time DOS runs it and kept for the session. On a phone held upright,
 a key pad appears under the screen with F1 to F10, arrows, Esc, Tab, Ins, Enter, sticky Ctrl, Alt
