@@ -6,7 +6,11 @@ It is not an emulator.
 
 H: is your playground. These files live only in memory.
 Reload the page to undo every change and start again.
-There is no shell. The cd command works; F4 edits files with VZ Editor.
+Microsoft's real COMMAND.COM runs DIR, TYPE, COPY, ECHO and .BAT files.
+Type COMMAND for a DOS prompt, then EXIT to return to VC's panels.
+H:\DOS holds EDLIN, DEBUG, FIND, MORE, SORT and FC, all on DOS PATH.
+DOS\DOS.TXT explains them and gives three things to try.
+F4 edits files with VZ Editor.
 Type VZ NEW.TXT to create a text file, then answer Y to "New file?".
 Type GWBASIC to start BASIC. Try PRINT 2+2, then SYSTEM to return.
 Type BOOTLOGO for turtle graphics, or press Enter on BOOTLOGO.COM.
@@ -65,3 +69,4 @@ GAMES/PDCLIC.TXT has the public-domain notice for its PDCurses DOS port.
 GAMES/OWLIC.TXT has the OpenWatcom runtime licence and its source link.
 VZLIC.TXT is VZ Editor's BSD-3 licence, by c.mos / Village Center.
 KERMLIC.TXT is MS-DOS Kermit's BSD-3 licence, by Columbia University.
+DOS/DOSLIC.TXT is Microsoft's MIT licence for MS-DOS 2.0's shell and utilities.

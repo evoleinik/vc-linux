@@ -27,6 +27,13 @@ static WebImage images[WEB_IMAGE_COUNT] = {
     [WEB_ROGUE] = {"ROGUE.EXE", WEB_MODULE_ROGUE, "image_rogue", NULL},
     [WEB_VZ] = {"VZ.COM", WEB_MODULE_VZ, "image_vz", NULL},
     [WEB_KERMIT] = {"KERMIT.EXE", WEB_MODULE_KERMIT, "image_kermit", NULL},
+    [WEB_COMMAND] = {"COMMAND.COM", WEB_MODULE_COMMAND, "image_command", NULL},
+    [WEB_EDLIN] = {"EDLIN.COM", WEB_MODULE_EDLIN, "image_edlin", NULL},
+    [WEB_DEBUG] = {"DEBUG.COM", WEB_MODULE_DEBUG, "image_debug", NULL},
+    [WEB_FIND] = {"FIND.EXE", WEB_MODULE_FIND, "image_find", NULL},
+    [WEB_MORE] = {"MORE.COM", WEB_MODULE_MORE, "image_more", NULL},
+    [WEB_SORT] = {"SORT.EXE", WEB_MODULE_SORT, "image_sort", NULL},
+    [WEB_FC] = {"FC.EXE", WEB_MODULE_FC, "image_fc", NULL},
 };
 
 EM_ASYNC_JS(int, fetch_program, (const char *name, const char *path), {
@@ -78,8 +85,7 @@ int web_image_is_vz(const Image *image) {
 static int enough_module_memory(const char *path) {
     struct stat info;
     if (stat(path, &info) || info.st_size <= 0) return 5;
-    // Emscripten retains one raw file copy, plus dylink static data. All four
-    // current sides use <9% of their file size for statics; web_modules.mjs
+    // Emscripten retains one raw file copy, plus dylink static data. web_modules.mjs
     // gates statics+alignment <= file size. 2x covers both, and 64 KiB covers
     // allocator/DSO bookkeeping and Asyncify's small direct wait stack.
     const size_t overhead = 64 * 1024;

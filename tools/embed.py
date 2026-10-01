@@ -1,13 +1,20 @@
 """Embed files into the binary as C arrays: python3 tools/embed.py OUT.c NAME=PATH ...
 
+--web-only=NAME=PATH puts a startup file in the browser's packed table only.
+It neither installs nor adds the file's bytes to the native binary.
+
 Writes the `embedded_files` table declared in runtime/rt.h. Native arrays stay
 unchanged. The browser reconstructs VC from its already-linked, unrelocated
 image and exact MZ header/trailer, and unpacks the other files before any DOS
 installation/EXEC comparison. Nothing is removed, deferred, or network-fetched.
 
-The packed stream is raw LZMA1 with frozen lc=lp=pb=0, a 1 MiB dictionary and
-an end marker. runtime/embed_lzma.c implements only that bounded profile. An
-Adler-32 catches accidental corruption; it is not an authenticity mechanism.
+Before raw LZMA1, a reversible byte filter turns each E8/E9-following 16-bit
+word into an absolute stream offset modulo 65536. This is compression, not
+instruction decoding: opcode-looking data is restored identically too.
+LZMA1 keeps frozen lc=lp=pb=0, a 1 MiB dictionary and an end marker.
+runtime/embed_lzma.c implements that bounded profile and reverses the filter.
+An Adler-32 over the original bytes catches accidental corruption; it is not
+an authenticity mechanism.
 """
 from pathlib import Path
 import lzma
@@ -37,6 +44,22 @@ def array(symbol: str, data: bytes) -> list[str]:
     return [*lines, "};"]
 
 
+def x86_16_filter(data: bytes) -> bytes:
+    """Normalize near relative operands; skip their bytes in both directions."""
+    result = bytearray(data)
+    at = 0
+    while at + 2 < len(result):
+        if result[at] in (0xE8, 0xE9):
+            relative = result[at + 1] | (result[at + 2] << 8)
+            absolute = (relative + at + 3) & 0xFFFF
+            result[at + 1] = absolute & 0xFF
+            result[at + 2] = absolute >> 8
+            at += 3
+        else:
+            at += 1
+    return bytes(result)
+
+
 def vc_parts(name: str, path: str, raw: bytes) -> tuple[str, bytes, bytes, int]:
     """Use the translator's validated MZ boundaries, including trailing data.
 
@@ -63,10 +86,15 @@ def main() -> None:
     payload = bytearray()
     # Validate every input before replacing a previously generated source.
     for pair in pairs:
+        web_only = pair.startswith("--web-only=")
+        if web_only:
+            pair = pair.removeprefix("--web-only=")
         name, path = pair.split("=", 1)
+        if web_only and name in ("VC.COM", "VC.OVL"):
+            raise ValueError("VC's built-in files must exist in both builds")
         data = Path(path).read_bytes()
         parts = vc_parts(name, path, data) if name in ("VC.COM", "VC.OVL") else None
-        entries.append((name, data, parts, len(payload)))
+        entries.append((name, data, parts, len(payload), web_only))
         if parts is None:
             payload.extend(data)
 
@@ -75,19 +103,21 @@ def main() -> None:
     table = []
     initialize = []
     if payload:
-        packed = lzma.compress(payload, format=lzma.FORMAT_RAW, filters=[WEB_LZMA_FILTER])
-        if lzma.decompress(packed, format=lzma.FORMAT_RAW, filters=[WEB_LZMA_FILTER]) != payload:
+        filtered = x86_16_filter(payload)
+        packed = lzma.compress(filtered, format=lzma.FORMAT_RAW, filters=[WEB_LZMA_FILTER])
+        if lzma.decompress(packed, format=lzma.FORMAT_RAW, filters=[WEB_LZMA_FILTER]) != filtered:
             raise ValueError("embedded DOS file compression did not round-trip")
         lines += ["#ifdef __EMSCRIPTEN__",
                   f"static uint8_t embedded_unpacked[{len(payload)}];",
                   *array("embedded_packed", packed), "#endif", ""]
         initialize += [
             "  if (embed_lzma_decode(embedded_unpacked, sizeof embedded_unpacked,",
-            "                        embedded_packed, sizeof embedded_packed) != 0 ||",
-            "      embed_adler32(embedded_unpacked, sizeof embedded_unpacked) !=",
+            "                        embedded_packed, sizeof embedded_packed) != 0) abort();",
+            "  embed_x86_16_restore(embedded_unpacked, sizeof embedded_unpacked);",
+            "  if (embed_adler32(embedded_unpacked, sizeof embedded_unpacked) !=",
             f"          {zlib.adler32(payload)}u) abort();",
         ]
-    for i, (name, data, parts, offset) in enumerate(entries):
+    for i, (name, data, parts, offset, web_only) in enumerate(entries):
         if parts is not None:
             image, prefix, suffix, size = parts
             lines += ["#ifdef __EMSCRIPTEN__", f"static uint8_t f{i}[{len(data)}];"]
@@ -109,13 +139,23 @@ def main() -> None:
                                   f"f{i}_suffix, {len(suffix)}u);")
         elif payload:
             lines += ["#ifdef __EMSCRIPTEN__",
-                      f"#define f{i} (embedded_unpacked + {offset}u)", "#else",
-                      *array(f"f{i}", data), "#endif"]
+                      f"#define f{i} (embedded_unpacked + {offset}u)"]
+            if not web_only:
+                lines += ["#else", *array(f"f{i}", data)]
+            lines.append("#endif")
         else:
+            if web_only:
+                lines.append("#ifdef __EMSCRIPTEN__")
             lines += array(f"f{i}", data)
+            if web_only:
+                lines.append("#endif")
+        if web_only:
+            table.append("#ifdef __EMSCRIPTEN__")
         table.append(f'  {{"{name}", f{i}, {len(data)}}},')
+        if web_only:
+            table.append("#endif")
     lines += ["", "const EmbeddedFile embedded_files[] = {", *table, "};"]
-    lines.append(f"const int embedded_file_count = {len(pairs)};")
+    lines.append("const int embedded_file_count = sizeof embedded_files / sizeof embedded_files[0];")
     lines += ["", "/* Called before installation and before any DOS EXEC byte match. */",
               "void embedded_files_init(void) {", "#ifdef __EMSCRIPTEN__",
               *initialize, "#endif", "}"]

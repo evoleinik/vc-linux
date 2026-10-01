@@ -35,8 +35,55 @@ def players(text):
 
 def dungeon(text, *, first_level=False):
     status = STATUS.search(text)
-    return bool(status and (not first_level or status[1] == "1")
-                and len(players(text)) == 1 and "." in text)
+    if not (status and (not first_level or status[1] == "1") and len(players(text)) == 1):
+        return False
+    # Monsters/items can cover every floor dot in a small room. Walls,
+    # doors and passages are also real map terrain; punctuation in the
+    # message/status rows must not make an incomplete screen look ready.
+    return any(char in ".#-|+" for line in text.splitlines()[1:]
+               if not STATUS.search(line) for char in line)
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("crowded-room", True),
+    ("visible-floor", True),
+    ("corridor", True),
+    ("missing-status", False),
+    ("missing-player", False),
+    ("two-players", False),
+    ("missing-terrain", False),
+    ("message-punctuation", False),
+    ("wrong-first-level", False),
+    ("deeper-level", True),
+])
+def test_rogue_dungeon_predicate_accepts_crowded_map_not_incomplete_screen(case, expected):
+    # Observed in the complete native gate: all eight floor cells in this
+    # small level-1 room were occupied by the player and seven monsters.
+    # Preserve that real map/status instead of fixing a random game seed.
+    rows = [" " * 80 for _ in range(25)]
+    room = ["-+--", "|S@|", "|IE|", "|IK|", "|SB|", "--+-"]
+    for row, line in enumerate(room, 8):
+        rows[row] = (" " * 72 + line).ljust(80)
+    rows[23] = "Level: 1  Gold: 0      Hp: 12(12)  Str: 16(16)  Arm: 4   Exp: 1/0".ljust(80)
+    if case == "visible-floor":
+        rows[9] = rows[9].replace("S", ".")
+    elif case == "corridor":
+        rows[8:14] = [" " * 80 for _ in range(6)]
+        rows[9] = (" " * 72 + "#@#").ljust(80)
+    elif case == "missing-status":
+        rows[23] = " " * 80
+    elif case == "missing-player":
+        rows[9] = rows[9].replace("@", "S")
+    elif case == "two-players":
+        rows[9] = rows[9].replace("S", "@")
+    elif case in ("missing-terrain", "message-punctuation"):
+        rows[8:14] = [line.translate(str.maketrans("-+|", "   ")) for line in rows[8:14]]
+        if case == "message-punctuation":
+            rows[0] = "Still loading... # - + |"
+    elif case in ("wrong-first-level", "deeper-level"):
+        rows[23] = rows[23].replace("Level: 1", "Level: 2")
+    text = "\n".join(rows)
+    assert dungeon(text, first_level=case != "deeper-level") is expected
 
 
 def game_state(text):
@@ -411,19 +458,29 @@ def test_rogue_read_only_directory_does_not_delay_qualifying_score(quick):
         assert not panels(session.text())
         started = time.monotonic()
         session.send("enter")
-        until(session, lambda: panels(session.text()) or session.poll() is not None, timeout=12)
+        # score() completes its lock/write attempt before death() presents
+        # this second, stdio prompt. Correct DOS CON handle input now waits
+        # for Return here; the old immediate-EOF bug happened to dismiss it.
+        def score_ready():
+            after_table = session.text().partition("Top ")[2]
+            return (re.search(rf"\b1\s+{gold}\s+Rogue:", after_table)
+                    and "[Press return to continue]" in after_table)
+
+        until(session, score_ready, timeout=12)
         elapsed = time.monotonic() - started
+        assert elapsed < 4.0, f"read-only score handling stalled for {elapsed:.2f}s"
+        assert session.poll() is None, session.log.read_text()
+        session.send("enter")
+        until(session, lambda: panels(session.text()) or session.poll() is not None, timeout=12)
         assert session.poll() is None, session.log.read_text()
         assert panels(session.text()), session.text()
-        # Without the lock delay the score table can disappear between tty
-        # reads: the final stdio prompt currently gets EOF from DOS CON.
-        # VC's saved DOS user screen retains the actual qualifying score.
+        # VC's saved DOS user screen retains the actual qualifying score
+        # after the real final prompt has been acknowledged.
         session.send(b"\x0f")  # Ctrl-O
         until(session, lambda: not panels(session.text()) and "Top " in session.text())
         assert re.search(rf"\b1\s+{gold}\s+Rogue:", session.text()), session.text()
         session.send(b"\x0f")
         until(session, lambda: panels(session.text()))
-        assert elapsed < 4.0, f"read-only score handling stalled for {elapsed:.2f}s"
         until(session, lambda: session.text() == session.memory_text())
         assert not score.exists() and not lock.exists()
 

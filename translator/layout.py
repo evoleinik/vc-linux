@@ -85,7 +85,7 @@ def _has_symbol(expr: str, names: set[str]) -> bool:
 
 
 def _is_uninitialized(expression: str) -> bool:
-    return expression == "?" or bool(re.fullmatch(r".+\bDUP\s*\(\s*\?\s*\)", expression, re.I))
+    return expression == "?" or bool(re.fullmatch(r".+\bDUP\s*\(\s*\?(?:\s*,\s*\?)*\s*\)", expression, re.I))
 
 
 def _match_bytes(row: ListingLine, relocatable: set[str]) -> tuple[int | None, ...]:
@@ -361,7 +361,9 @@ def _static_successors(record: Instruction, relocations: set[int], frame: int):
 def _decode_static_successors(image: LoadedImage, listing: Listing, bases: dict[str, int],
                               decoder, instructions: list[Instruction], *,
                               allow_data_overlaps: bool = False,
-                              return_skips: dict[int, int] | None = None) -> None:
+                              return_skips: dict[int, int] | None = None,
+                              segment_frames: dict[str, int] | None = None,
+                              terminal_offsets: set[int] | None = None) -> None:
     """Close listed code over static successors and the program entry point.
 
     DB bytes may be executable: VC.COM's RESIDENT banner runs at entry, and
@@ -389,9 +391,12 @@ def _decode_static_successors(image: LoadedImage, listing: Listing, bases: dict[
     frames = {}
     for name, base in bases.items():
         origin = _group_origin(listing.segments[name].group, bases, listing, image)
-        frames[name] = origin if origin is not None else base & ~15
+        frames[name] = (segment_frames[name] if segment_frames is not None else
+                        origin if origin is not None else base & ~15)
     pending = deque([entry])
     for record in instructions:
+        if terminal_offsets and record.off in terminal_offsets:
+            continue
         pending.extend(_static_successors(record, relocations, frames[record.line.segment]))
     while pending:
         off = pending.popleft()
@@ -429,7 +434,8 @@ def _decode_static_successors(image: LoadedImage, listing: Listing, bases: dict[
         instructions.append(record)
         starts.add(off)
         owners[off:off + insn.size] = [record] * insn.size
-        pending.extend(_static_successors(record, relocations, frames[row.segment]))
+        if not terminal_offsets or off not in terminal_offsets:
+            pending.extend(_static_successors(record, relocations, frames[row.segment]))
     instructions.sort(key=lambda record: record.off)
 
 

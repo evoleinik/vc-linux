@@ -23,6 +23,11 @@ include tools/bootlogo.mk
 include tools/rogue.mk
 include tools/vz.mk
 include tools/kermit.mk
+include tools/msdos.mk
+
+MSDOS_GEN := $(addprefix $(B)/gen/,$(addsuffix .c,$(MSDOS_PROGRAMS)))
+MSDOS_DATA := data/DOS.TXT third_party/msdos2/LICENSE
+MSDOS_EMBED := $(foreach p,$(MSDOS_PROGRAMS),$(MSDOS_$(p)_FILE)=$(B)/msdos2/$(MSDOS_$(p)_FILE)) DOS.TXT=data/DOS.TXT DOSLIC.TXT=third_party/msdos2/LICENSE
 
 VZ_DEF_DIR := third_party/vzeditor/VZ-IBM
 VZ_DEF_NAMES := VZFLE.DEF HELPE.DEF BLOCK.DEF PALET.DEF BW.DEF
@@ -69,6 +74,7 @@ $(B)/gen/vc_ovl.c: $(B)/VC.OVL $(B)/gen/VC.OVL.lst $(wildcard translator/*.py)
 
 gen: $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/vz.c
 gen: $(B)/gen/kermit.c
+gen: $(MSDOS_GEN)
 
 test-translator: gen
 	$(PY) -m pytest -q tests/test_translator_*.py
@@ -148,7 +154,7 @@ test-process: $(B)/test_rt_process
 # ---- the native binary -----------------------------------------------------
 RT_SRC := runtime/rt.c runtime/dos_core.c runtime/main.c runtime/cpu.c runtime/dos_fs.c \
           runtime/cp866.c runtime/bios.c runtime/term.c runtime/modem.c runtime/modem_transport.c
-GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/vz.c $(B)/gen/kermit.c $(B)/gen/files.c
+GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/vz.c $(B)/gen/kermit.c $(MSDOS_GEN) $(B)/gen/files.c
 GEN_OBJ := $(patsubst $(B)/gen/%.c,$(B)/obj/%.o,$(GEN_SRC))
 NATIVE_RT_SRC := $(RT_SRC) runtime/door.c runtime/door_confinement.c
 NATIVE_GEN_SRC := $(GEN_SRC) $(B)/gen/door_demo.c
@@ -158,10 +164,13 @@ $(B)/gen/files.c: $(B)/VC.COM $(B)/VC.OVL $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo
 
 KERMIT_DATA := data/BBS.TAK data/KERMIT.TXT third_party/mskermit/LICENSE
 KERMIT_EMBED := KERMIT.EXE=$(B)/kermit/KERMIT.EXE BBS.TAK=data/BBS.TAK KERMIT.TXT=data/KERMIT.TXT KERMLIC.TXT=third_party/mskermit/LICENSE
+# The same original H:\SRC files share the bounded startup LZMA stream.
+# Keep them out of native arrays and out of MEMFS's duplicate raw package.
+WEB_SOURCE_EMBED := --web-only=SRC/VC.ASM=asm/VC.ASM --web-only=SRC/VCOVL.ASM=asm/VCOVL.ASM
 
-$(B)/gen/files.c: $(B)/kermit/KERMIT.EXE $(KERMIT_DATA) translator/image.py
+$(B)/gen/files.c: $(B)/kermit/KERMIT.EXE $(KERMIT_DATA) $(MSDOS_IMAGES) $(MSDOS_DATA) translator/image.py asm/VC.ASM asm/VCOVL.ASM
 	@mkdir -p $(B)/gen
-	$(PY) tools/embed.py $@ VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL GWBASIC.EXE=$(B)/gwbasic/GWBASIC.EXE BOOTLOGO.COM=$(B)/bootlogo/LOGO.COM ROGUE.EXE=$(B)/rogue/ROGUE.EXE ROGUELIC.TXT=third_party/rogue/LICENSE.TXT PDCLIC.TXT=third_party/pdcurses/README.md OWLIC.TXT=$(B)/rogue/OWLIC.TXT $(VZ_EMBED) $(KERMIT_EMBED) VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT VC.HLP=data/VC.HLP
+	$(PY) tools/embed.py $@ VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL GWBASIC.EXE=$(B)/gwbasic/GWBASIC.EXE BOOTLOGO.COM=$(B)/bootlogo/LOGO.COM ROGUE.EXE=$(B)/rogue/ROGUE.EXE ROGUELIC.TXT=third_party/rogue/LICENSE.TXT PDCLIC.TXT=third_party/pdcurses/README.md OWLIC.TXT=$(B)/rogue/OWLIC.TXT $(VZ_EMBED) $(KERMIT_EMBED) $(MSDOS_EMBED) VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT VC.HLP=data/VC.HLP $(WEB_SOURCE_EMBED) $(WEB_GAME_EMBED)
 
 $(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h
 	@mkdir -p $(B)/obj
@@ -203,13 +212,16 @@ $(B)/vc-door-aarch64: $(DOOR_GEN_OBJ) $(DOOR_RT_OBJ)
 	$(DOOR_CC) -pthread -s -o $@ $(DOOR_GEN_OBJ) $(DOOR_RT_OBJ)
 
 BASIC_GAME_FILES := $(addprefix $(B)/games/,$(shell $(PY) tools/basic_games.py --names))
+WEB_GAME_EMBED := $(foreach f,$(BASIC_GAME_FILES),--web-only=GAMES/$(notdir $(f))=$(f))
+$(B)/gen/files.c: $(BASIC_GAME_FILES)
 $(BASIC_GAME_FILES) &: tools/basic_games.py $(wildcard third_party/basic-computer-games/*/*.bas) third_party/basic-computer-games/LICENSE
 	$(PY) tools/basic_games.py $(B)/games
 
 games: $(BASIC_GAME_FILES)
 
 test-e2e: $(B)/vc $(B)/vc-pipe-modem games
-	$(PY) -m pytest -q tests/test_e2e.py tests/test_gwbasic_e2e.py tests/test_install_e2e.py tests/test_command_e2e.py tests/test_logo_e2e.py tests/test_rogue_e2e.py tests/test_vz_e2e.py tests/test_kermit_e2e.py
+	$(PY) -m pytest -q tests/test_e2e.py tests/test_gwbasic_e2e.py tests/test_install_e2e.py tests/test_command_e2e.py tests/test_logo_e2e.py tests/test_rogue_e2e.py tests/test_vz_e2e.py tests/test_kermit_e2e.py tests/test_msdos_e2e.py
+	$(PY) -m pytest -q tests/test_command_nested_e2e.py tests/test_command_io_e2e.py
 
 test-ini: $(B)/VC.OVL
 	$(PY) -m pytest -q tests/test_setup_ini.py
@@ -222,6 +234,7 @@ test: test-kermit-build test-modem test-serial-machine test-modem-transport
 test: test-modem-transport-unit
 test: test-embed
 test: test-door-packaging
+test: test-msdos2-build
 
 test-embed:
 	$(PY) -m pytest -q tests/test_embed.py
@@ -258,7 +271,7 @@ test-door-confinement: $(B)/vc-door-confinement-test
 
 test-door: $(B)/vc $(B)/test_door_cleanup
 	./$(B)/test_door_cleanup
-	$(PY) -m pytest -q tests/test_door_e2e.py
+	$(PY) -m pytest -q tests/test_door_e2e.py tests/test_door_command.py
 
 test: test-door test-door-confinement test-door-memory
 
@@ -317,7 +330,7 @@ WEB_DEMO := $(WEB_WORK)/demo
 # PIC expands inlined translation helpers. Keeping them out of line makes
 # -O2 smaller than -Os/-Oz here without editing the generated C. Side modules
 # retain their ordinary -O2 build. Measurements are in the mobile plan.
-# 64 MiB covers the guard's 2N + 64 KiB for all five modules in any load order,
+# 64 MiB covers the guard's 2N + 64 KiB for all twelve modules in any load order,
 # with headroom. test-web prints that bound and fails if memory would grow.
 WEB_FLAGS := $(WEB_OPT) -flto -fno-inline-functions -sMALLOC=emmalloc -sMAIN_MODULE=2 -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 \
              -sSTACK_SIZE=1048576 -sINITIAL_MEMORY=67108864 -sALLOW_MEMORY_GROWTH=1 -sABORTING_MALLOC=0 \
@@ -328,7 +341,7 @@ WEB_FLAGS := $(WEB_OPT) -flto -fno-inline-functions -sMALLOC=emmalloc -sMAIN_MOD
 # would keep all of libc; linking side files into the main link would make
 # them eager dylink dependencies. tests/web_modules.mjs guards both choices.
 WEB_MAIN_SRC := $(RT_SRC) runtime/web_programs.c runtime/embed_lzma.c $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/files.c
-WEB_PROGRAMS := gwbasic bootlogo rogue vz kermit
+WEB_PROGRAMS := gwbasic bootlogo rogue vz kermit $(MSDOS_PROGRAMS)
 # Unversioned side binaries are build inputs only, never published. Their
 # content-derived generation hash is independent of the page's ?v= hash:
 # putting the latter into main's strings would create a circular hash.
@@ -338,6 +351,7 @@ WEB_BINARIES := $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm $(WEB_MODULES)
 WEB_SIDE_FLAGS := $(WEB_OPT) -sSIDE_MODULE=2 -std=gnu11 -Iruntime
 WEB_DEMO_INPUT := web/README.TXT web/README-RU.TXT web/BOOTLOGO.TXT web/GAMES/SPIRAL.BAS README.md asm/VC.ASM asm/VCOVL.ASM asm/LICENSE.TXT tools/web_demo.py tools/vz_defaults.py $(BASIC_GAME_FILES) $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/rogue/OWLIC.TXT third_party/rogue/LICENSE.TXT third_party/pdcurses/README.md $(B)/vz/VZ.COM $(VZ_DATA) third_party/gwbasic/LICENSE third_party/bootlogo/LICENSE
 WEB_DEMO_INPUT += $(B)/kermit/KERMIT.EXE $(KERMIT_DATA)
+WEB_DEMO_INPUT += $(MSDOS_IMAGES) $(MSDOS_DATA)
 
 # Native packaging calls the very same generator and uses the browser inputs.
 # It never invokes emcc and never embeds a separately curated demo file list.
@@ -347,11 +361,16 @@ $(B)/gen/door_demo.c: $(WEB_DEMO_INPUT) tools/door_demo.py tools/embed.py tools/
 
 WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT ПРОЧТИ.TXT HISTORY.TXT SRC/VC.ASM SRC/VCOVL.ASM SRC/LICENSE.TXT GWBASIC.EXE GWBASIC.TXT BOOTLOGO.COM BOOTLOGO.TXT LOGOLIC.TXT GAMES/SPIRAL.BAS GAMES/ROGUE.EXE GAMES/ROGUELIC.TXT GAMES/PDCLIC.TXT GAMES/OWLIC.TXT VZ.COM VZ.DEF $(VZ_DEF_NAMES) VZLIC.TXT) $(patsubst $(B)/games/%,$(WEB_DEMO)/GAMES/%,$(BASIC_GAME_FILES))
 WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,KERMIT.EXE BBS.TAK KERMIT.TXT KERMLIC.TXT)
+WEB_MSDOS_FILES := COMMAND.COM DOS/EDLIN.COM DOS/DEBUG.COM DOS/FIND.EXE DOS/MORE.COM DOS/SORT.EXE DOS/FC.EXE DOS/DOS.TXT DOS/DOSLIC.TXT
+WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,$(WEB_MSDOS_FILES))
 # main.c already installs these exact files from gen/files.c. Do not embed
 # a second copy in MEMFS's startup package. Keep the complete demo directory
 # for the packaging/content gates, including the byte-matched executables.
 WEB_INSTALLED := GWBASIC.EXE BOOTLOGO.COM GAMES/ROGUE.EXE GAMES/ROGUELIC.TXT GAMES/PDCLIC.TXT GAMES/OWLIC.TXT VZ.COM VZ.DEF $(VZ_DEF_NAMES) VZLIC.TXT
 WEB_INSTALLED += KERMIT.EXE BBS.TAK KERMIT.TXT KERMLIC.TXT
+WEB_INSTALLED += $(WEB_MSDOS_FILES)
+WEB_INSTALLED += SRC/VC.ASM SRC/VCOVL.ASM
+WEB_INSTALLED += $(patsubst $(B)/games/%,GAMES/%,$(BASIC_GAME_FILES))
 WEB_PACKED_FILES := $(filter-out $(addprefix $(WEB_DEMO)/,$(WEB_INSTALLED)),$(WEB_DEMO_FILES))
 # Emscripten 4.0.2's file_packager emits invalid assembler symbols for a
 # Cyrillic destination. Use an ASCII staging name, renamed before DOS starts.
@@ -377,7 +396,7 @@ $(WEB_SOURCE_INDEX): $(WEB_SOURCE_INPUTS)
 # Grouped targets keep both the demo preparation and the single emcc link safe
 # under make -j.
 $(WEB_DEMO_FILES) &: $(WEB_DEMO_INPUT)
-	$(PY) tools/web_demo.py $(WEB_DEMO) $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/vz/VZ.COM $(B)/kermit/KERMIT.EXE
+	$(PY) tools/web_demo.py $(WEB_DEMO) $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/vz/VZ.COM $(B)/kermit/KERMIT.EXE $(B)/msdos2
 
 $(WEB_MODULE_HEADER): $(WEB_MODULES) tools/web_modules.py
 	$(PY) tools/web_modules.py $(WEB_WORK) $(WEB_OUT)
@@ -408,6 +427,10 @@ $(WEB_WORK)/vz.wasm: $(B)/gen/vz.c runtime/cpu.h runtime/image.h Makefile
 $(WEB_WORK)/kermit.wasm: $(B)/gen/kermit.c runtime/cpu.h runtime/image.h Makefile
 	@mkdir -p $(WEB_WORK)
 	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_kermit"]' -o $@
+
+$(addprefix $(WEB_WORK)/,$(addsuffix .wasm,$(MSDOS_PROGRAMS))): $(WEB_WORK)/%.wasm: $(B)/gen/%.c runtime/cpu.h runtime/image.h Makefile
+	@mkdir -p $(WEB_WORK)
+	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_$*"]' -o $@
 
 $(WEB_OUT)/%: web/%
 	@mkdir -p $(dir $@)
@@ -449,5 +472,6 @@ test-web: web $(WEB_WORK)/source-runtime.mjs
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --fetch-failure
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --fetch-timeout
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --memory-limit
+	$(NODE) tests/web_command_fixes.mjs $(WEB_OUT)/vc.mjs
 
 .PHONY: web test-web

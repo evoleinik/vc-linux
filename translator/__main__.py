@@ -10,6 +10,7 @@ from .image import ImageError, load_image
 from .layout import LayoutError, build_layout
 from .listing import ListingError, parse_listing
 from .linked import build_linked_layout
+from .msdos import build_msdos_layout
 from .nasm import build_nasm_layout, parse_nasm_listing
 from .supplement import build_gwbasic_graphics_layout, emit_supplement
 
@@ -19,7 +20,7 @@ def main() -> int:
     parser.add_argument("image", type=Path)
     parser.add_argument("listing", type=Path, nargs="*")
     parser.add_argument("--map", type=Path, help="linker map for a multi-module EXE or flat COM")
-    parser.add_argument("--format", choices=("jwasm", "nasm", "watcom"), default="jwasm",
+    parser.add_argument("--format", choices=("jwasm", "nasm", "watcom", "msdos"), default="jwasm",
                         help="listing dialect (NASM requires -LefFt and a flat COM)")
     parser.add_argument("--watcom", type=Path, help="OpenWatcom root (otherwise WATCOM)")
     parser.add_argument("--supplement", choices=("gwbasic-graphics",),
@@ -37,6 +38,10 @@ def main() -> int:
             if args.map or len(args.listing) != 1:
                 parser.error("NASM requires one flat-COM listing, without --map")
             layout = build_nasm_layout(load_image(args.image), parse_nasm_listing(args.listing[0]))
+        elif args.format == "msdos":
+            if not args.map or not args.listing or args.supplement:
+                parser.error("MS-DOS requires JWasm listings and --map")
+            layout = build_msdos_layout(load_image(args.image), args.listing, args.map)
         elif args.map:
             layout = build_linked_layout(load_image(args.image), args.listing, args.map)
         elif len(args.listing) == 1:

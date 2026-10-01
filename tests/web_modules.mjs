@@ -83,17 +83,26 @@ for (const name of ['__asyncjs__fetch_program', '_dlopen_js', 'emscripten_sleep'
   assert.ok(mainImports.some((entry) => entry.name === name), `main implements its direct ${name} wait`);
 }
 
-const common = ['cpu', 'cpu_int', 'flags_get', 'flags_set', 'mem', 'rt_budget', 'rt_code_delta'];
+const minimal = ['cpu', 'cpu_int', 'mem', 'rt_budget', 'rt_code_delta'];
+const common = [...minimal, 'flags_get', 'flags_set'];
 const programs = [
   ['gwbasic', ['rt_halted', 'port_in8', 'port_out8'], ['run_gwbasic_graphics']],
   ['bootlogo', [], []],
   ['rogue', [], []],
   ['vz', ['port_in8', 'port_out8', 'rt_fault'], []],
   ['kermit', ['port_in8', 'port_out8', 'port_in16', 'port_out16'], []],
+  ['command', [], []],
+  ['edlin', [], []],
+  ['debug', ['port_in8', 'port_out8'], []],
+  // These smaller utilities never PUSHF/POPF or otherwise pack flags.
+  ['find', [], [], minimal],
+  ['more', [], [], minimal],
+  ['sort', ['rt_fault'], [], minimal],
+  ['fc', [], [], minimal],
 ];
 const linkerSymbols = new Set(['__memory_base', '__table_base', '__stack_pointer',
   '__indirect_function_table', 'memory']);
-for (const [name, extraImports, extraExports] of programs) {
+for (const [name, extraImports, extraExports, baseImports = common] of programs) {
   const side = await readModule(name);
   assert.deepEqual(dependencies(side, `${name}.wasm`, moduleSizes.get(name)), [],
     `${name} must not fetch another library`);
@@ -109,7 +118,7 @@ for (const [name, extraImports, extraExports] of programs) {
     assert.ok(!mainExports.has(entry.name), `${entry.name} must live only in its first-use side module`);
   }
   const hostImports = imports.filter((entry) => !linkerSymbols.has(entry.name));
-  assert.deepEqual(hostImports.map(({ name: symbol }) => symbol).sort(), [...common, ...extraImports].sort(),
+  assert.deepEqual(hostImports.map(({ name: symbol }) => symbol).sort(), [...baseImports, ...extraImports].sort(),
     `${name}: explicit shared CPU/runtime ABI`);
   for (const entry of hostImports) {
     assert.ok(['env', 'GOT.mem'].includes(entry.module), `${name}: no independent host instance`);
@@ -120,4 +129,4 @@ for (const [name, extraImports, extraExports] of programs) {
   assert.ok(imports.some((entry) => entry.name === '__indirect_function_table' && entry.kind === 'table'),
     `${name} shares the main indirect-call table`);
 }
-console.log('web modules: VC-only main, no eager libraries, shared host ABI, bounded side static memory, and five non-Asyncified sides passed');
+console.log(`web modules: VC-only main, no eager libraries, shared host ABI, bounded side static memory, and ${programs.length} non-Asyncified sides passed`);

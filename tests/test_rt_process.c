@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "bios.h"
 #include "hle.h"
+#include "guest_mem.h"
 #include "rt.h"
 #include "term.h"
 
@@ -19,8 +20,9 @@
 } } while (0)
 
 enum {
-    CHILD_FAULT, IRQ_FAULT, ROOT_FAULT, OVERLAY_FAULT,
+    CHILD_FAULT, IRQ_FAULT, ROOT_FAULT, OVERLAY_FAULT, CHILD_PSP_FAULT,
     CHILD_BREAK, DEFAULT_BREAK, BLOCKED_BREAK, HOOKED_BREAK, ROOT_BREAK,
+    IMAGE_RETURN,
 };
 static int scenario;
 static unsigned child_runs, child_irqs, parent_ticks, parent_breaks, steps, renders;
@@ -37,11 +39,13 @@ static char fixture_dir[] = "/tmp/vc-process-XXXXXX";
 static int parent_run(uint32_t off, uint16_t loadseg);
 static int basic_run(uint32_t off, uint16_t loadseg);
 static int overlay_run(uint32_t off, uint16_t loadseg);
+static int command_run(uint32_t off, uint16_t loadseg);
 /* Distinct bytes prevent the synthetic images from matching one another.
  * Their MZ headers identify files; Image supplies their load metadata. */
 static const uint8_t vc_file[256] = {[0 ... 255] = 0xa5};
 static const uint8_t ovl_file[272] = {'M', 'Z', 1, [16 ... 271] = 0xb6};
 static const uint8_t basic_file[272] = {'M', 'Z', 2, [16 ... 271] = 0xc7};
+static const uint8_t command_file[64] = {[0 ... 5] = 0xd8, [6] = 0xcd, [7] = 0x21, [8 ... 63] = 0xd8};
 const Image image_vc_com = {
     .name = "VC.COM", .bytes = vc_file, .size = sizeof vc_file, .run = parent_run,
 };
@@ -57,6 +61,15 @@ const Image image_bootlogo = {.name = "LOGO.COM"}; /* Not executed by this fixtu
 const Image image_rogue = {.name = "ROGUE.EXE"}; /* Not executed by this fixture. */
 const Image image_vz = {.name = "VZ.COM"}; /* Not executed by this fixture. */
 const Image image_kermit = {.name = "KERMIT.EXE"}; /* Not executed by this fixture. */
+const Image image_command = {
+    .name = "COMMAND.COM", .bytes = command_file, .size = sizeof command_file, .run = command_run,
+};
+const Image image_edlin = {.name = "EDLIN.COM"};
+const Image image_debug = {.name = "DEBUG.COM"};
+const Image image_find = {.name = "FIND.EXE"};
+const Image image_more = {.name = "MORE.COM"};
+const Image image_sort = {.name = "SORT.EXE"};
+const Image image_fc = {.name = "FC.EXE"};
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file},
@@ -326,7 +339,13 @@ static int basic_run(uint32_t off, uint16_t loadseg) {
         divisor(2, 2700);
         port_out8(0x61, 3);
         CHECK(rt_speaker_hz() > 0);
-        if (scenario >= CHILD_BREAK) {
+        if (scenario == CHILD_PSP_FAULT) {
+            port_out8(0x21, 0xff);
+            cpu.a.x = 0x5500;
+            cpu.d.x = child_allocation;
+            cpu.si = (uint16_t)(child_allocation + 0x10);
+            cpu_int(0x21, 0x20);
+        } else if (scenario >= CHILD_BREAK) {
             port_out8(0x21, 0xff);
             cpu.ifl = 1;
             child_busy = 1;
@@ -349,6 +368,11 @@ static int basic_run(uint32_t off, uint16_t loadseg) {
         }
         break;
     case 32:
+        if (scenario == CHILD_PSP_FAULT) {
+            CHECK(rd16(child_allocation, 0x16) == child_psp);
+            no_code();
+            break;
+        }
         CHECK(scenario != BLOCKED_BREAK); /* Break must never return a NUL. */
         CHECK(now_ns - last_input_poll <= 50000000ull);
         if (scenario == HOOKED_BREAK && child_breaks == 1) {
@@ -371,6 +395,34 @@ static int overlay_run(uint32_t off, uint16_t loadseg) {
     return 0;
 }
 
+static int command_run(uint32_t off, uint16_t loadseg) {
+    (void)loadseg;
+    if (off) return -1;
+    CHECK(scenario == IMAGE_RETURN);
+    rt_exited = 1;
+    return 0;
+}
+
+static void image_return_case(void) {
+    CHECK(!guest_write(0x80000, command_file, sizeof command_file));
+    rt_register_image(&image_command, 0x8000);
+    CHECK(rt_image_return("COMMAND.COM", 0x8000, 8) == &image_command);
+    CHECK(rt_image_return("COMMAND.COM", 0x7ff0, 0x108));
+    CHECK(!rt_image_return("GWBASIC.EXE", 0x8000, 8));
+    CHECK(!rt_image_return("COMMAND.COM", 0x8000, 0));
+    CHECK(!rt_image_return("COMMAND.COM", 0x8000, 0x100));
+    CHECK(!guest_move(0x90000, 0x80000, sizeof command_file));
+    CHECK(!rt_image_return("COMMAND.COM", 0x9000, 8)); /* Not an observed copy yet. */
+    cpu.cs = 0x9000; cpu.ip = 0;
+    rt_run(); /* The dispatcher records this moved, byte-matched copy. */
+    CHECK(rt_image_return("COMMAND.COM", 0x9000, 8) == &image_command);
+    wr8(0x9000, 7, 0x22);
+    CHECK(!rt_image_return("COMMAND.COM", 0x9000, 8));
+    CHECK(rt_image_return("COMMAND.COM", 0x8000, 8));
+    wr8(0x8000, 7, 0x22);
+    CHECK(!rt_image_return("COMMAND.COM", 0x8000, 8));
+}
+
 static int run_case(const char *name, int which, int expected) {
     fflush(NULL);
     pid_t child = fork();
@@ -384,6 +436,7 @@ static int run_case(const char *name, int which, int expected) {
         dos_core_init();
         dos_fs_init();
         bios_init();
+        if (which == IMAGE_RETURN) { image_return_case(); exit(0); }
         char executable[256];
         CHECK(snprintf(executable, sizeof executable, "%s/VC.COM", fixture_dir) > 0);
         dos_start(executable, (const uint8_t *)"", 0);
@@ -416,6 +469,8 @@ int main(void) {
     int failed = 0;
     failed += run_case("untranslated child restores parent", CHILD_FAULT, 0);
     failed += run_case("untranslated child IRQ restores parent", IRQ_FAULT, 0);
+    failed += run_case("untranslated AH55 descendant restores parent", CHILD_PSP_FAULT, 0);
+    failed += run_case("COMMAND INT returns in direct and moved copies", IMAGE_RETURN, 0);
     failed += run_case("root VC remains fatal", ROOT_FAULT, 70);
     failed += run_case("VC.OVL child remains fatal", OVERLAY_FAULT, 70);
     failed += run_case("Ctrl-Break stops child with inherited parent hook", CHILD_BREAK, 0);
@@ -430,6 +485,6 @@ int main(void) {
         CHECK(unlink(path) == 0);
     }
     CHECK(rmdir(fixture_dir) == 0);
-    printf("test_rt_process: 9 cases, %d failures\n", failed);
+    printf("test_rt_process: 11 cases, %d failures\n", failed);
     return failed ? 1 : 0;
 }

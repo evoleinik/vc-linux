@@ -1,0 +1,33 @@
+Repository: https://github.com/microsoft/MS-DOS
+Commit: 2d04cacc5322951f187bb17e017c12920ac8ebe2
+Imported: 2026-10-02, offline from build/msdos/ and its COMMIT file.
+Licence: MIT; LICENSE and README.md are verbatim upstream root files.
+
+source/ preserves the exact bytes of the original v2.0/source members needed
+for COMMAND.COM, EDLIN, DEBUG, FIND, MORE, SORT and FC, including COMLINK and
+the historical README.txt. bin/ preserves the seven corresponding v2.0/bin
+release files for comparison, not execution. SOURCES.sha256 pins both sets.
+No vendored source, line ending, embedded NUL, conditional assembly switch,
+message, or copyright notice is changed. Builds execute the source-built
+images, not the release binaries. Case-insensitive include aliases exist only
+in temporary build directories and contain identical bytes.
+
+There are 57 pinned upstream files: 46 assembly sources/includes, COMLINK,
+the release README.txt, seven release binaries, LICENSE and the root README.
+COMMAND's own revision is 2.11, so its DOSSYM.ASM/DOSMAC.ASM include names
+resolve to the unedited DOSSYM_v211.ASM/DOSMAC_v211.ASM files in the temporary
+build directory. The other six programs use the original unsuffixed files.
+TCODE2.ASM's Map_call reference requires the v211 international structure.
+The original COMSW switches select the TeleVideo/IBM-compatible build and
+its 2.11 copyright/banner text; none of that branding is rewritten.
+
+The repository is a historical source snapshot, not an exact release tree.
+source/README.txt explains that COMMAND's split-module sources do not
+correspond exactly to the release binary. The other sources also carry their
+own revision history; see IDENTITY.md for the measured comparison per program.
+
+Build-side loader metadata is explicit: COMMAND uses MZ-to-COM conversion;
+SORT uses EXEMOD-style e_maxalloc=1 so its separately allocated sorting
+buffer has free memory. Raw COMMAND.MZ and SORT.MZ remain build artifacts.
+SORT changes only header bytes 0Ch/0Dh, never instructions, initialized data,
+relocations, source, or the preserved release file; see IDENTITY.md and tests.

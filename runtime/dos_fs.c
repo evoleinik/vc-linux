@@ -4,6 +4,7 @@
 #include "hle.h"
 #include "dos_fs.h"
 #include "cp866.h"
+#include "guest_mem.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -24,7 +25,7 @@
 
 /* A DOS path is held separately from the process cwd. All host operations
  * receive absolute paths; in particular, this module never calls chdir(). */
-#define DOS_HANDLES 64
+#define DOS_HANDLES DOS_MAX_HANDLES
 #define SEARCH_SLOTS 128
 #define DOS_PATH_MAX 4096
 #define DOS_NAME_MAX 255
@@ -37,7 +38,7 @@
 #define ATTR_DIR 0x10
 #define ATTR_ARCHIVE 0x20
 
-enum { DEV_NONE, DEV_IN, DEV_OUT, DEV_AUX, DEV_PRN };
+enum { DEV_NONE, DEV_IN, DEV_OUT, DEV_AUX, DEV_PRN, DEV_CON, DEV_NUL };
 enum { DRIVE_C = 2, DRIVE_H = 7 };
 typedef struct {
     /* Empty root means absent. Both paths are absolute host spellings; cwd
@@ -48,6 +49,7 @@ typedef struct {
 typedef struct {
     int fd, device, access;
     unsigned mode, drive;
+    unsigned references; /* System file, shared by inherited PSP job tables. */
     uint32_t fcb_id; /* nonzero only for an FCB open; guards copied/stale FCBs */
     uint16_t fcb_owner;
     char path[PATH_MAX];
@@ -67,8 +69,9 @@ typedef struct {
     Entry *entries;
     size_t count, next;
     uint32_t generation;
-    uint16_t handle, mask;
-    bool active, lfn;
+    uint16_t handle, mask, owner;
+    unsigned drive;
+    bool active, lfn, fcb;
     char pattern[DOS_NAME_MAX + 1];
 } Search;
 
@@ -116,11 +119,15 @@ static uint32_t search_generation;
 static unsigned temp_sequence;
 static uint32_t fcb_sequence;
 static uint16_t fcb_process;
+static uint16_t closed_file_owner;
+static char closed_file_path[PATH_MAX];
 static struct timespec clock_delta;
 static bool initialized;
 static int door_root_fd = -1;
 static uint64_t door_quota, door_bytes, door_page = 4096;
 static unsigned door_entries;
+static char pipe_directory[PATH_MAX];
+static bool pipe_cleanup_registered;
 
 static int disk_space(bool extended);
 static int filesystem_info(void);
@@ -132,6 +139,48 @@ static void forget_birth(const struct stat *st);
 static int quota_truncate(int fd, off_t size);
 static void quota_release_entry(const struct stat *st);
 static bool inode_is_open(const struct stat *st);
+static int rename_paths(const char *old, char *target, const char *dos);
+
+static void cleanup_command_pipes(void)
+{
+    if (!*pipe_directory) return;
+    /* Only these exact runtime-owned names may be removed. The 0700
+     * mkdtemp directory is neither HOME nor a guest-supplied path. */
+    for (unsigned drive = 0; drive < DOS_DRIVES; drive++)
+        for (unsigned number = 1; number <= 2; number++) {
+            char file[PATH_MAX];
+            int n = snprintf(file, sizeof file, "%s/%c-PIPE%u", pipe_directory, 'A' + drive, number);
+            if (n > 0 && (size_t)n < sizeof file) (void)unlink(file);
+        }
+    (void)rmdir(pipe_directory);
+    pipe_directory[0] = 0;
+}
+
+/* COMMAND 2 writes these two fixed names at the drive root. Translate only
+ * those exact root names; ordinary files in subdirectories stay ordinary.
+ * A door already has a private root, and must never open anything in /tmp. */
+static int command_pipe_path(const char *name, unsigned drive, bool missing, char out[PATH_MAX])
+{
+    if (door_root_fd >= 0) return 0;
+    bool rooted = *name == '\\' || *name == '/';
+    if (!rooted && strcmp(drives[drive].cwd, drives[drive].root)) return 0;
+    while (*name == '\\' || *name == '/') name++;
+    unsigned number = !strcasecmp(name, "%PIPE1.$$$") ? 1 :
+                      !strcasecmp(name, "%PIPE2.$$$") ? 2 : 0;
+    if (!number) return 0;
+    if (!*pipe_directory) {
+        if (!missing) return -2;
+        char directory[] = "/tmp/vc-dos-pipe-XXXXXX";
+        if (!mkdtemp(directory)) return -5;
+        strcpy(pipe_directory, directory);
+        if (!pipe_cleanup_registered) {
+            if (atexit(cleanup_command_pipes)) { cleanup_command_pipes(); return -8; }
+            pipe_cleanup_registered = true;
+        }
+    }
+    int n = snprintf(out, PATH_MAX, "%s/%c-PIPE%u", pipe_directory, 'A' + drive, number);
+    return n > 0 && n < PATH_MAX ? 1 : -3;
+}
 
 static bool drive_present(unsigned drive)
 {
@@ -1167,6 +1216,8 @@ static int resolve_path(const char *dos, char out[PATH_MAX], bool allow_missing)
     unsigned drive;
     int error = path_drive(&p, &drive);
     if (error) return error;
+    int pipe = command_pipe_path(p, drive, allow_missing, out);
+    if (pipe) return pipe < 0 ? -pipe : 0;
     const DosDrive *d = drives + drive;
     strcpy(out, (*p == '/' || *p == '\\') ? d->root : d->cwd);
     if (door_root_fd >= 0) {
@@ -1622,7 +1673,7 @@ static Search *classic_search(void)
     if (!slot || slot > SEARCH_SLOTS) return NULL;
     Search *s = searches + slot - 1;
     uint32_t check = get32(dta_seg, (uint16_t)(dta_off + 2));
-    if (!s->active || s->lfn || check != (s->generation ^ UINT32_C(0x44544121)) ||
+    if (!s->active || s->lfn || s->fcb || check != (s->generation ^ UINT32_C(0x44544121)) ||
         get32(dta_seg, (uint16_t)(dta_off + 6)) != ~check) return NULL;
     return s;
 }
@@ -1707,7 +1758,7 @@ static int find_first(bool lfn)
     Search *s = searches + slot;
     error = snapshot(dir, drive, &s->entries, &s->count);
     if (error) return error;
-    s->next = 0; s->mask = cpu.c.x; s->lfn = lfn; s->active = true;
+    s->next = 0; s->mask = cpu.c.x; s->lfn = lfn; s->fcb = false; s->active = true;
     s->generation = ++search_generation;
     s->handle = (uint16_t)(0x8000 | ((s->generation & 0x7f) << 7) | slot);
     if (s->handle == 0xffff) {
@@ -1772,6 +1823,7 @@ static int close_handle(unsigned n)
 {
     DosHandle *h = get_handle(n);
     if (!h) return 6;
+    if (h->references > 1) { --h->references; return 0; }
     struct stat st;
     bool unlinked = h->fd >= 0 && !fstat(h->fd, &st) && !st.st_nlink;
     int error = h->fd >= 0 && close(h->fd) < 0 ? dos_errno(errno) : 0;
@@ -1783,6 +1835,89 @@ static int close_handle(unsigned n)
     return error;
 }
 
+/* DOS 2's COMMAND.COM moves SFT indices inside PSP:18h to implement
+ * redirection. Always read those bytes, not a cached host-side mapping.
+ * The standalone file tests (and DOS 1 FCB clients) need no PSP. */
+static bool has_jft(uint16_t psp)
+{
+    return psp && rd16(psp, 0) == 0x20CD;
+}
+
+static uint32_t jft_entry(uint16_t psp, unsigned number)
+{
+    unsigned count = rd16(psp, 0x32);
+    uint32_t base = lin(rd16(psp, 0x36), rd16(psp, 0x34));
+    if (count > DOS_HANDLES || number >= count || !guest_span(base, count)) return UINT32_MAX;
+    return base + number;
+}
+
+static unsigned system_handle(unsigned number)
+{
+    if (!has_jft(fcb_process)) return number;
+    uint32_t at = jft_entry(fcb_process, number);
+    return at == UINT32_MAX ? DOS_HANDLES : mem[at];
+}
+
+static DosHandle *dos_handle(unsigned number)
+{
+    return get_handle(system_handle(number));
+}
+
+static int unused_jfn(void)
+{
+    if (!has_jft(fcb_process)) return unused_handle();
+    for (unsigned i = 0; i < DOS_HANDLES; ++i) {
+        uint32_t at = jft_entry(fcb_process, i);
+        if (at == UINT32_MAX) break;
+        if (mem[at] == 0xFF) return (int)i;
+    }
+    return -1;
+}
+
+static int publish_handle(unsigned slot)
+{
+    if (!has_jft(fcb_process)) return 0;
+    int number = unused_jfn();
+    if (number < 0) { close_handle(slot); return 4; }
+    mem[jft_entry(fcb_process, (unsigned)number)] = (uint8_t)slot;
+    cpu.a.x = (uint16_t)number;
+    return 0;
+}
+
+static int close_dos_handle(unsigned number)
+{
+    unsigned slot = system_handle(number);
+    DosHandle *h = get_handle(slot);
+    if (!h) return 6;
+    if (!h->device) {
+        closed_file_owner = fcb_process;
+        snprintf(closed_file_path, sizeof closed_file_path, "%s", h->path);
+    }
+    if (has_jft(fcb_process)) mem[jft_entry(fcb_process, number)] = 0xFF;
+    return close_handle(slot);
+}
+
+int dos_fs_take_closed_file(uint16_t owner, char *path, size_t capacity)
+{
+    int found = owner == closed_file_owner && *closed_file_path && strlen(closed_file_path) < capacity;
+    if (found) memcpy(path, closed_file_path, strlen(closed_file_path) + 1);
+    closed_file_path[0] = 0;
+    return found;
+}
+
+void dos_fs_inherit_process(uint16_t child, uint16_t parent)
+{
+    if (!parent || !has_jft(parent)) return;
+    for (unsigned i = 0; i < 20; ++i) {
+        uint32_t source = jft_entry(parent, i), target = jft_entry(child, i);
+        unsigned slot = source == UINT32_MAX ? DOS_HANDLES : mem[source];
+        DosHandle *h = get_handle(slot);
+        if (target == UINT32_MAX) break;
+        if (!h || (h->mode & 0x80)) mem[target] = 0xFF;
+        else { mem[target] = (uint8_t)slot; ++h->references; }
+    }
+}
+
 void dos_fs_set_process(uint16_t psp)
 {
     fcb_process = psp;
@@ -1790,8 +1925,18 @@ void dos_fs_set_process(uint16_t psp)
 
 void dos_fs_close_process(uint16_t psp)
 {
+    if (has_jft(psp))
+        for (unsigned i = 0; i < DOS_HANDLES; ++i) {
+            uint32_t at = jft_entry(psp, i);
+            if (at == UINT32_MAX) break;
+            if (get_handle(mem[at])) close_handle(mem[at]);
+            mem[at] = 0xFF;
+        }
     for (unsigned i = 0; i < DOS_HANDLES; i++)
         if (handles[i].fcb_id && handles[i].fcb_owner == psp) close_handle(i);
+    for (unsigned i = 0; i < SEARCH_SLOTS; i++)
+        if (searches[i].active && searches[i].fcb && searches[i].owner == psp)
+            release_search(searches + i);
     dos_fs_release_process_paths(psp);
 }
 
@@ -1910,12 +2055,22 @@ static int open_path(const char *path, unsigned drive, unsigned mode,
     }
     DosHandle *h = handles + slot;
     h->fd = fd; h->device = DEV_NONE; h->access = mode & 3; h->mode = mode;
+    h->references = 1;
     h->drive = drive;
     strcpy(h->path, path);
     if (lease) lease->recreate = false;
     cpu.a.x = (uint16_t)slot;
     cpu.c.x = !exists ? 2 : if_exists == 2 ? 3 : 1;
     return 0;
+}
+
+static unsigned named_device(const char *name)
+{
+    const char *leaf = name;
+    for (const char *p = name; *p; p++) if (*p == '/' || *p == '\\') leaf = p + 1;
+    size_t stem = strcspn(leaf, ".");
+    return stem == 3 && !strncasecmp(leaf, "NUL", 3) ? DEV_NUL :
+           stem == 3 && !strncasecmp(leaf, "CON", 3) ? DEV_CON : DEV_NONE;
 }
 
 static int open_file(uint16_t off, unsigned mode, unsigned attributes, unsigned action, bool extended)
@@ -1925,12 +2080,34 @@ static int open_file(uint16_t off, unsigned mode, unsigned attributes, unsigned 
     char dos[DOS_PATH_MAX], path[PATH_MAX];
     int error = read_string(cpu.ds, off, dos, sizeof(dos));
     if (error) return error;
+    /* DOS device names are case-insensitive, may have an ignored extension,
+     * and can end in a colon. Device recognition precedes file creation, so
+     * redirection can never create/truncate a host file named NUL. */
+    size_t length = strlen(dos);
+    bool device_colon = length > 2 && dos[length - 1] == ':';
+    if (device_colon) dos[length - 1] = 0;
     const char *name = dos;
     unsigned drive;
     error = path_drive(&name, &drive);
-    if (error || (error = resolve_path(dos, path, (action & 0x10) != 0))) return error;
+    if (error) return error;
+    unsigned device = named_device(name);
+    if (device_colon && !device) return 3;
+    /* Reserve capacity before open_path can create or truncate anything.
+     * The PSP table can fill while the larger system table still has room. */
+    if (unused_jfn() < 0) return 4;
+    if (device) {
+        int slot = unused_handle();
+        if (slot < 0) return 4;
+        handles[slot] = (DosHandle){.fd = -1, .device = (int)device,
+            .access = (int)(mode & 3), .mode = mode, .drive = drive, .references = 1};
+        cpu.a.x = (uint16_t)slot;
+        if (extended) cpu.c.x = 1;
+        return publish_handle((unsigned)slot);
+    }
+    if ((error = resolve_path(dos, path, (action & 0x10) != 0))) return error;
     uint16_t saved_cx = cpu.c.x;
     error = open_path(path, drive, mode, attributes, action);
+    if (!error) error = publish_handle(cpu.a.x);
     if (!extended) cpu.c.x = saved_cx;
     return error;
 }
@@ -1940,6 +2117,108 @@ static int open_file(uint16_t off, unsigned mode, unsigned attributes, unsigned 
 static uint16_t fcb_offset(uint16_t seg, uint16_t off)
 {
     return rd8(seg, off) == 0xff ? (uint16_t)(off + 7) : off;
+}
+
+/* DOS 1.x searches keep continuation state in the caller's FCB, not the
+ * output DTA. A generation-tagged token supports copied FCBs without trusting
+ * guest pointers, and cannot resume another process's search. */
+static Search *fcb_search(uint16_t seg, uint16_t off)
+{
+    unsigned slot = rd16(seg, (uint16_t)(off + 12));
+    if (!slot || slot > SEARCH_SLOTS) return NULL;
+    Search *s = searches + slot - 1;
+    uint32_t check = get32(seg, (uint16_t)(off + 14));
+    if (!s->active || !s->fcb || s->owner != fcb_process ||
+        check != (s->generation ^ UINT32_C(0x46434221)) ||
+        get32(seg, (uint16_t)(off + 18)) != ~check) return NULL;
+    return s;
+}
+
+static void fcb_find_entry(const Entry *e, const Search *s, bool extended)
+{
+    uint16_t out = dta_off;
+    zero_mem(dta_seg, out, extended ? 40 : 33);
+    if (extended) {
+        wr8(dta_seg, out, 0xff);
+        wr8(dta_seg, (uint16_t)(out + 6), (uint8_t)s->mask);
+        out = (uint16_t)(out + 7);
+    }
+    wr8(dta_seg, out++, (uint8_t)(s->drive + 1));
+    for (unsigned i = 0; i < 11; i++) wr8(dta_seg, (uint16_t)(out + i), ' ');
+    const char *dot = e->alias[0] == '.' ? NULL : strchr(e->alias, '.');
+    size_t name = dot ? (size_t)(dot - e->alias) : strlen(e->alias);
+    for (size_t i = 0; i < name && i < 8; i++)
+        wr8(dta_seg, (uint16_t)(out + i), (uint8_t)e->alias[i]);
+    if (dot)
+        for (size_t i = 0; dot[i + 1] && i < 3; i++)
+            wr8(dta_seg, (uint16_t)(out + 8 + i), (uint8_t)dot[i + 1]);
+    wr8(dta_seg, (uint16_t)(out + 11), (uint8_t)e->attr);
+    uint16_t tt, dt;
+    pack_time(e->st.st_mtim, &tt, &dt);
+    wr16(dta_seg, (uint16_t)(out + 22), tt);
+    wr16(dta_seg, (uint16_t)(out + 24), dt);
+    uint64_t size = S_ISDIR(e->st.st_mode) || e->st.st_size < 0 ? 0 : (uint64_t)e->st.st_size;
+    put32(dta_seg, (uint16_t)(out + 28), size > UINT32_MAX ? UINT32_MAX : (uint32_t)size);
+}
+
+static uint8_t fcb_find(uint16_t seg, uint16_t off, bool first, bool extended)
+{
+    Search *s = fcb_search(seg, off);
+    if (first) {
+        if (s) release_search(s);
+        unsigned d = rd8(seg, off), drive = d ? d - 1 : current_drive;
+        if (!drive_present(drive)) return 0xff;
+        char pattern[13];
+        size_t n = 0;
+        for (unsigned part = 0; part < 2; part++) {
+            unsigned width = part ? 3 : 8, begin = part ? 9 : 1, used = width;
+            while (used && rd8(seg, (uint16_t)(off + begin + used - 1)) == ' ') used--;
+            if (!part && !used) return 0xff;
+            if (part && used) pattern[n++] = '.';
+            for (unsigned i = 0; i < used; i++) {
+                uint8_t c = rd8(seg, (uint16_t)(off + begin + i));
+                if (!c || strchr("\\/:\"<>|", c)) return 0xff;
+                pattern[n++] = (char)c;
+            }
+        }
+        pattern[n] = 0;
+        /* DOS directory lookup recognizes literal device names without
+         * making them entries in wildcard directory listings. COMMAND's
+         * COPY still does this FCB lookup after opening/IOCTL-ing CON. */
+        if (!strpbrk(pattern, "?*") && named_device(pattern)) {
+            Entry device = {.attr = 0x40, .have_stat = true, .st = {.st_mode = S_IFCHR}};
+            memcpy(device.alias, pattern, n + 1);
+            Search result = {.drive = drive,
+                .mask = extended ? rd8(seg, (uint16_t)(off - 1)) : 0};
+            zero_mem(seg, (uint16_t)(off + 12), 10); /* A device has no find-next. */
+            fcb_find_entry(&device, &result, extended);
+            return 0;
+        }
+        unsigned slot;
+        for (slot = 0; slot < SEARCH_SLOTS && searches[slot].active; slot++) {}
+        if (slot == SEARCH_SLOTS) return 0xff;
+        s = searches + slot;
+        if (snapshot(drives[drive].cwd, drive, &s->entries, &s->count)) return 0xff;
+        s->next = 0; s->active = true; s->fcb = true; s->lfn = false;
+        s->owner = fcb_process; s->drive = drive;
+        s->mask = extended ? rd8(seg, (uint16_t)(off - 1)) : 0;
+        s->generation = ++search_generation;
+        strcpy(s->pattern, pattern);
+        wr16(seg, (uint16_t)(off + 12), (uint16_t)(slot + 1));
+        uint32_t check = s->generation ^ UINT32_C(0x46434221);
+        put32(seg, (uint16_t)(off + 14), check);
+        put32(seg, (uint16_t)(off + 18), ~check);
+    }
+    if (!s) return 0xff;
+    while (s->next < s->count) {
+        Entry *e = s->entries + s->next++;
+        if (!e->have_stat || !attributes_match(e->attr, s->mask, false) ||
+            !classic_match(s->pattern, e->alias)) continue;
+        fcb_find_entry(e, s, extended);
+        return 0;
+    }
+    release_search(s);
+    return 0xff;
 }
 
 static int fcb_path(uint16_t seg, uint16_t off, char *host, bool missing, unsigned *drive)
@@ -2022,6 +2301,98 @@ static uint8_t fcb_close(uint16_t seg, uint16_t off)
     if (!fstat(h->fd, &st)) fcb_metadata(seg, off, &st);
     zero_mem(seg, (uint16_t)(off + 24), 8);
     return close_handle(slot) ? 0xff : 0;
+}
+
+static int fcb_pattern(uint16_t seg, uint16_t off, char pattern[13])
+{
+    size_t count = 0;
+    for (unsigned part = 0; part < 2; part++) {
+        unsigned width = part ? 3 : 8, start = part ? 9 : 1;
+        unsigned used = width;
+        while (used && rd8(seg, (uint16_t)(off + start + used - 1)) == ' ') used--;
+        if (!part && !used) return 2;
+        if (part && used) pattern[count++] = '.';
+        for (unsigned i = 0; i < used; i++) {
+            uint8_t c = rd8(seg, (uint16_t)(off + start + i));
+            if (!c || strchr("\\/:\"<>|", c)) return 2;
+            pattern[count++] = (char)c;
+        }
+    }
+    pattern[count] = 0;
+    return 0;
+}
+
+static int fcb_rename_target(uint16_t seg, uint16_t off, unsigned drive,
+                             const char *alias, char target[PATH_MAX])
+{
+    char field[11];
+    memset(field, ' ', sizeof field);
+    const char *dot = strchr(alias, '.');
+    size_t name = dot ? (size_t)(dot - alias) : strlen(alias);
+    if (name > 8 || (dot && strlen(dot + 1) > 3)) return 2;
+    memcpy(field, alias, name);
+    if (dot) memcpy(field + 8, dot + 1, strlen(dot + 1));
+    for (unsigned i = 0; i < sizeof field; i++) {
+        uint8_t c = rd8(seg, (uint16_t)(off + 17 + i));
+        if (!c || strchr("*\\/:.\"<>|", c)) return 2;
+        /* FCB rename copies exactly this padded 8.3 position, not a
+         * variable-length glob capture. In particular '?' can copy blank. */
+        if (c != '?') field[i] = (char)c;
+    }
+    char dos[16] = {(char)('A' + drive), ':'};
+    size_t count = 2;
+    for (unsigned part = 0; part < 2; part++) {
+        unsigned width = part ? 3 : 8, start = part ? 8 : 0, used = width;
+        while (used && field[start + used - 1] == ' ') used--;
+        if (!part && !used) return 2;
+        if (part && used) dos[count++] = '.';
+        memcpy(dos + count, field + start, used);
+        count += used;
+    }
+    dos[count] = 0;
+    return resolve_path(dos, target, true);
+}
+
+static uint8_t fcb_mutate(uint16_t seg, uint16_t off, bool rename, bool extended)
+{
+    unsigned raw = rd8(seg, off), drive = raw ? raw - 1 : current_drive;
+    if (!drive_present(drive)) return 0xff;
+    if (rename) {
+        raw = rd8(seg, (uint16_t)(off + 16));
+        /* An unqualified new name belongs to the old file's drive, even
+         * when a drive-qualified source is not on the current drive. */
+        if (raw && raw - 1 != drive) return 0xff;
+    }
+    char pattern[13];
+    if (fcb_pattern(seg, off, pattern)) return 0xff;
+    Entry *entries;
+    size_t count;
+    if (snapshot(drives[drive].cwd, drive, &entries, &count)) return 0xff;
+    unsigned mask = extended ? rd8(seg, (uint16_t)(off - 1)) : 0;
+    uint8_t status = 0xff;
+    for (size_t i = 0; i < count; i++) {
+        Entry *entry = entries + i;
+        if (!entry->have_stat || !S_ISREG(entry->st.st_mode) ||
+            !attributes_match(entry->attr, (uint16_t)mask, false) ||
+            !classic_match(pattern, entry->alias)) continue;
+        char path[PATH_MAX], target[PATH_MAX];
+        struct stat st;
+        int error = join_path(drives[drive].cwd, entry->host, path, sizeof path);
+        if (!error) error = file_stat(path, &st);
+        if (!error && (!S_ISREG(st.st_mode) || !(st.st_mode & S_IWUSR))) error = 5;
+        if (!error && rename) {
+            error = fcb_rename_target(seg, off, drive, entry->alias, target);
+            if (!error) error = rename_paths(path, target, "");
+        } else if (!error) {
+            if (inode_is_open(&st)) error = 5;
+            else if (fs_unlink(path, false)) error = dos_errno(errno);
+            else forget_birth(&st);
+        }
+        if (error) { status = 0xff; break; }
+        status = 0;
+    }
+    free_entries(entries, count);
+    return status;
 }
 
 static uint32_t fcb_record(uint16_t seg, uint16_t off, bool random, uint16_t size)
@@ -2157,6 +2528,10 @@ static void fcb_call(uint8_t function)
         saved.si = cpu.si;
     } else if (function == 0x0f || function == 0x16) status = fcb_open(seg, off, function == 0x16);
     else if (function == 0x10) status = fcb_close(seg, off);
+    else if (function == 0x11 || function == 0x12)
+        status = fcb_find(seg, off, function == 0x11, rd8(seg, cpu.d.x) == 0xff);
+    else if (function == 0x13 || function == 0x17)
+        status = fcb_mutate(seg, off, function == 0x17, rd8(seg, cpu.d.x) == 0xff);
     else if (function == 0x14 || function == 0x15 || function == 0x21 || function == 0x22 ||
              function == 0x27 || function == 0x28) {
         status = fcb_transfer(seg, off, function, &count);
@@ -2164,19 +2539,14 @@ static void fcb_call(uint8_t function)
     } else if (function == 0x24) {
         put32(seg, (uint16_t)(off + 33), fcb_record(seg, off, false, 0));
         status = 0;
-    } else if (function == 0x23 || function == 0x13) {
+    } else if (function == 0x23) {
         char path[PATH_MAX];
         unsigned drive;
         if (!fcb_path(seg, off, path, false, &drive)) {
             struct stat st;
             if (!file_stat(path, &st) && S_ISREG(st.st_mode)) {
-                if (function == 0x23) {
-                    uint16_t size = rd16(seg, (uint16_t)(off + 14));
-                    if (size) { put32(seg, (uint16_t)(off + 33), (uint32_t)(((uint64_t)st.st_size + size - 1) / size)); status = 0; }
-                } else if ((st.st_mode & S_IWUSR) && !inode_is_open(&st) && !fs_unlink(path, false)) {
-                    forget_birth(&st);
-                    status = 0;
-                }
+                uint16_t size = rd16(seg, (uint16_t)(off + 14));
+                if (size) { put32(seg, (uint16_t)(off + 33), (uint32_t)(((uint64_t)st.st_size + size - 1) / size)); status = 0; }
             }
         }
     }
@@ -2187,10 +2557,16 @@ static void fcb_call(uint8_t function)
 
 static int read_file(void)
 {
-    DosHandle *h = get_handle(cpu.b.x);
+    DosHandle *h = dos_handle(cpu.b.x);
     if (!h) return 6;
     if (h->access == 1) return 5;
-    if (h->device != DEV_NONE || !cpu.c.x) { cpu.a.x = 0; return 0; }
+    if (!cpu.c.x) { cpu.a.x = 0; return 0; }
+    if (h->device == DEV_IN || h->device == DEV_CON) {
+        cpu.cf = 0;
+        (void)dos_con_int21();
+        return cpu.cf ? cpu.a.x : 0;
+    }
+    if (h->device != DEV_NONE) { cpu.a.x = 0; return 0; }
     uint8_t buffer[UINT16_MAX];
     ssize_t n;
     do { n = read(h->fd, buffer, cpu.c.x); } while (n < 0 && errno == EINTR);
@@ -2202,7 +2578,7 @@ static int read_file(void)
 
 static int write_file(void)
 {
-    DosHandle *h = get_handle(cpu.b.x);
+    DosHandle *h = dos_handle(cpu.b.x);
     if (!h) return 6;
     if (h->access == 0) return 5;
     uint16_t count = cpu.c.x;
@@ -2218,7 +2594,7 @@ static int write_file(void)
     uint8_t buffer[UINT16_MAX];
     for (unsigned i = 0; i < count; ++i) buffer[i] = rd8(cpu.ds, (uint16_t)(cpu.d.x + i));
     if (h->device != DEV_NONE) {
-        if (h->device == DEV_OUT) con_write(buffer, count);
+        if (h->device == DEV_OUT || h->device == DEV_CON) con_write(buffer, count);
         cpu.a.x = count;
         return 0;
     }
@@ -2233,7 +2609,7 @@ static int write_file(void)
 static int seek_file(void)
 {
     if (cpu.a.l > 2) return 1;
-    DosHandle *h = get_handle(cpu.b.x);
+    DosHandle *h = dos_handle(cpu.b.x);
     if (!h) return 6;
     if (h->device != DEV_NONE) { cpu.a.x = cpu.d.x = 0; return 0; }
     uint32_t offset = (uint32_t)cpu.c.x << 16 | cpu.d.x;
@@ -2248,27 +2624,33 @@ static int seek_file(void)
 
 static int duplicate_handle(bool forced)
 {
-    DosHandle *source = get_handle(cpu.b.x);
+    DosHandle *source = dos_handle(cpu.b.x);
     if (!source) return 6;
-    int slot = forced ? cpu.c.x : unused_handle();
+    int number = forced ? cpu.c.x : unused_jfn();
+    if (number < 0) return 4;
+    if (number >= DOS_HANDLES || (has_jft(fcb_process) &&
+        jft_entry(fcb_process, (unsigned)number) == UINT32_MAX)) return 6;
+    if (number == cpu.b.x) { cpu.a.x = (uint16_t)number; return 0; }
+    int slot = has_jft(fcb_process) ? unused_handle() : number;
     if (slot < 0) return 4;
-    if (slot >= DOS_HANDLES) return 6;
-    if (slot == cpu.b.x) { cpu.a.x = (uint16_t)slot; return 0; }
     int fd = -1;
     if (source->fd >= 0) {
         fd = fcntl(source->fd, F_DUPFD_CLOEXEC, 0);
         if (fd < 0) return dos_errno(errno);
     }
-    if (get_handle((unsigned)slot)) close_handle((unsigned)slot);
-    handles[slot] = *source;
+    DosHandle copy = *source;
+    if (dos_handle((unsigned)number)) close_dos_handle((unsigned)number);
+    handles[slot] = copy;
     handles[slot].fd = fd;
-    cpu.a.x = (uint16_t)slot;
+    handles[slot].references = 1;
+    if (has_jft(fcb_process)) mem[jft_entry(fcb_process, (unsigned)number)] = (uint8_t)slot;
+    cpu.a.x = (uint16_t)number;
     return 0;
 }
 
 static int flush_handle(void)
 {
-    DosHandle *h = get_handle(cpu.b.x);
+    DosHandle *h = dos_handle(cpu.b.x);
     if (!h) return 6;
     return h->fd >= 0 && fsync(h->fd) < 0 ? dos_errno(errno) : 0;
 }
@@ -2284,11 +2666,12 @@ static int ioctl_call(void)
         return 0;
     }
     if (sub != 0 && sub != 1 && sub != 6 && sub != 7) return 1;
-    DosHandle *h = get_handle(cpu.b.x);
+    DosHandle *h = dos_handle(cpu.b.x);
     if (!h) return 6;
     if (!sub) {
         if (h->device) cpu.d.x = (uint16_t)(0x80 | (h->mode & 0x20) |
-            (h->device == DEV_IN ? 1 : h->device == DEV_OUT ? 2 : 0));
+            (h->device == DEV_IN ? 1 : h->device == DEV_OUT ? 2 :
+             h->device == DEV_CON ? 3 : h->device == DEV_NUL ? 4 : 0));
         else cpu.d.x = (uint16_t)h->drive;
     } else if (sub == 1) {
         if (!h->device || cpu.d.h) return 1;
@@ -2351,7 +2734,7 @@ static int attributes_call(unsigned sub, bool lfn)
 static int handle_time(unsigned sub)
 {
     if (sub > 1) return 1; /* includes the explicitly unsupported 5702..5707 */
-    DosHandle *h = get_handle(cpu.b.x);
+    DosHandle *h = dos_handle(cpu.b.x);
     if (!h) return 6;
     if (h->device) return 1;
     if (!sub) {
@@ -2575,8 +2958,13 @@ static int rename_file(void)
     if (error) return error;
     error = read_string(cpu.es, cpu.di, dos, sizeof(dos));
     if (error || (error = resolve_path(dos, target, true))) return error;
+    return rename_paths(old, target, dos);
+}
+
+static int rename_paths(const char *old, char *target, const char *dos)
+{
     struct stat st;
-    error = file_stat(old, &st);
+    int error = file_stat(old, &st);
     if (error) return error;
     if (!(st.st_mode & S_IWUSR)) return 5;
     /* A drive root (or its ancestor reached through C:) must stay in place. */
@@ -2604,7 +2992,7 @@ static int rename_file(void)
         if (!lossless || !*leaf || !cp_equal(leaf, old_dos)) return 0;
         error = cp_to_utf8(leaf, utf8, sizeof(utf8));
         strcpy(parent, old); parent_path(parent);
-        if (error || (error = join_path(parent, utf8, target, sizeof(target)))) return error;
+        if (error || (error = join_path(parent, utf8, target, PATH_MAX))) return error;
         if (!strcmp(old, target)) return 0;
     }
     /* Unlike POSIX rename(), DOS must never overwrite an existing name.
@@ -2660,6 +3048,7 @@ static int create_temporary(void)
     bool separator = n && dos[n - 1] != '/' && dos[n - 1] != '\\' && dos[n - 1] != ':';
     if (n + separator + 13 > 128) return 3;
     if (separator) dos[n++] = '\\';
+    if (unused_jfn() < 0) return 4;
     unsigned attributes = cpu.c.x;
     for (unsigned tries = 0; tries < 999999; ++tries) {
         temp_sequence = temp_sequence % 999999 + 1;
@@ -2669,6 +3058,8 @@ static int create_temporary(void)
         if (error) return error;
         error = open_path(path, drive, 2, attributes, 0x10);
         if (error == 80) continue;
+        if (error) return error;
+        error = publish_handle(cpu.a.x);
         if (error) return error;
         strcpy(dos + n, name);
         cpu.c.x = (uint16_t)attributes;
@@ -2782,10 +3173,14 @@ void dos_fs_init(void)
 {
     while (path_leases) dos_fs_release_path(path_leases);
     if (initialized) {
-        for (unsigned i = 0; i < DOS_HANDLES; ++i) if (get_handle(i)) close_handle(i);
+        for (unsigned i = 0; i < DOS_HANDLES; ++i) if (get_handle(i)) {
+            handles[i].references = 1;
+            close_handle(i);
+        }
         for (unsigned i = 0; i < SEARCH_SLOTS; ++i) release_search(searches + i);
     }
     if (door_root_fd >= 0) close(door_root_fd);
+    cleanup_command_pipes();
     door_root_fd = -1;
     door_quota = door_bytes = 0;
     door_entries = 0;
@@ -2796,6 +3191,7 @@ void dos_fs_init(void)
     handles[1].access = handles[2].access = 1;
     handles[3].device = DEV_AUX; handles[3].access = 2;
     handles[4].device = DEV_PRN; handles[4].access = 1;
+    for (unsigned i = 0; i < 5; ++i) handles[i].references = 1;
     while (birth_times) {
         BirthTime *next = birth_times->next;
         free(birth_times); birth_times = next;
@@ -2821,6 +3217,7 @@ void dos_fs_init(void)
     dta_seg = cpu.ds; dta_off = 0x80;
     last_error = 0; temp_sequence = 0;
     fcb_process = 0;
+    closed_file_path[0] = 0;
     clock_delta = (struct timespec){0, 0};
     initialized = true;
 }
@@ -2872,6 +3269,73 @@ static bool owns_function(uint16_t ax)
     }
 }
 
+/* Character DOS I/O is redirectable too. BIOS owns real CON input and its
+ * editable line buffer; regular-file handles are serviced here before that
+ * fallback. Unlike a host shell, this sees COMMAND's live PSP job table. */
+static int redirected_console(void)
+{
+    unsigned function = cpu.a.h;
+    if (!initialized || function > 0x0C || !function) return 0;
+    bool writing = function == 2 || function == 9 || (function == 6 && cpu.d.l != 0xFF);
+    bool reading = function == 1 || function == 7 || function == 8 || function == 0x0A ||
+                   function == 0x0B || function == 0x0C || (function == 6 && cpu.d.l == 0xFF);
+    if (!writing && !reading) return 0;
+    DosHandle *h = dos_handle(writing ? 1 : 0);
+    if (!h || (h->device != DEV_NONE && h->device != DEV_NUL)) return 0;
+    if (writing) {
+        uint8_t buffer[UINT16_MAX];
+        unsigned count = 1;
+        buffer[0] = cpu.d.l;
+        if (function == 9) {
+            for (count = 0; count < sizeof buffer; ++count) {
+                uint8_t byte = rd8(cpu.ds, (uint16_t)(cpu.d.x + count));
+                if (byte == '$') break;
+                buffer[count] = byte;
+            }
+        }
+        size_t done = 0;
+        while (h->device != DEV_NUL && done < count) {
+            ssize_t n = quota_write(h->fd, buffer + done, count - done, 0, false);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            done += (size_t)n;
+        }
+        cpu.a.l = function == 9 ? '$' : cpu.d.l;
+        return 1;
+    }
+    if (function == 0x0C) {
+        function = cpu.a.l;
+        if (function != 1 && function != 6 && function != 7 && function != 8 && function != 0x0A)
+            return 1;
+    }
+    if (function == 0x0B) {
+        struct stat st;
+        off_t pos = lseek(h->fd, 0, SEEK_CUR);
+        cpu.a.l = h->device != DEV_NUL && pos >= 0 && !fstat(h->fd, &st) && pos < st.st_size ? 0xFF : 0;
+        return 1;
+    }
+    unsigned count = 0, maximum = function == 0x0A ? rd8(cpu.ds, cpu.d.x) : 2;
+    uint8_t byte = 0x1A;
+    while (count + 1 < maximum) {
+        ssize_t n;
+        do { n = h->device == DEV_NUL ? 0 : read(h->fd, &byte, 1); } while (n < 0 && errno == EINTR);
+        if (n != 1) { byte = 0x1A; break; }
+        if (function != 0x0A) { count = 1; break; }
+        if (byte == '\n') continue;
+        if (byte == '\r') break;
+        wr8(cpu.ds, (uint16_t)(cpu.d.x + 2 + count++), byte);
+    }
+    if (function == 0x0A) {
+        wr8(cpu.ds, (uint16_t)(cpu.d.x + 1), (uint8_t)count);
+        wr8(cpu.ds, (uint16_t)(cpu.d.x + 2 + count), '\r');
+    } else {
+        cpu.a.l = byte;
+        if (function == 6) { cpu.zf = count == 0; if (!count) cpu.a.l = 0; }
+        if (function == 1 && count) con_write(&byte, 1);
+    }
+    return 1;
+}
+
 static void extended_error(void)
 {
     unsigned cls = 0, action = 0, locus = 0;
@@ -2892,6 +3356,7 @@ static void extended_error(void)
 
 int dos_fs_int21(void)
 {
+    if (redirected_console()) return 1;
     uint16_t function = cpu.a.x;
     /* This test must precede even lazy initialization: unowned interrupts
      * leave every register/flag and every byte of guest memory untouched. */
@@ -2972,7 +3437,7 @@ int dos_fs_int21(void)
     case 0x3b: error = change_directory(); break;
     case 0x3c: error = open_file(cpu.d.x, 2, cpu.c.x, 0x12, false); break;
     case 0x3d: error = open_file(cpu.d.x, cpu.a.l, 0, 1, false); break;
-    case 0x3e: error = close_handle(cpu.b.x); break;
+    case 0x3e: error = close_dos_handle(cpu.b.x); break;
     case 0x3f: error = read_file(); break;
     case 0x40: error = write_file(); break;
     case 0x41: error = delete_file(false); break;
@@ -2990,7 +3455,10 @@ int dos_fs_int21(void)
     case 0x5a: error = create_temporary(); break;
     case 0x5b: error = open_file(cpu.d.x, 2, cpu.c.x, 0x10, false); break;
     case 0x60: error = truename(false); break;
-    case 0x67: if (cpu.b.x > DOS_HANDLES) error = 4; break;
+    case 0x67:
+        if (has_jft(fcb_process)) return 0; /* The kernel allocates the guest table. */
+        if (cpu.b.x > DOS_HANDLES) error = 4;
+        break;
     case 0x68: error = flush_handle(); break;
     case 0x6c:
         error = cpu.a.l ? 1 : open_file(cpu.si, cpu.b.x, cpu.c.x, cpu.d.x, true);
@@ -3115,9 +3583,8 @@ static int country_info(void)
 
 static int handle_info(void)
 {
-    if (cpu.b.x >= DOS_HANDLES) return 6;
-    DosHandle *h = handles + cpu.b.x;
-    if (h->fd < 0 || h->device != DEV_NONE) return 6;
+    DosHandle *h = dos_handle(cpu.b.x);
+    if (!h || h->fd < 0 || h->device != DEV_NONE) return 6;
     struct stat st;
     if (fstat(h->fd, &st) != 0) return dos_errno(errno);
     uint16_t seg = cpu.ds, off = cpu.d.x;

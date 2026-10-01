@@ -3,6 +3,15 @@
 #define VC_DOS_FS_H
 
 #include <stdint.h>
+#include <stddef.h>
+
+enum { DOS_MAX_HANDLES = 64 };
+
+/* Copy inheritable system-file references into a new PSP's job file table. */
+void dos_fs_inherit_process(uint16_t child, uint16_t parent);
+/* One-shot provenance for a DOS-hosted loader's close -> create-PSP sequence.
+ * The returned path is re-opened and byte-checked by the execution layer. */
+int dos_fs_take_closed_file(uint16_t owner, char *path, size_t capacity);
 
 #define DOS_DOOR_ENTRY_LIMIT 4096u
 

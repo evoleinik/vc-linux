@@ -43,6 +43,7 @@ const fetchFailure = process.argv.includes('--fetch-failure');
 const fetchTimeout = process.argv.includes('--fetch-timeout');
 const memoryLimit = process.argv.includes('--memory-limit');
 const kermitOnly = process.argv.includes('--kermit-only');
+const msdosOnly = process.argv.includes('--msdos-only');
 const programDeadlines = [];
 const realSetTimeout = globalThis.setTimeout;
 if (fetchTimeout) {
@@ -91,12 +92,15 @@ let sourceKeyReducer;
 let sourceInitialInput;
 const sourceFetches = [];
 const originalSources = new Map();
-const programModules = ['gwbasic.wasm', 'bootlogo.wasm', 'rogue.wasm', 'vz.wasm', 'kermit.wasm'];
+const legacyModules = ['gwbasic.wasm', 'bootlogo.wasm', 'rogue.wasm', 'vz.wasm', 'kermit.wasm'];
+const msdosFiles = ['COMMAND.COM', 'EDLIN.COM', 'DEBUG.COM', 'FIND.EXE', 'MORE.COM', 'SORT.EXE', 'FC.EXE'];
+const msdosModules = msdosFiles.map(name => `${name.split('.')[0].toLowerCase()}.wasm`);
+const programModules = [...legacyModules, ...msdosModules];
 const programFiles = new Map(readdirSync(dirname(modulePath)).flatMap((name) => {
-  const match = name.match(/^(gwbasic|bootlogo|rogue|vz|kermit)\.([0-9a-f]{12})\.wasm$/);
-  return match ? [[`${match[1]}.wasm`, name]] : [];
+  const match = name.match(/^([a-z]+)\.([0-9a-f]{12})\.wasm$/);
+  return match && programModules.includes(`${match[1]}.wasm`) ? [[`${match[1]}.wasm`, name]] : [];
 }));
-assert.equal(programFiles.size, 5, 'all side modules have immutable build-hash filenames');
+assert.equal(programFiles.size, programModules.length, 'all side modules have immutable build-hash filenames');
 const moduleFetches = [];
 const expectedFetches = [];
 let heldDownload = null;
@@ -537,6 +541,165 @@ async function quitVC() {
   assert.equal(exitCode, 0, 'VC exits successfully');
 }
 
+function dosLog() {
+  return vc.FS.readFile('/var/vc/cache/vc-linux/vc.log', { encoding: 'utf8' });
+}
+
+function dosLoads(program) {
+  return dosLog().split('\n').filter(line =>
+    line.endsWith(`translation ${program}`) ||
+    line.endsWith(`translation ${program} (DOS-hosted loader)`)).length;
+}
+
+async function dosPanels(program, previousLoads) {
+  await until(`${program} finishes and VC redraws both panels`, text =>
+    dosLoads(program) > previousLoads && isPanel(text) && pending.length === 0 &&
+    commandLine(text).trimEnd() === 'H:\\>');
+  assert.equal(exitCalls, 0, `${program} must exit only its DOS child`);
+  const log = dosLog();
+  assert.doesNotMatch(log.slice(log.lastIndexOf(`translation ${program}`)),
+    /No translated code|Incorrect DOS version/,
+    `${program} uses its source-built translation and DOS-version compatibility`);
+}
+
+async function savedDosScreen(description, check) {
+  send('\x0f');
+  await until(description, text => !hasPanels(text) && check(text));
+  send('\x0f');
+  await until('VC panels after inspecting DOS output', isPanel);
+}
+
+async function checkCommand() {
+  stage = 'DOS installation';
+  for (const name of msdosFiles) {
+    const path = name === 'COMMAND.COM' ? `/home/vc/${name}` : `/home/vc/DOS/${name}`;
+    assert.deepEqual(Buffer.from(vc.FS.readFile(path)),
+      readFileSync(new URL(`../build/msdos2/${name}`, import.meta.url)),
+      `${path} contains the complete source-built DOS executable`);
+    if (name !== 'COMMAND.COM') assert.ok(!vc.FS.analyzePath(`/home/vc/${name}`).exists,
+      'the six utilities belong in H:\\DOS, not H:\\');
+  }
+  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/DOS/DOS.TXT')),
+    readFileSync(new URL('../data/DOS.TXT', import.meta.url)), 'H:\\DOS has the DOS guide');
+  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/DOS/DOSLIC.TXT')),
+    readFileSync(new URL('../third_party/msdos2/LICENSE', import.meta.url)), 'the MIT licence travels with DOS');
+
+  stage = 'DOS DIR from VC command line';
+  const beforeDir = dosLoads('COMMAND.COM');
+  expectedFetches.push('command.wasm');
+  send('dir\r');
+  await releaseProgramFetch('command.wasm');
+  await dosPanels('COMMAND.COM', beforeDir);
+  // A complete root listing is taller than 25 rows. Its tail still shows
+  // these actual H: files; Ctrl-O exposes VC's saved DOS output screen.
+  await savedDosScreen('Microsoft DIR lists real H: files', text =>
+    /README\s+TXT/.test(text) && /VZ\s+COM/.test(text) && /File\(s\)/.test(text));
+  assertFetches();
+  console.log('PASS DOS DIR: plain dir lazy-loads COMMAND.COM and lists H: files on VC\'s saved user screen');
+
+  stage = 'DOS two-line batch from VC command line';
+  vc.FS.writeFile('/home/vc/B30.BAT', 'echo batch-first-30\r\necho batch-second-30\r\n');
+  const beforeBatch = dosLoads('COMMAND.COM');
+  send('B30\r');
+  await dosPanels('COMMAND.COM', beforeBatch);
+  await savedDosScreen('both lines of a .BAT file execute in COMMAND.COM', text =>
+    /^batch-first-30\s*$/m.test(text) && /^batch-second-30\s*$/m.test(text));
+  assertFetches();
+  console.log('PASS DOS batch: two lines run through cached COMMAND.COM and return to VC');
+
+  stage = 'DOS interactive prompt and COMSPEC';
+  const beforePrompt = dosLoads('COMMAND.COM');
+  send('command\r');
+  await until('COMMAND opens its own H: prompt', text =>
+    dosLoads('COMMAND.COM') > beforePrompt && !hasPanels(text) && /^H:\\>\s*$/m.test(text));
+  send('set\r');
+  await until('the DOS environment has the real COMMAND and utility PATH', text =>
+    text.includes('COMSPEC=H:\\COMMAND.COM') && /PATH=[^\n]*H:\\DOS(?:;|\s|$)/.test(text));
+  send('exit\r');
+  await dosPanels('COMMAND.COM', beforePrompt);
+  assertFetches();
+  console.log('PASS DOS prompt: COMMAND, COMSPEC=H:\\COMMAND.COM, H:\\DOS on PATH, EXIT restores VC');
+}
+
+async function checkDosUtilities() {
+  stage = 'DOS EDLIN first use';
+  const beforeEdlin = dosLoads('EDLIN.COM');
+  expectedFetches.push('edlin.wasm');
+  send('edlin E30.TXT\r');
+  await releaseProgramFetch('edlin.wasm');
+  await until('EDLIN new file and its * command prompt', text =>
+    text.includes('New file') && /^\*\s*$/m.test(text));
+  send('i\r');
+  await until('EDLIN numbered insertion prompt', text => /^\s*1:\*?\s*$/m.test(text));
+  send('edlin-web-30\r');
+  await until('EDLIN acknowledges the inserted line', text =>
+    text.includes('edlin-web-30') && /^\s*2:\*?\s*$/m.test(text));
+  send('\x1a\r');
+  await until('Ctrl-Z ends EDLIN insertion', text => /^\*\s*$/m.test(text));
+  send('e\r');
+  await dosPanels('EDLIN.COM', beforeEdlin);
+  assert.equal(vc.FS.readFile('/home/vc/E30.TXT', { encoding: 'utf8' }), 'edlin-web-30\r\n\x1a');
+  const beforeEdlinAgain = dosLoads('EDLIN.COM');
+  send('edlin E30.TXT\r');
+  await until('cached EDLIN opens the saved file', text =>
+    dosLoads('EDLIN.COM') > beforeEdlinAgain && text.includes('End of input file') && /^\*\s*$/m.test(text));
+  send('q\r');
+  await until('EDLIN asks before abandoning the buffer', text => text.includes('Abort edit (Y/N)?'));
+  send('y');
+  await dosPanels('EDLIN.COM', beforeEdlinAgain);
+  assertFetches();
+  console.log('PASS DOS EDLIN: source editor saves exact MEMFS bytes and its second run is cached');
+
+  for (const first of [true, false]) {
+    stage = `DOS DEBUG ${first ? 'first' : 'cached'} use`;
+    const before = dosLoads('DEBUG.COM');
+    if (first) expectedFetches.push('debug.wasm');
+    send('debug\r');
+    if (first) await releaseProgramFetch('debug.wasm');
+    await until('DEBUG opens its - prompt', text =>
+      dosLoads('DEBUG.COM') > before && !hasPanels(text) && /^-\s*$/m.test(text));
+    send('q\r');
+    await dosPanels('DEBUG.COM', before);
+    assertFetches();
+  }
+  console.log('PASS DOS DEBUG: - prompt and Q return on first and cached runs');
+
+  const input = 'beta\r\nalpha\r\nx-line\r\n';
+  vc.FS.writeFile('/home/vc/D30IN.TXT', input);
+  vc.FS.writeFile('/home/vc/D30ALT.TXT', 'zeta\r\nalpha\r\nx-line\r\n');
+  for (const [program, command, output, check] of [
+    ['FIND.EXE', 'find "x" D30IN.TXT > F30.TXT', 'F30.TXT', text =>
+      text.includes('x-line\r\n') && !text.includes('beta') && !text.includes('alpha')],
+    // MORE.ASM initializes its cursor by printing CRLF before reading stdin.
+    ['MORE.COM', 'more < D30IN.TXT > M30.TXT', 'M30.TXT', text => text === `\r\n${input}`],
+    ['FC.EXE', 'fc /b D30IN.TXT D30ALT.TXT > C30.TXT', 'C30.TXT', text =>
+      text.includes('--ADDRS----F1---F2-') && /00000000\s+62\s+7A/.test(text)],
+    ['SORT.EXE', 'sort < D30IN.TXT > S30.TXT', 'S30.TXT', text => text === 'alpha\r\nbeta\r\nx-line\r\n'],
+  ]) {
+    const module = `${program.split('.')[0].toLowerCase()}.wasm`;
+    for (const first of [true, false]) {
+      stage = `DOS ${program} ${first ? 'first' : 'cached'} use`;
+      const before = dosLoads(program);
+      if (first) expectedFetches.push(module);
+      send(`${command}\r`);
+      if (first) await releaseProgramFetch(module);
+      await dosPanels(program, before);
+      const text = vc.FS.readFile(`/home/vc/${output}`, { encoding: 'utf8' });
+      if (!check(text)) {
+        send('\x0f');
+        await until(`${program} saved error screen`, screen => !hasPanels(screen));
+        console.error(`--- ${program} saved DOS output ---\n${screen}`);
+      }
+      assert.ok(check(text), `${program} produces its expected DOS output: ${JSON.stringify(text)}`);
+      assertFetches();
+    }
+    console.log(`PASS DOS ${program}: correct redirected MEMFS output; first-use fetch and cached rerun`);
+  }
+  for (const module of msdosModules)
+    assert.equal(moduleFetches.filter(request => request.name === module).length, 1,
+      `${module} was downloaded exactly once across its real first and cached runs`);
+}
+
 async function checkKermit() {
   stage = 'Kermit BBS.TAK association and lazy module';
   assert.equal(bbs.calls.length, 0, 'no WebSocket opens before a Hayes dial');
@@ -546,7 +709,7 @@ async function checkKermit() {
   assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/BBS.TAK')),
     readFileSync(new URL('../data/BBS.TAK', import.meta.url)), 'the shipped TAKE file is installed');
   send('\x1b[H');
-  await until('home selection before BBS.TAK', text => /\.\.|BBS|GAMES/.test(selected(text)));
+  await until('home selection before BBS.TAK', text => /\.\.|B30\.BAT|BBS|GAMES/.test(selected(text)));
   await selectFile('BBS.TAK');
   expectedFetches.push('kermit.wasm');
   send('\r');
@@ -801,6 +964,13 @@ function fail(error) {
     log = vc.FS.readFile('/var/vc/cache/vc-linux/vc.log', { encoding: 'utf8' });
   } catch { /* A startup failure may precede the screen/log. */ }
   console.error(`FAIL [${stage}]: ${error?.stack || error}\n${screen}\n--- VC log ---\n${log}`);
+  if (vc?._vc_source_snapshot) {
+    try {
+      const snapshot = takeSourceSnapshot();
+      console.error(`Guest location: ${JSON.stringify({ raw: snapshot.raw,
+        current: snapshot.current, recent: snapshot.recent?.slice(0, 8) })}`);
+    } catch { /* A fatal runtime trap may also prevent inspection. */ }
+  }
   console.error(`Speaker events in current stage: ${JSON.stringify(speakerEvents)}`);
   if (sourcePanel) {
     const view = sourcePanel.view;
@@ -853,7 +1023,7 @@ try {
       };
     };
   }
-  if (!fetchFailure && !fetchTimeout && !memoryLimit) await installSourcePanel();
+  if (!fetchFailure && !fetchTimeout && !memoryLimit && !msdosOnly) await installSourcePanel();
   const wasmBinary = await readFile(new URL('./vc.wasm', moduleURL));
   await createVC({
     wasmBinary,
@@ -919,8 +1089,25 @@ try {
     'VC keeps its settings and log off the H: demo drive');
   assert.ok(vc.FS.stat('/home/vc/GWBASIC.EXE').size > 50000,
     'GW-BASIC is an actual MZ file on H:');
+  for (const name of ['VC.ASM', 'VCOVL.ASM'])
+    assert.deepEqual(Buffer.from(vc.FS.readFile(`/home/vc/SRC/${name}`)),
+      readFileSync(new URL(`../asm/${name}`, import.meta.url)),
+      `startup LZMA preserves the exact H:\\SRC\\${name} bytes`);
+  for (const name of readdirSync(new URL('../build/games/', import.meta.url)))
+    assert.deepEqual(Buffer.from(vc.FS.readFile(`/home/vc/GAMES/${name}`)),
+      readFileSync(new URL(`../build/games/${name}`, import.meta.url)),
+      `startup LZMA preserves the exact H:\\GAMES\\${name} bytes`);
   assert.ok(!vc.FS.analyzePath('/home/vc/GAMES/NOTHING.TXT').exists);
   console.log('PASS 1: startup shows 10Quit and README on H:');
+
+  if (msdosOnly) {
+    await checkCommand();
+    await checkDosUtilities();
+    await quitVC();
+    console.log('web DOS smoke: real DIR, batch files, prompt, six utilities, exact first-use and cached module fetches passed');
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
 
   if (kermitOnly) {
     await checkKermit();
@@ -1004,14 +1191,7 @@ try {
   send('\x1b');
   await until('the panels after the Russian viewer', isPanel);
 
-  stage = '3 no shell';
-  send('echo hi\r');
-  const noShell = 'No shell in the browser, only cd works here. The Linux version runs '
-    + 'commands: github.com/evoleinik/vc-linux';
-  await until('the exact no-shell message on the user screen', (text) =>
-    text.replaceAll('\n', '').includes(noShell));
-  console.log('PASS 3: echo hi displays the exact no-shell message');
-  await until('the panels after the command', isPanel);
+  await checkCommand();
 
   stage = '4 kitty Ctrl-[';
   const leftPath = screen.split('\n')[0].slice(0, 40).match(/[A-Z]:\\[^ ═╤╗]*/)?.[0];
@@ -1445,11 +1625,14 @@ try {
   send('Y');
   await until('VC panels after the second VZ child', isPanel);
   assertFetches();
-  assert.deepEqual(expectedFetches, programModules.slice(0, 4), 'the first four programs fetched exactly once');
+  assert.deepEqual(expectedFetches, ['command.wasm', ...legacyModules.slice(0, 4)],
+    'COMMAND and the first four legacy programs fetched exactly once');
   console.log('PASS 25: typed vz NEW.TXT creates and saves a real H: file');
 
   await checkKermit();
-  assert.deepEqual(expectedFetches, programModules, 'all five programs fetched exactly once');
+  await checkDosUtilities();
+  assert.deepEqual([...expectedFetches].sort(), [...programModules].sort(),
+    'all twelve programs fetched exactly once');
 
   stage = '25b cached BASIC after loading every side module';
   send('gwbasic\r');
@@ -1465,7 +1648,7 @@ try {
   const peak = wasmExports.sbrk(0);
   console.log(`PASS memory: peak ${peak} bytes; INITIAL_MEMORY ${startupHeapBytes} bytes; headroom ${startupHeapBytes - peak} bytes; heap ${startupHeapBytes} -> ${vc.HEAPU8.byteLength}`);
   assert.equal(vc.HEAPU8.byteLength, startupHeapBytes,
-    'INITIAL_MEMORY must cover loading all five programs without heap growth');
+    'INITIAL_MEMORY must cover loading all twelve programs without heap growth');
   // The measured peak depends on load order: emmalloc asks sbrk for a whole
   // new block when no free block fits. Bound every order: each load's guard
   // may take a fresh 2N + 64 KiB above the startup heap top.
@@ -1485,7 +1668,7 @@ try {
   await quitVC();
   console.log('PASS 26: F10, Enter quits and fires the exit hook');
   assertFetches();
-  console.log('web smoke: all 26 checks, Russian F3, Source for all five programs, and first-use/cached module fetches passed');
+  console.log('web smoke: legacy checks, DOS shell/utilities, Russian F3, Source, and all twelve first-use/cached module fetches passed');
   exitAfterOutput(0);
 } catch (error) {
   fail(error);

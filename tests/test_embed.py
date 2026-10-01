@@ -17,6 +17,8 @@ import zlib
 import pytest
 
 from translator.image import load_image
+from tools.basic_games import game_files
+from tools.embed import x86_16_filter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,13 +41,13 @@ def mz(payload: bytes, tail: bytes = b"", magic: bytes = b"MZ") -> bytes:
     return bytes(header) + payload + tail
 
 
-def generate(tmp_path, pairs, *, check=True):
+def generate(tmp_path, pairs, *, check=True, web_only=()):
     output = tmp_path / "files.c"
     command = [sys.executable, str(ROOT / "tools/embed.py"), str(output)]
     for index, (name, data) in enumerate(pairs):
         source = tmp_path / f"input-{index}.bin"
         source.write_bytes(data)
-        command.append(f"{name}={source}")
+        command.append(("--web-only=" if name in web_only else "") + f"{name}={source}")
     result = subprocess.run(command, capture_output=True, text=True)
     if check:
         assert result.returncode == 0, result.stderr
@@ -122,6 +124,28 @@ def test_image_size_mismatch_is_refused_before_copy(tmp_path):
     assert result.returncode != 0
 
 
+@pytest.mark.parametrize("web", [False, True], ids=["native", "web"])
+@pytest.mark.parametrize("data", [b"", b"original source\r\n" * 100], ids=["empty", "source"])
+def test_web_only_startup_files_stay_out_of_native_table_and_binary(tmp_path, web, data):
+    pairs = [("VC.COM", b"\xc3"), ("VC.OVL", mz(bytes(range(200)))),
+             ("KEPT.TXT", b"both builds"), ("SRC/VC.ASM", data)]
+    source, _ = generate(tmp_path, pairs, web_only=("SRC/VC.ASM",))
+    obj, result = compile_fixture(tmp_path, source, pairs, web=web)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"".join(contents for name, contents in pairs
+                                      if web or name != "SRC/VC.ASM")
+    if not web:
+        symbols = subprocess.check_output(["nm", "--defined-only", str(obj)], text=True)
+        assert re.search(r"\bf3\b", symbols) is None, "browser-only source bytes must not be in native .rodata"
+        assert b"SRC/VC.ASM" not in obj.read_bytes(), "the native table must not install browser-only files"
+
+
+def test_builtin_files_cannot_be_web_only(tmp_path):
+    _, result = generate(tmp_path, [("VC.COM", b"\xc3")], web_only=("VC.COM",), check=False)
+    assert result.returncode != 0
+    assert "built-in files must exist in both builds" in result.stderr
+
+
 @pytest.mark.parametrize("name,data,message", [
     ("VC.COM", mz(bytes(range(200))), "VC.COM must be a COM"),
     ("VC.OVL", b"not an executable", "VC.OVL must be an MZ"),
@@ -178,6 +202,9 @@ def decoder(tmp_path_factory):
     checksum = library.embed_adler32
     checksum.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     checksum.restype = ctypes.c_uint32
+    restore = library.embed_x86_16_restore
+    restore.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    restore.restype = None
 
     def run(packed, size):
         output = ctypes.create_string_buffer(b"\xa5" * (size + 16), size + 16)
@@ -187,7 +214,36 @@ def decoder(tmp_path_factory):
         assert checksum(output, size) == zlib.adler32(value)
         return result, value
 
+    def restore_filtered(data):
+        output = ctypes.create_string_buffer(b"\xa5" * 16 + data + b"\xa5" * 16, len(data) + 32)
+        restore(ctypes.addressof(output) + 16, len(data))
+        assert output.raw[:16] == output.raw[-16:] == b"\xa5" * 16
+        return output.raw[16:-16]
+
+    run.restore_filtered = restore_filtered
     return run
+
+
+def test_x86_16_filter_fixed_operands_and_incomplete_tail(decoder):
+    original = bytes.fromhex("e8 00 00 e9 fd ff e8 e9 e8 90 e9 12")
+    filtered = bytes.fromhex("e8 03 00 e9 03 00 e8 f2 e8 90 e9 12")
+    assert x86_16_filter(original) == filtered
+    assert decoder.restore_filtered(filtered) == original
+    boundary = b"\x90" * 65534 + bytes.fromhex("e8 ff ff")
+    assert x86_16_filter(boundary)[-3:] == bytes.fromhex("e8 00 00")
+    assert decoder.restore_filtered(x86_16_filter(boundary)) == boundary
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 3, 4, 255, 256, 65535, 65536, 65537, 1_000_003])
+def test_x86_16_filter_arbitrary_bytes_and_exact_memory_bounds(decoder, size):
+    original = bytearray(random.Random(20261002 + size).randbytes(size))
+    # Include adjacent operands containing opcode-looking data, not only
+    # instruction-aligned CALLs. This filter never decodes instructions.
+    for at in range(0, max(0, size - 5), 127):
+        original[at:at + 6] = bytes.fromhex("e8 e9 e8 e9 ff ff")
+    filtered = x86_16_filter(original)
+    assert len(filtered) == size
+    assert decoder.restore_filtered(filtered) == original
 
 
 def encode(data, **properties):
@@ -305,6 +361,7 @@ def test_generated_initializer_refuses_corrupt_packed_files(tmp_path, corruption
 
 @pytest.mark.parametrize("web", [False, True], ids=["native", "web"])
 def test_every_real_embedded_file_round_trips_byte_for_byte(tmp_path, web):
+    browser_sources = ("SRC/VC.ASM", "SRC/VCOVL.ASM", *(f"GAMES/{name}" for name in game_files()))
     paths = [
         ("VC.COM", "build/VC.COM"), ("VC.OVL", "build/VC.OVL"),
         ("GWBASIC.EXE", "build/gwbasic/GWBASIC.EXE"),
@@ -319,17 +376,22 @@ def test_every_real_embedded_file_round_trips_byte_for_byte(tmp_path, web):
         ("VZLIC.TXT", "third_party/vzeditor/LICENSE"),
         ("KERMIT.EXE", "build/kermit/KERMIT.EXE"), ("BBS.TAK", "data/BBS.TAK"),
         ("KERMIT.TXT", "data/KERMIT.TXT"), ("KERMLIC.TXT", "third_party/mskermit/LICENSE"),
+        *((name, f"build/msdos2/{name}") for name in
+          ("COMMAND.COM", "EDLIN.COM", "DEBUG.COM", "FIND.EXE", "MORE.COM", "SORT.EXE", "FC.EXE")),
+        ("DOS.TXT", "data/DOS.TXT"), ("DOSLIC.TXT", "third_party/msdos2/LICENSE"),
         *((name, f"data/{name}") for name in ("VC.INI", "VC.EXT", "VCEDIT.EXT", "VC.HLP")),
+        ("SRC/VC.ASM", "asm/VC.ASM"), ("SRC/VCOVL.ASM", "asm/VCOVL.ASM"),
+        *((f"GAMES/{name}", f"build/games/{name}") for name in game_files()),
     ]
     pairs = [(name, (ROOT / path).read_bytes()) for name, path in paths]
-    source, _ = generate(tmp_path, pairs)
+    source, _ = generate(tmp_path, pairs, web_only=browser_sources)
     if web:
         text = source.read_text()
         match = re.search(r"static const uint8_t embedded_packed\[\d+\] = \{([\s\S]*?)\n\};", text)
         assert match
         packed = bytes(map(int, re.findall(r"\d+", match[1])))
-        assert lzma.decompress(packed, format=lzma.FORMAT_RAW, filters=[LZMA_FILTER]) == b"".join(
-            data for name, data in pairs if name not in ("VC.COM", "VC.OVL"))
+        assert lzma.decompress(packed, format=lzma.FORMAT_RAW, filters=[LZMA_FILTER]) == x86_16_filter(b"".join(
+            data for name, data in pairs if name not in ("VC.COM", "VC.OVL")))
     _, result = compile_fixture(tmp_path, source, pairs, web=web)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == b"".join(data for _, data in pairs)
+    assert result.stdout == b"".join(data for name, data in pairs if web or name not in browser_sources)

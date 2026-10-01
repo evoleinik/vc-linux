@@ -13,7 +13,9 @@ const sources = Object.fromEntries([
 const failures = [];
 const versions = new Set();
 const referenced = new Set();
-const programs = ["gwbasic", "bootlogo", "rogue", "vz", "kermit"];
+const programs = ["gwbasic", "bootlogo", "rogue", "vz", "kermit",
+  "command", "edlin", "debug", "find", "more", "sort", "fc"];
+const programPattern = programs.join('|');
 const sideFiles = readdirSync(dir).filter(file => file.endsWith(".wasm") && file !== "vc.wasm").sort();
 const sideHashes = new Set();
 for (const program of programs) {
@@ -21,7 +23,7 @@ for (const program of programs) {
   if (names.length !== 1) failures.push(`${program}: expected exactly one published side module, found ${names.length}`);
 }
 for (const file of sideFiles) {
-  const match = file.match(/^(gwbasic|bootlogo|rogue|vz|kermit)\.([0-9a-f]{12})\.wasm$/);
+  const match = file.match(new RegExp(`^(${programPattern})\\.([0-9a-f]{12})\\.wasm$`));
   if (!match) failures.push(`${file}: side module filename has no build hash`);
   else sideHashes.add(match[2]);
 }
@@ -47,7 +49,7 @@ else if (sideFiles.length === programs.length) {
 // separate manifest: a header/main rebuild missed by make must fail here.
 // C strings end at NUL; the smoke test additionally checks actual EXEC URLs.
 const main = readFileSync(join(dir, "vc.wasm")).toString("latin1");
-const requestedSides = [...new Set([...main.matchAll(/(?:gwbasic|bootlogo|rogue|vz|kermit)(?:\.[A-Za-z0-9_-]+)?\.wasm(?=\0)/g)]
+const requestedSides = [...new Set([...main.matchAll(new RegExp(`(?:${programPattern})(?:\\.[A-Za-z0-9_-]+)?\\.wasm(?=\\0)`, 'g'))]
   .map(([file]) => file))].sort();
 if (requestedSides.length !== programs.length || JSON.stringify(requestedSides) !== JSON.stringify(sideFiles))
   failures.push(`main requests [${requestedSides.join(", ")}], but published files are [${sideFiles.join(", ")}]`);
@@ -94,5 +96,5 @@ if (failures.length) {
   console.error("web assets: FAIL\n  " + failures.join("\n  ") + "\nFix: build with `make web`, which stamps the hash.");
   process.exitCode = 1; // Let redirected diagnostics drain before exiting.
 } else {
-  console.log(`web assets: every page asset carries ?v=${[...versions][0]}; five hashed side filenames match the main binary (${[...sideHashes][0]})`);
+  console.log(`web assets: every page asset carries ?v=${[...versions][0]}; ${programs.length} hashed side filenames match the main binary (${[...sideHashes][0]})`);
 }

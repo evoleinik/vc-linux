@@ -14,8 +14,8 @@
 /* ---- DOS file system: runtime/dos_fs.c ---------------------------------- */
 
 void dos_fs_init(void);
-/* Keep FCB opens associated with their DOS owner so an erroring child cannot
- * leak descriptors into its parent. Ordinary inherited handles are untouched. */
+/* Track the active PSP job table and FCB owner. Exiting closes only that
+ * process's references; inherited files stay open in its parent. */
 void dos_fs_set_process(uint16_t psp);
 void dos_fs_close_process(uint16_t psp);
 /* INT 21h functions for files, directories, drives, handles, date and time,
@@ -33,10 +33,11 @@ void bios_init(void);       /* fill the BIOS data area video and keyboard fields
 void bios_int10(void);      /* video */
 void bios_int16(void);      /* keyboard */
 void bios_int33(void);      /* mouse */
-/* INT 21h console functions 01h-0Ch. Returns 1 if handled, 0 otherwise. */
+/* INT 21h console functions 01h-0Ch, plus cooked AH=3Fh CON input delegated
+ * by the filesystem after it resolves the handle. Returns 1 if handled. */
 int dos_con_int21(void);
 /* Write bytes to the CON device: teletype into the text screen at the BIOS
- * cursor, with CR, LF, BS and BEL handling and scrolling. */
+ * cursor, with CR, LF, BS, BEL, DOS TAB stops and scrolling. */
 void con_write(const uint8_t *buf, size_t n);
 
 void term_init(void);

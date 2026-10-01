@@ -388,6 +388,56 @@ def _build_pre18_rogue_probe(probe_root):
     return (output / "ROGUE.EXE").read_bytes()
 
 
+def test_rogue_build_pins_banner_before_compilation(tmp_path, monkeypatch):
+    # This fails on the old builder even on the same day as the verified
+    # image: a live compiler date must never reach the banner translation.
+    monkeypatch.syspath_prepend(str(ROOT / "tools"))
+    spec = importlib.util.spec_from_file_location("build_rogue", ROOT / "tools/build_rogue.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    watcom = Path(os.environ.get("WATCOM", ROOT / "build/openwatcom")).resolve()
+    run = subprocess.run
+    compiled_notices = []
+    vendor = ROOT / "third_party/pdcurses/pdcurses/initscr.c"
+    original = vendor.read_bytes()
+
+    def compile_checked_notice(args, **kwargs):
+        if Path(args[0]).name == "wcc" and Path(args[-1]).name == "initscr.c":
+            source = Path(args[-1])
+            content = source.read_text()
+            assert "__DATE__" not in content, "PDCurses banner still depends on the compiler date"
+            assert "__TIME__" not in content and "__TIMESTAMP__" not in content
+            assert '"Oct  1 2026"' in content
+            assert source == tmp_path / "pdcsrc/initscr.c"
+            compiled_notices.append(source)
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", compile_checked_notice)
+    builder.build(ROOT, watcom, tmp_path, 2)
+    assert compiled_notices == [tmp_path / "pdcsrc/initscr.c"]
+    assert vendor.read_bytes() == original
+    assert hashlib.sha256((tmp_path / "ROGUE.EXE").read_bytes()).hexdigest() == (
+        "b6350f98553e96ae5454383ec377d9feb63834cc99fc3411f7ff016321dd61a7"
+    )
+
+
+@pytest.mark.parametrize("changed", ("missing", "duplicate", "date", "time", "timestamp"))
+def test_rogue_build_refuses_changed_clock_notice(monkeypatch, changed):
+    monkeypatch.syspath_prepend(str(ROOT / "tools"))
+    spec = importlib.util.spec_from_file_location("build_rogue", ROOT / "tools/build_rogue.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    source = (ROOT / "third_party/pdcurses/pdcurses/initscr.c").read_text()
+    if changed == "missing":
+        source = source.replace("__DATE__", '"upstream date changed"')
+    elif changed == "duplicate":
+        source += source
+    else:
+        source += "\nconst char *another_clock = __" + changed.upper() + "__;\n"
+    with pytest.raises(ValueError, match="PDCurses.*(?:notice|clock)"):
+        builder.pin_pdcurses_notice(source)
+
+
 def test_rogue_build_is_byte_reproducible(rogue_files, tmp_path):
     before = rogue_files[0].read_bytes()
     def vendor_digests():
@@ -447,23 +497,3 @@ def test_rogue_port_refuses_changed_upstream_source(tmp_path):
     with pytest.raises(ValueError, match="expected 1 instances"):
         port.prepare(source, tmp_path / "output")
 
-
-def test_pdcurses_date_stamp_is_pinned():
-    """PDCurses stamps __DATE__ and OpenWatcom ignores SOURCE_DATE_EPOCH, so an
-    unpinned build changes every day. CI went red at midnight UTC on 2026-10-02."""
-    sys.path.insert(0, str(ROOT / "tools"))
-    spec = importlib.util.spec_from_file_location("build_rogue", ROOT / "tools/build_rogue.py")
-    build_rogue = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(build_rogue)
-    image = b"MZ..PDCurses 3.9 - Oct  2 2026\x00tail"
-    assert build_rogue.pin_build_date(image) == b"MZ..PDCurses 3.9 - Oct  1 2026\x00tail"
-    for bad in (b"no stamp here", image + image, b"PDCurses 3.9 - tomorrow!!!\x00"):
-        with pytest.raises(SystemExit):
-            build_rogue.pin_build_date(bad)
-    # In the object, the containing OMF record's checksum must stay valid.
-    data = b"\x00\x00\x00" + b"PDCurses 3.9 - Oct  2 2026\x00"
-    body = bytes([0xA0]) + (len(data) + 1).to_bytes(2, "little") + data
-    record = body + bytes([-sum(body) & 0xFF])
-    pinned = build_rogue.pin_object_date(b"\x80\x02\x00\x00\x00" + record)
-    assert b"Oct  1 2026" in pinned
-    assert sum(pinned[5:]) & 0xFF == 0

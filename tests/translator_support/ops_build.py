@@ -68,9 +68,11 @@ def load_cases() -> tuple[InstructionCase, ...]:
     from translator.nasm import build_nasm_layout, parse_nasm_listing
     from translator.supplement import build_gwbasic_graphics_layout
     from translator.compiled import build_compiled_layout
+    from translator.msdos import build_msdos_layout
     from tools.build_gwbasic import modules
     from tools.build_vz import modules as vz_modules
     from tools.build_kermit import modules as kermit_modules
+    from tools.build_msdos import PROGRAMS as msdos_programs
 
     # Stock listings omit assembler-generated prologue/epilogue boundaries.
     # Always ask make to check dependencies so direct pytest runs cannot test
@@ -80,7 +82,8 @@ def load_cases() -> tuple[InstructionCase, ...]:
     assert generated.returncode == 0, generated.stdout
     result = []
     seen = set()
-    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE"):
+    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE",
+                 *msdos_programs):
         if name == "ROGUE.EXE":
             directory = ROOT / "build" / "rogue"
             loaded = load_image(directory / name)
@@ -106,6 +109,12 @@ def load_cases() -> tuple[InstructionCase, ...]:
             loaded = load_image(directory / name)
             layout = build_linked_layout(loaded, [directory / (module + ".lst") for module in kermit_modules()],
                                          directory / "KERMIT.MAP")
+        elif name in msdos_programs:
+            directory = ROOT / "build" / "msdos2"
+            loaded = load_image(directory / name)
+            layout = build_msdos_layout(loaded,
+                                        [directory / (module + ".lst") for module in msdos_programs[name]],
+                                        directory / (Path(name).stem + ".MAP"))
         else:
             loaded = load_image(ROOT / "build" / name)
             layout = build_layout(loaded, parse_listing(ROOT / "build" / "gen" / f"{name}.lst"))

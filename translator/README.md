@@ -161,6 +161,41 @@ unpatched macro word are rejected by dedicated tests. No runtime decoder is
 introduced, and regeneration leaves VC's, GW-BASIC's and bootLogo's five
 established C files byte-identical.
 
+## MS-DOS 2.0 command processor and utilities
+
+The opt-in `--format msdos --map PROGRAM.MAP` path translates Microsoft's
+unedited source builds of COMMAND, EDLIN, DEBUG, FIND, MORE, SORT and FC.
+Their MASM dialect predates the conventional CODE class: executable starts
+still come only from active source instruction rows, including those in
+unclassified segments. The same independent byte-coverage and linked-byte
+checks apply to every contribution.
+
+COMMAND.COM contains three independently addressed groups: resident,
+transient and EXEC code. Each group's map address defines its nominal CS
+frame; the COM file still starts at PSP:0100h. Symbolic data initializers
+retain their declared group frame, and explicit `OFFSET SEGMENT:symbol`
+uses that segment rather than silently substituting its group's frame.
+MORE's single ungrouped COM is also supported. The established single-group
+COM and linked EXE paths are unchanged.
+
+SORT `/R` changes the opcode at `CODE_PATCH` from JAE (`73`) to JB (`72`).
+`msdos.py` proves the literal CS-relative store, its complete reverse-switch
+test, the original JAE, unchanged displacement and both successors. It
+compiles the two exact templates through the existing guarded-variant
+emitter. Only that one opcode byte is mutable; every other opcode faults.
+Both forms receive independent randomized Unicorn comparisons. No runtime
+decoder or arbitrary self-modifying-code support is added.
+
+EDLIN's decimal line-number conversion adds DAA to the ordinary emitter,
+checked both at its real instruction sites and in 4,096 additional random
+states. The parser does not mistake Capstone's `ENDING` enum sentinel for
+an opcode: EDLIN uses `ENDING DB 1 DUP (?)` as a variable. FIND's
+`DW 64 DUP (?,?)` is likewise uninitialized storage, not mandatory file
+bytes. A source-proved `MOV AH,4Ch`/`INT 21h` with no alternate entry to the
+INT has no static return path into following SORT messages. Interrupt
+emission itself remains unchanged; returning DOS calls still seed the
+ordinary reachable-data closure.
+
 ## Necessary JWasm listing normalization
 
 The original `make images` recipes are unchanged. Their listings omit

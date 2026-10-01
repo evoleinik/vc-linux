@@ -26,7 +26,7 @@ PREFIXES = {"REP", "REPE", "REPZ", "REPNE", "REPNZ", "LOCK",
 NON_INSTRUCTIONS = {"ALIGN", "EVEN", "ORG", "LABEL", "PROC", "ENDP", "ENDS",
                     "SEGMENT", "EQU", "=", "INCLUDE", "END", "MACRO", "ENDM"}
 _INSTRUCTION_HEADS = {name.removeprefix("X86_INS_") for name in vars(x86_const)
-                      if name.startswith("X86_INS_")}
+                      if name.startswith("X86_INS_") and name not in {"X86_INS_INVALID", "X86_INS_ENDING"}}
 _INSTRUCTION_HEADS.update("LODS MOVS STOS SCAS CMPS INS OUTS RETN".split())
 
 
@@ -190,7 +190,7 @@ def _metadata(text: str) -> tuple[dict[str, Segment], dict[str, Label], dict[str
             gm = re.match(r"^(\S+)\s+(?:\.\s+)*GROUP\s*$", row)
             if gm:
                 group = gm[1]
-            sm = re.match(r"^(\S+)\s+(?:\.\s+)*16 Bit\s+([0-9A-F]+)\s+\S+\s+\S+\s+'([^']+)'", row)
+            sm = re.match(r"^(\S+)\s+(?:\.\s+)*16 Bit\s+([0-9A-F]+)\s+\S+\s+\S+\s+'([^']*)'", row)
             if sm:
                 segments[sm[1]] = Segment(sm[1], sm[3].upper() == "CODE", int(sm[2], 16), group)
     if "Binary Map:" in text:

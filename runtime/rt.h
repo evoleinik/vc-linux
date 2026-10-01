@@ -26,6 +26,10 @@ void rt_log(const char *fmt, ...);
 void rt_set_logging(int enabled);
 void rt_update_clock(void);
 void rt_register_image(const Image *img, uint16_t loadseg);
+/* Recognize an INT return in a registered image or an already-observed moved
+ * copy. Name lookup avoids eagerly linking lazy browser modules; this checks
+ * live bytes and never executes/probes translated code or loads a module. */
+const Image *rt_image_return(const char *name, uint16_t cs, uint16_t ip);
 /* A separately generated set of listing-proved entry points may supplement
  * an unchanged image translation. The dispatcher still checks that image's
  * bytes before either runner, including when the guest copies code. */
@@ -48,8 +52,9 @@ void dos_core_init(void);
 int dos_core_int21(void);
 /* Execute only the exact kernel-installed entry thunks in the current PSP. */
 int dos_run_psp(void);
-/* Stop a non-VC child after an untranslated transfer. Return 0 for VC itself,
- * including its overlay child, so the dispatcher keeps its fatal diagnostic. */
+/* Stop a DOS child after an untranslated transfer. Return 0 for the outer VC
+ * and its overlay so the dispatcher keeps its fatal diagnostic; a VC nested
+ * beneath another DOS program is that program's child and may be stopped. */
 int dos_abort_untranslated(void);
 /* Ctrl-Break stops only a non-VC child that has not installed INT 1Bh.
  * Return 0 when the dispatcher should deliver the guest's own interrupt. */

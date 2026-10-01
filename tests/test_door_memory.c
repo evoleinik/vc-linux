@@ -30,6 +30,13 @@ const Image image_bootlogo = {.name = "BOOTLOGO.COM"};
 const Image image_rogue = {.name = "ROGUE.EXE"};
 const Image image_vz = {.name = "VZ.COM"};
 const Image image_kermit = {.name = "KERMIT.EXE"};
+const Image image_command = {.name = "COMMAND.COM"};
+const Image image_edlin = {.name = "EDLIN.COM"};
+const Image image_debug = {.name = "DEBUG.COM"};
+const Image image_find = {.name = "FIND.EXE"};
+const Image image_more = {.name = "MORE.COM"};
+const Image image_sort = {.name = "SORT.EXE"};
+const Image image_fc = {.name = "FC.EXE"};
 const EmbeddedFile embedded_files[] = {{"VC.COM", vc_bytes, sizeof vc_bytes}};
 const int embedded_file_count = 1;
 
@@ -92,8 +99,10 @@ static void overlapping_psp(void) {
     cpu.si = 0x4000;
     (void)do_int(0x21);
     for (unsigned i = 0; i < sizeof before; ++i)
-        if (i != 2 && i != 3 && i != 0x16 && i != 0x17)
+        if (i != 2 && i != 3 && i != 0x16 && i != 0x17 && !(i >= 0x32 && i <= 0x37))
             CHECK(mem[lin(0x2001, (uint16_t)i)] == before[i]);
+    CHECK(rd16(0x2001, 0x32) == 20);
+    CHECK(rd16(0x2001, 0x34) == 0x18 && rd16(0x2001, 0x36) == 0x2001);
     puts("door memory: overlapping AH=55h PSP copy is safe");
 }
 

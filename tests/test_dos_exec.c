@@ -4,6 +4,7 @@
 #include "rt.h"
 #include "hle.h"
 #include "dos_fs.h"
+#include "guest_mem.h"
 
 #include <assert.h>
 #include <dirent.h>
@@ -24,6 +25,13 @@ static const uint8_t logo_file[] = {0xB8, 0x04, 0x00, 0xCD, 0x10, 0xCD, 0x20};
 static const uint8_t rogue_file[] = {'M', 'Z', 3, 0, 0, 0, 0, 0, 0xB8, 0x00, 0x4C, 0xCD, 0x21};
 static const uint8_t vz_file[] = {0xB8, 0x00, 0x4C, 0xCD, 0x21};
 static const uint8_t kermit_file[] = {'M', 'Z', 4, 0, 0, 0, 0, 0, 0x90, 0x90, 0xCB};
+static const uint8_t command_file[] = {0xB8, 0x00, 0x30, 0xCD, 0x21, 0xCB};
+static const uint8_t edlin_file[] = {0xB8, 0x01, 0x30, 0xCD, 0x21, 0xCB};
+static const uint8_t debug_file[] = {0xB8, 0x02, 0x30, 0xCD, 0x21, 0xCB};
+static const uint8_t find_file[] = {0xB8, 0x03, 0x30, 0xCD, 0x21, 0xCB};
+static const uint8_t more_file[] = {0xB8, 0x04, 0x30, 0xCD, 0x21, 0xCB};
+static const uint8_t sort_file[] = {0xB8, 0x05, 0x30, 0xCD, 0x21, 0xCB};
+static const uint8_t fc_file[] = {0xB8, 0x06, 0x30, 0xCD, 0x21, 0xCB};
 static const uint8_t association[] = "bas: gwbasic !.!\r\ntak: kermit stay, take !.!\r\n";
 const Image image_vc_com = {.name = "VC.COM", .bytes = vc_file, .size = sizeof vc_file};
 const Image image_vc_ovl = {
@@ -44,6 +52,14 @@ const Image image_kermit = {
     .name = "KERMIT.EXE", .is_exe = 1, .bytes = kermit_file + 8, .size = sizeof kermit_file - 8,
     .hdr_sp = 0x100, .min_alloc = 0x10, .max_alloc = 0x20,
 };
+#define DOS_IMAGE(symbol, label, file) const Image symbol = {.name = label, .bytes = file, .size = sizeof file}
+DOS_IMAGE(image_command, "COMMAND.COM", command_file);
+DOS_IMAGE(image_edlin, "EDLIN.COM", edlin_file);
+DOS_IMAGE(image_debug, "DEBUG.COM", debug_file);
+DOS_IMAGE(image_find, "FIND.EXE", find_file);
+DOS_IMAGE(image_more, "MORE.COM", more_file);
+DOS_IMAGE(image_sort, "SORT.EXE", sort_file);
+DOS_IMAGE(image_fc, "FC.EXE", fc_file);
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file}, {"VC.EXT", association, sizeof association - 1},
@@ -52,17 +68,32 @@ const EmbeddedFile embedded_files[] = {
     {"ROGUE.EXE", rogue_file, sizeof rogue_file},
     {"VZ.COM", vz_file, sizeof vz_file},
     {"KERMIT.EXE", kermit_file, sizeof kermit_file},
+    {"COMMAND.COM", command_file, sizeof command_file},
+    {"EDLIN.COM", edlin_file, sizeof edlin_file},
+    {"DEBUG.COM", debug_file, sizeof debug_file},
+    {"FIND.EXE", find_file, sizeof find_file},
+    {"MORE.COM", more_file, sizeof more_file},
+    {"SORT.EXE", sort_file, sizeof sort_file},
+    {"FC.EXE", fc_file, sizeof fc_file},
 };
 const int embedded_file_count = sizeof embedded_files / sizeof embedded_files[0];
 int hle_redirect, rt_exited, rt_exit_code;
 static const Image *registered;
 static const Image *captured_parent;
+static uint16_t command_psp;
 static int capture_fails;
 static unsigned host_runs, checks, renders;
 static uint16_t parent_psp;
 static char fixture[128], original_cwd[4096], output[4096];
 
-void rt_register_image(const Image *img, uint16_t seg) { (void)seg; registered = img; }
+void rt_register_image(const Image *img, uint16_t seg) {
+    registered = img;
+    if (img == &image_command) command_psp = (uint16_t)(seg - 0x10);
+}
+const Image *rt_image_return(const char *name, uint16_t cs, uint16_t ip) {
+    return !strcmp(name, "COMMAND.COM") && command_psp && cs == command_psp && ip == 0x105 ?
+           &image_command : NULL;
+}
 RtProcessState *rt_save_process_state(const Image *parent) {
     captured_parent = parent;
     return capture_fails ? NULL : malloc(1);
@@ -76,6 +107,7 @@ void term_resume(void) {}
 void term_shutdown(void) {}
 void term_render(void) { ++renders; }
 void term_idle(int ms) { (void)ms; }
+int dos_con_int21(void) { cpu.a.x = 0; cpu.cf = 0; return 1; }
 void con_write(const uint8_t *buf, size_t n) {
     size_t used = strlen(output), room = sizeof output - used - 1;
     if (n > room) n = room;
@@ -109,6 +141,7 @@ static void guest_string(uint16_t off, const char *text) {
 static void fresh_machine(void) {
     dos_core_init();
     dos_fs_init();
+    command_psp = 0;
     char file[256];
     snprintf(file, sizeof file, "%s/VC.COM", fixture);
     dos_start(file, (const uint8_t *)"", 0);
@@ -196,6 +229,392 @@ static void end_child(void) {
     CHECK(cpu.sp == 0xE000 && cpu.ifl && !cpu.cf);
     cpu.a.h = 0x4D;
     CHECK(dos_core_int21() && cpu.a.x == 42);
+}
+
+static void check_dos_version(uint16_t expected) {
+    cpu.a.x = 0x3000;
+    CHECK(dos_core_int21() && cpu.a.x == expected);
+    CHECK(rd16(cpu.ds, 0x40) == expected);
+    /* SETVER never changes the true-version service. */
+    cpu.a.x = 0x3306;
+    CHECK(dos_core_int21() && cpu.b.x == 0x0A07);
+}
+
+static void test_setver(void) {
+    const Image *const dos2[] = {&image_command, &image_edlin, &image_debug,
+        &image_find, &image_more, &image_sort, &image_fc};
+    for (unsigned i = 0; i < sizeof dos2 / sizeof dos2[0]; ++i) {
+        fresh_machine();
+        check_dos_version(0x0A07);
+        /* Selection is by the matched translation, not a user-controlled
+         * filename. Renamed copies need exactly the same compatibility. */
+        host_file("RENAMED.COM", dos2[i]->bytes, dos2[i]->size);
+        exec_file("RENAMED.COM", "");
+        CHECK(registered == dos2[i]);
+        check_dos_version(0x0002);
+        end_child();
+        check_dos_version(0x0A07);
+    }
+    fresh_machine();
+    host_file("COMMAND.COM", basic_file, sizeof basic_file);
+    exec_file("COMMAND.COM", "");
+    CHECK(registered == &image_gwbasic);
+    check_dos_version(0x0A07);
+    end_child();
+}
+
+static void test_job_file_table(void) {
+    fresh_machine();
+    host_file("REDIRECT.TXT", (const uint8_t *)"xyz", 3);
+    guest_string(0x3400, "REDIRECT.TXT");
+    cpu.ds = parent_psp; cpu.d.x = 0x3400; cpu.a.x = 0x3D00;
+    CHECK(dos_fs_int21() && !cpu.cf);
+    uint16_t handle = cpu.a.x;
+    uint8_t system_file = rd8(parent_psp, (uint16_t)(0x18 + handle));
+    CHECK(system_file != 0xFF);
+    uint8_t console = rd8(parent_psp, 0x18);
+    /* COMMAND.COM redirects by MOV/XCHG in the PSP, not by INT 21h/46h. */
+    wr8(parent_psp, (uint16_t)(0x18 + handle), 0xFF);
+    wr8(parent_psp, 0x18, system_file);
+    cpu.a.h = 0x3F; cpu.b.x = 0; cpu.c.x = 1; cpu.d.x = 0x3500;
+    CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == 1 && rd8(parent_psp, 0x3500) == 'x');
+    exec_file("BASIC.EXE", "");
+    CHECK(registered == &image_gwbasic && rd8(cpu.ds, 0x18) == system_file);
+    cpu.a.h = 0x3F; cpu.b.x = 0; cpu.c.x = 1; cpu.d.x = 0x180;
+    CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == 1 && rd8(cpu.ds, 0x180) == 'y');
+    end_child();
+    cpu.a.h = 0x3F; cpu.b.x = 0; cpu.c.x = 1; cpu.d.x = 0x3500;
+    CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == 1 && rd8(parent_psp, 0x3500) == 'z');
+    cpu.a.h = 0x3E; cpu.b.x = 0;
+    CHECK(dos_fs_int21() && !cpu.cf && rd8(parent_psp, 0x18) == 0xFF);
+    wr8(parent_psp, 0x18, console);
+    /* Unclosed ordinary handles belong to the child, just like FCB opens. */
+    for (unsigned i = 0; i < 80; ++i) {
+        exec_file("BASIC.EXE", "");
+        memcpy(mem + lin(cpu.ds, 0x180), "REDIRECT.TXT", 13);
+        cpu.a.x = 0x3D00; cpu.d.x = 0x180;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        end_child();
+    }
+}
+
+static void test_default_fcbs(void) {
+    fresh_machine();
+    host_file("EDLIN.COM", edlin_file, sizeof edlin_file);
+    exec_file("EDLIN.COM", " EDIT.TXT SECOND.BAS");
+    CHECK(registered == &image_edlin);
+    CHECK(rd8(cpu.ds, 0x5C) == 0 && rd8(cpu.ds, 0x6C) == 0);
+    CHECK(!memcmp(mem + lin(cpu.ds, 0x5D), "EDIT    TXT", 11));
+    CHECK(!memcmp(mem + lin(cpu.ds, 0x6D), "SECOND  BAS", 11));
+    CHECK(cpu.a.x == 0);
+    end_child();
+}
+
+static void full_job_table_create(uint16_t function) {
+    fresh_machine();
+    host_file("HOLD.TXT", (const uint8_t *)"x", 1);
+    host_file("KEEP.TXT", (const uint8_t *)"keep these bytes", 16);
+    guest_string(0x3400, "HOLD.TXT");
+    for (unsigned i = 5; i < 20; ++i) {
+        cpu.ds = parent_psp; cpu.d.x = 0x3400; cpu.a.x = 0x3D00;
+        CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == i);
+    }
+    /* There are free system slots, but no free slot in this PSP. Failure
+     * must happen before a create/truncate has any filesystem side effect. */
+    const char *name = function == 0x5A00 ? "TEMPFULL\\" :
+                       function == 0x5B00 ? "NEWFULL.TXT" : "KEEP.TXT";
+    if (function == 0x5A00) CHECK(mkdir("TEMPFULL", 0700) == 0);
+    guest_string(0x3400, name);
+    cpu.ds = parent_psp; cpu.d.x = 0x3400; cpu.c.x = 0; cpu.a.x = function;
+    if (function == 0x6C00) { cpu.si = 0x3400; cpu.b.x = 2; cpu.d.x = 0x12; }
+    CHECK(dos_fs_int21() && cpu.cf && cpu.a.x == 4);
+    if (function == 0x5A00) {
+        DIR *dir = opendir("TEMPFULL");
+        CHECK(dir != NULL);
+        struct dirent *entry;
+        while ((entry = readdir(dir)))
+            CHECK(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."));
+        CHECK(closedir(dir) == 0);
+        CHECK(rmdir("TEMPFULL") == 0);
+    } else if (function == 0x5B00) {
+        struct stat st;
+        CHECK(stat("NEWFULL.TXT", &st) < 0 && errno == ENOENT);
+    } else {
+        FILE *file = fopen("KEEP.TXT", "rb");
+        CHECK(file != NULL);
+        uint8_t bytes[32];
+        CHECK(fread(bytes, 1, sizeof bytes, file) == 16);
+        CHECK(!memcmp(bytes, "keep these bytes", 16));
+        CHECK(fclose(file) == 0);
+    }
+}
+
+static void test_full_jft_create(void) { full_job_table_create(0x3C00); }
+static void test_full_jft_extended_create(void) { full_job_table_create(0x6C00); }
+static void test_full_jft_new_create(void) { full_job_table_create(0x5B00); }
+static void test_full_jft_temporary(void) { full_job_table_create(0x5A00); }
+
+static void test_grow_job_file_table(void) {
+    fresh_machine();
+    CHECK(rd16(parent_psp, 0x32) == 20);
+    cpu.a.x = 0x6700; cpu.b.x = 40;
+    CHECK((dos_fs_int21() || dos_core_int21()) && !cpu.cf);
+    CHECK(rd16(parent_psp, 0x32) >= 40);
+    uint16_t table_seg = rd16(parent_psp, 0x36), table_off = rd16(parent_psp, 0x34);
+    CHECK(table_seg != parent_psp && table_off == 0);
+    for (unsigned i = 0; i < 5; ++i) CHECK(rd8(table_seg, (uint16_t)i) == i);
+    host_file("GROWHOLD.TXT", (const uint8_t *)"x", 1);
+    guest_string(0x3400, "GROWHOLD.TXT");
+    for (unsigned i = 5; i < 40; ++i) {
+        cpu.ds = parent_psp; cpu.d.x = 0x3400; cpu.a.x = 0x3D00;
+        CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == i);
+    }
+    /* EXEC inherits DOS's first 20 slots, without moving the parent's table. */
+    exec_file("BASIC.EXE", "");
+    CHECK(rd16(cpu.ds, 0x32) == 20 && rd8(cpu.ds, 0x18 + 19) == rd8(table_seg, 19));
+    end_child();
+    CHECK(rd16(parent_psp, 0x36) == table_seg);
+    cpu.a.x = 0x6700; cpu.b.x = 65;
+    CHECK((dos_fs_int21() || dos_core_int21()) && cpu.cf && cpu.a.x == 4);
+    CHECK(rd16(parent_psp, 0x36) == table_seg && rd16(parent_psp, 0x32) >= 40);
+    cpu.a.x = 0x6700; cpu.b.x = 20;
+    CHECK((dos_fs_int21() || dos_core_int21()) && !cpu.cf);
+    CHECK(rd16(parent_psp, 0x36) == table_seg && rd8(table_seg, 39) != 0xFF);
+    cpu.a.h = 0x48; cpu.b.x = 0x100;
+    CHECK(dos_core_int21() && !cpu.cf);
+    uint16_t child = cpu.a.x;
+    cpu.a.h = 0x55; cpu.d.x = child; cpu.si = (uint16_t)(child + 0x100);
+    CHECK(dos_core_int21());
+    CHECK(rd16(child, 0x32) == 20 && rd16(child, 0x36) == child);
+    CHECK(rd8(child, 0x18 + 19) == rd8(table_seg, 19));
+    dos_fs_close_process(child);
+    cpu.a.h = 0x50; cpu.b.x = parent_psp;
+    CHECK(dos_core_int21());
+    cpu.a.h = 0x49; cpu.es = child;
+    CHECK(dos_core_int21() && !cpu.cf);
+    cpu.ds = parent_psp; cpu.d.x = 0x3500; cpu.b.x = 39; cpu.c.x = 1; cpu.a.h = 0x3F;
+    CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == 1 && rd8(parent_psp, 0x3500) == 'x');
+}
+
+static void test_dos_hosted_loader(void) {
+    for (unsigned initial_break = 0; initial_break < 2; ++initial_break)
+    for (unsigned defect = 0; defect < 3; ++defect) {
+        fresh_machine();
+        host_file("COMMAND.COM", command_file, sizeof command_file);
+        host_file("LOADED.COM", edlin_file, sizeof edlin_file);
+        exec_file("COMMAND.COM", "");
+        CHECK(registered == &image_command);
+        uint16_t shell = cpu.ds;
+        /* EXEC.ASM:140-145 queries BREAK, then temporarily disables it.
+         * A legitimate BREAK OFF before EXEC must remain off after failure. */
+        cpu.a.x = 0x3301; cpu.d.l = 1;
+        CHECK(dos_core_int21());
+        if (!initial_break) {
+            cpu.a.x = 0x3301; cpu.d.l = 0;
+            CHECK(dos_core_int21());
+        }
+        cpu.a.x = 0x3300;
+        CHECK(dos_core_int21() && cpu.d.l == initial_break);
+        cpu.a.x = 0x3301; cpu.d.l = 0;
+        CHECK(dos_core_int21());
+        cpu.a.h = 0x4A; cpu.es = shell; cpu.b.x = 0x1000;
+        CHECK(dos_core_int21() && !cpu.cf);
+        cpu.a.h = 0x48; cpu.b.x = 0x1000;
+        CHECK(dos_core_int21() && !cpu.cf);
+        uint16_t child = cpu.a.x;
+        wr16((uint16_t)(child - 1), 1, child);
+        memcpy(mem + lin(shell, 0x600), "LOADED.COM", 11);
+        cpu.a.x = 0x3D00; cpu.ds = shell; cpu.d.x = 0x600;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        uint16_t file = cpu.a.x;
+        cpu.a.h = 0x3F; cpu.b.x = file; cpu.ds = (uint16_t)(child + 0x10);
+        cpu.d.x = 0; cpu.c.x = sizeof edlin_file;
+        CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == sizeof edlin_file);
+        cpu.a.h = 0x3E;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        if (defect == 1) mem[lin((uint16_t)(child + 0x10), 0)] ^= 1;
+        if (defect == 2) host_file("LOADED.COM", command_file, sizeof command_file);
+        wr16(shell, 0x2E, 0x500); wr16(shell, 0x30, shell);
+        const uint16_t frame[] = {0x4B00, 0, 0, 0, 0, 0, 0, shell, shell, 0x6789, shell, 0x202};
+        for (unsigned i = 0; i < sizeof frame / sizeof frame[0]; ++i)
+            wr16(shell, (uint16_t)(0x500 + 2 * i), frame[i]);
+        cpu.cs = cpu.ss = shell; cpu.sp = 0x900;
+        cpu_int(0x21, 0x105); /* AH55 really originates in COMMAND's loader. */
+        cpu.a.h = 0x55; cpu.d.x = child; cpu.si = (uint16_t)(child + 0x1000);
+        hle_redirect = 0;
+        CHECK(dos_core_int21());
+        if (defect) {
+            CHECK(hle_redirect && cpu.cf && cpu.a.x == 11);
+        } else {
+            CHECK(!hle_redirect && registered == &image_edlin);
+            cpu.ds = child;
+            check_dos_version(0x0002);
+            /* A successful EXEC runs the source's restore_ctrlc itself.
+             * The child may then intentionally change this global setting. */
+            cpu.a.x = 0x3301; cpu.d.l = (uint8_t)initial_break;
+            CHECK(dos_core_int21());
+            cpu.a.x = 0x3301; cpu.d.l = (uint8_t)!initial_break;
+            CHECK(dos_core_int21());
+            /* The real loader finishes the child exit vector after AH55. */
+            wr16(child, 0x0A, 0x6789); wr16(child, 0x0C, shell);
+            cpu.a.x = 0x4C00;
+            CHECK(dos_core_int21() && hle_redirect);
+        }
+        CHECK(cpu.cs == shell && cpu.ip == 0x6789 && cpu.ss == shell && cpu.sp == 0x518);
+        CHECK(cpu.ds == shell && cpu.ifl);
+        unsigned expected_break = defect ? initial_break : !initial_break;
+        cpu.a.x = 0x3300;
+        CHECK(dos_core_int21() && cpu.d.l == expected_break);
+        end_child();
+        cpu.a.x = 0x3300;
+        CHECK(dos_core_int21() && cpu.d.l == expected_break);
+    }
+}
+
+static void nested_dos_hosted_loader(unsigned defect) {
+    fresh_machine();
+    uint16_t root = parent_psp;
+    host_file("COMMAND.COM", command_file, sizeof command_file);
+    host_file("LOADED.COM", edlin_file, sizeof edlin_file);
+    exec_file("COMMAND.COM", "");
+    CHECK(registered == &image_command);
+    uint16_t shell = cpu.ds;
+    cpu.a.h = 0x4A; cpu.es = shell; cpu.b.x = 0x1000;
+    CHECK(dos_core_int21() && !cpu.cf);
+    parent_psp = shell;
+    cpu.cs = cpu.ss = shell; cpu.sp = 0xE000;
+    exec_file("BASIC.EXE", "");
+    CHECK(registered == &image_gwbasic);
+    uint16_t caller = cpu.ds;
+    cpu.a.h = 0x4A; cpu.es = caller; cpu.b.x = 0x1000;
+    CHECK(dos_core_int21() && !cpu.cf);
+    cpu.a.h = 0x48; cpu.b.x = 0x1000;
+    CHECK(dos_core_int21() && !cpu.cf);
+    uint16_t child = cpu.a.x;
+    wr16((uint16_t)(child - 1), 1, child);
+    CHECK(!guest_write(lin(caller, 0x600), "LOADED.COM", 11));
+    cpu.a.x = 0x3D00; cpu.ds = caller; cpu.d.x = 0x600;
+    CHECK(dos_fs_int21() && !cpu.cf);
+    uint16_t file = cpu.a.x;
+    cpu.a.h = 0x3F; cpu.b.x = file; cpu.ds = (uint16_t)(child + 0x10);
+    cpu.d.x = 0; cpu.c.x = sizeof edlin_file;
+    CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == sizeof edlin_file);
+    cpu.a.h = 0x3E;
+    CHECK(dos_fs_int21() && !cpu.cf);
+    wr16(caller, 0x2E, 0x500); wr16(caller, 0x30, caller);
+    const uint16_t frame[] = {0x4B00, 0, 0, 0, 0, 0, 0, caller, caller, 0x6789, caller, 0x202};
+    for (unsigned i = 0; i < sizeof frame / sizeof frame[0]; ++i)
+        wr16(caller, (uint16_t)(0x500 + 2 * i), frame[i]);
+    cpu.cs = cpu.ss = shell; cpu.sp = 0x900;
+    cpu_int(0x21, 0x105);
+    cpu.a.x = 0x3301; cpu.d.l = 1;
+    CHECK(dos_core_int21());
+    cpu.a.x = 0x3300;
+    CHECK(dos_core_int21() && cpu.d.l == 1);
+    cpu.a.x = 0x3301; cpu.d.l = 0;
+    CHECK(dos_core_int21());
+    if (defect) wr8((uint16_t)(child + 0x10), 0, 0x90);
+    cpu.a.h = 0x55; cpu.d.x = child; cpu.si = (uint16_t)(child + 0x1000);
+    hle_redirect = 0;
+    CHECK(dos_core_int21());
+    if (defect) {
+        CHECK(hle_redirect && cpu.cf && cpu.a.x == 11);
+    } else {
+        CHECK(!hle_redirect && registered == &image_edlin);
+        CHECK(captured_parent == &image_gwbasic);
+        CHECK(rd16(child, 0x16) == caller && rd16(child, 0x40) == 0x0002);
+        /* A successful load executes COMMAND's restore_ctrlc itself. */
+        cpu.a.x = 0x3301; cpu.d.l = 1;
+        CHECK(dos_core_int21());
+        wr16(child, 0x0A, 0x6789); wr16(child, 0x0C, caller);
+        cpu.a.x = 0x4C00;
+        CHECK(dos_core_int21() && hle_redirect);
+    }
+    CHECK(cpu.cs == caller && cpu.ip == 0x6789 && cpu.ss == caller && cpu.sp == 0x518);
+    cpu.a.x = 0x3300;
+    CHECK(dos_core_int21() && cpu.d.l == 1);
+    end_child(); /* BASIC returns to COMMAND, then COMMAND to root VC. */
+    parent_psp = root;
+    end_child();
+}
+
+static void test_nested_dos_hosted_loader(void) {
+    for (unsigned defect = 0; defect < 2; ++defect) nested_dos_hosted_loader(defect);
+}
+
+static void test_ah55_descendant_lifetime(void) {
+    fresh_machine();
+    host_file("LIFETIME.TXT", (const uint8_t *)"shared", 6);
+    for (unsigned i = 0; i < 80; ++i) {
+        exec_file("BASIC.EXE", "");
+        CHECK(registered == &image_gwbasic);
+        uint16_t caller = cpu.ds;
+        CHECK(!guest_write(lin(caller, 0x180), "LIFETIME.TXT", 13));
+        cpu.a.x = 0x3D00; cpu.ds = caller; cpu.d.x = 0x180;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        cpu.a.h = 0x48; cpu.b.x = 0x100;
+        CHECK(dos_core_int21() && !cpu.cf);
+        uint16_t child = cpu.a.x;
+        cpu.a.h = 0x55; cpu.d.x = child; cpu.si = (uint16_t)(child + 0x100);
+        CHECK(dos_core_int21());
+        CHECK(rd16(child, 0x16) == caller);
+        /* DEBUG's load-without-execution switches back to its own PSP;
+         * quitting the owner still must release this inherited handle. */
+        cpu.a.h = 0x50; cpu.b.x = caller;
+        CHECK(dos_core_int21());
+        end_child();
+    }
+}
+
+static void test_abort_ah55_descendant(void) {
+    fresh_machine();
+    exec_file("BASIC.EXE", "");
+    CHECK(registered == &image_gwbasic);
+    uint16_t caller = cpu.ds;
+    for (unsigned depth = 0; depth < 2; ++depth) {
+        cpu.a.h = 0x48; cpu.b.x = 0x100;
+        CHECK(dos_core_int21() && !cpu.cf);
+        uint16_t child = cpu.a.x;
+        cpu.a.h = 0x55; cpu.d.x = child; cpu.si = (uint16_t)(child + 0x100);
+        CHECK(dos_core_int21());
+    }
+    cpu.cs = cpu.ip = 0;
+    CHECK(dos_abort_untranslated());
+    CHECK(hle_redirect && cpu.cs == parent_psp && cpu.ip == 0x2345);
+    CHECK(cpu.sp == 0xE000 && cpu.ifl && !cpu.cf);
+    CHECK(strstr(output, "GWBASIC.EXE stopped."));
+    CHECK(rd16((uint16_t)(caller - 1), 1) == 0);
+    cpu.a.h = 0x4D;
+    CHECK(dos_core_int21() && cpu.a.x == 70);
+    CHECK(!dos_abort_untranslated()); /* Root VC retains its fatal gate. */
+}
+
+static void test_abort_nested_vc(void) {
+    const char *names[] = {"VC.COM", "VC.OVL"};
+    for (unsigned which = 0; which < sizeof names / sizeof names[0]; ++which) {
+        fresh_machine();
+        uint16_t root = parent_psp;
+        host_file("COMMAND.COM", command_file, sizeof command_file);
+        exec_file("COMMAND.COM", "");
+        CHECK(registered == &image_command);
+        uint16_t shell = cpu.ds;
+        cpu.a.h = 0x4A; cpu.es = shell; cpu.b.x = 0x1000;
+        CHECK(dos_core_int21() && !cpu.cf);
+        parent_psp = shell;
+        cpu.cs = cpu.ss = shell; cpu.sp = 0xE000;
+        exec_file(names[which], "");
+        CHECK(registered == (which ? &image_vc_ovl : &image_vc_com));
+        cpu.cs = cpu.ip = 0;
+        CHECK(dos_abort_untranslated());
+        CHECK(hle_redirect && cpu.cs == shell && cpu.ip == 0x2345);
+        CHECK(cpu.sp == 0xE000 && cpu.ifl && !cpu.cf);
+        CHECK(strstr(output, which ? "VC.OVL stopped." : "VC.COM stopped."));
+        cpu.a.h = 0x4D;
+        CHECK(dos_core_int21() && cpu.a.x == 70);
+        parent_psp = root;
+        end_child();
+        CHECK(!dos_abort_untranslated());
+    }
 }
 
 static void test_exec_identity(void) {
@@ -1139,6 +1558,19 @@ int main(int argc, char **argv) {
     host_file("BASIC.EXE", basic_file, sizeof basic_file);
     const struct { const char *name; void (*run)(void); } suites[] = {
         {"identity", test_exec_identity},
+        {"setver", test_setver},
+        {"jft", test_job_file_table},
+        {"default-fcbs", test_default_fcbs},
+        {"jft-full-create", test_full_jft_create},
+        {"jft-full-extended", test_full_jft_extended_create},
+        {"jft-full-new", test_full_jft_new_create},
+        {"jft-full-temp", test_full_jft_temporary},
+        {"jft-grow", test_grow_job_file_table},
+        {"dos-loader", test_dos_hosted_loader},
+        {"nested-dos-loader", test_nested_dos_hosted_loader},
+        {"ah55-lifetime", test_ah55_descendant_lifetime},
+        {"ah55-abort", test_abort_ah55_descendant},
+        {"nested-vc-abort", test_abort_nested_vc},
         {"logo", test_logo_identity},
         {"rogue-identity", test_rogue_identity},
         {"vz-identity", test_vz_identity_and_edit},

@@ -30,9 +30,10 @@ files, and as WebAssembly in any browser. No emulator runs at run time.
 | Rogue 5.4.4, the original roguelike | Michael Toy, Ken Arnold, Glenn Wichman, 1980-1985 | BSD-3 |
 | VZ Editor 1.6 | c.mos, Village Center, 1990s | BSD-3 |
 | MS-DOS Kermit 3.15 | Columbia University, 1982-1997 | BSD-3 (released 2011) |
+| MS-DOS 2.0 COMMAND.COM, EDLIN, DEBUG, FIND, MORE, SORT and FC | Microsoft, 1983 | MIT |
 
 **Try it in your browser: [notanemulator.com](https://notanemulator.com/).** VC starts at once,
-and runs VZ Editor, GW-BASIC, twelve classic BASIC games, bootLogo turtle graphics and Rogue
+and runs MS-DOS's shell and utilities, VZ Editor, GW-BASIC, twelve classic BASIC games, bootLogo turtle graphics and Rogue
 from its `H:` drive, the way DOS did. It is the same translated code, compiled to WebAssembly.
 
 ## How this differs from emulation and rewrites
@@ -84,7 +85,8 @@ goes to `~/.cache/vc-linux/vc.log`.
 | Ctrl-H | Show or hide dotfiles | dotfiles carry the DOS hidden attribute |
 | Ctrl-\\ | Go to the root of the drive | |
 | Alt-letter | Speed search | takes a `*` wildcard |
-| Command line | Translated DOS programs, else `/bin/sh` | Searches the current DOS directory and DOS `PATH` for `.COM`/`.EXE`; `vc` runs native VC; `cd ~` works |
+| Command line | Translated DOS programs; `/bin/sh` on Linux, COMMAND.COM in the browser | Searches the current DOS directory and DOS `PATH` for `.COM`/`.EXE`; Linux keeps its host shell |
+| `dos2` (Linux), `command` (browser) | Microsoft's original MS-DOS 2.0 shell | `DIR`, `TYPE`, `COPY`, `ECHO` and `.BAT` files; `EXIT` restores VC's panels |
 | Enter on `.BAS` | GW-BASIC | `SYSTEM` returns to VC; Ctrl-Pause or Ctrl-Shift-B stops BASIC |
 | `kermit take bbs.tak, stay` (Linux), or Enter on `H:\BBS.TAK` (browser) | Dial the BBS in MS-DOS Kermit | Ctrl-] then C returns to Kermit's prompt; `HANGUP`, then `EXIT`, returns to VC |
 | `bootlogo`, or Enter on `BOOTLOGO.COM` | bootLogo turtle graphics | `QUIT`, then VC's Enter confirmation returns to the panels |
@@ -93,6 +95,31 @@ goes to `~/.cache/vc-linux/vc.log`.
 
 Drives: `C:` is `/` and `H:` is your home directory. Names are shown in code page 866, so Cyrillic
 displays correctly.
+
+Type `dos2` on Linux, or `command` in the browser, for Microsoft's MS-DOS 2.0 prompt, then `dir`, `echo hello`,
+`type FILE.TXT`, or `copy FILE.TXT COPY.TXT`. `exit` returns to VC. The original
+EDLIN line editor, DEBUG, FIND, MORE, SORT and FC accompany it: for example,
+`find "x" FILE.TXT`, `sort < FILE.TXT`, and `fc FILE.TXT COPY.TXT` at its prompt.
+`debug` opens the `-` prompt; `q` quits. DEBUG can inspect files and memory,
+but newly assembled or modified code has no translation to execute.
+
+In the browser VC's ordinary command line also uses `H:\COMMAND.COM`, including
+batch files. Utilities and `DOS.TXT`, a guide with three examples, live in
+`H:\DOS` on DOS `PATH`. On Linux, `dos2` is the explicit DOS shell:
+ordinary VC commands still use `/bin/sh`, and Linux `COMSPEC` is unchanged.
+The seven DOS programs install in `$XDG_CONFIG_HOME/vc-linux/DOS2` (default
+`~/.config/vc-linux/DOS2`). Only COMMAND's own environment adds that directory
+to `PATH`: VC's `find`, `sort`, `more`, `fc` and `command -v git` retain their
+host-shell meanings. A byte-identical `DOS2.COM` alias sits beside the other
+installed programs, `DOS.TXT` and `DOSLIC.TXT` in the config directory. Exact
+unchanged copies from the old flat installation are retired; edited files and
+user-created symlinks stay untouched. No extra files are put directly in your
+home directory. Batch files on Linux run inside `dos2`.
+`make msdos2` builds the unedited vendored source with JWasm and JWlink.
+[`third_party/msdos2/UPSTREAM`](third_party/msdos2/UPSTREAM) records the Microsoft
+repository commit and MIT licence; the build's per-program comparison report
+[`third_party/msdos2/IDENTITY.md`](third_party/msdos2/IDENTITY.md) records where
+the sources postdate or differ from Microsoft's shipped binaries.
 
 Type `gwbasic` to run the original 1983 interpreter, translated ahead of time just like VC.
 Try `PRINT 2+2`, then `SYSTEM`. The installed `GWBASIC.EXE` is a real DOS file: EXEC reads it
@@ -190,10 +217,13 @@ WezTerm does too once `enable_kitty_keyboard` is on. xterm does it through modif
 
 The same translated C also compiles to WebAssembly with Emscripten. The page opens VC at once on a
 small in-memory `H:` drive holding a README, VC's history, its own assembly sources, VZ Editor,
-GW-BASIC, bootLogo, Rogue, and twelve of David Ahl's public-domain BASIC Computer Games. xterm.js
+GW-BASIC, bootLogo, Rogue, Microsoft's DOS shell and utilities, and twelve of David Ahl's
+public-domain BASIC Computer Games. xterm.js
 shows the screen in the IBM VGA font. The page reports keys in full, so Ctrl-[, Ctrl-I and Ctrl-M
-work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload. There is no shell,
-but F4 edits with VZ, and `cd` and translated DOS programs run from the command line. Open `GAMES` and
+work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload.
+The command line runs Microsoft's COMMAND.COM, including `dir`, `type`, `copy`,
+`echo` and `.BAT` files. `command` opens its prompt and `exit` returns to VC.
+F4 edits with VZ. Open `GAMES` and
 press Enter on a `.BAS` file to play. `BEEP`, `SOUND` and `PLAY` use a Web Audio square wave after
 the first key press. Use Ctrl-Pause or Ctrl-Shift-B to stop a game, then `SYSTEM` to return to VC.
 `BOOTLOGO.TXT` explains bootLogo with a square, a star and the original README's flower. The original
@@ -219,7 +249,7 @@ language in English, Russian or Ukrainian, and `H:\ПРОЧТИ.TXT` is the READ
 To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
 
     make web          # build/web/: index.html, vc.mjs, vc.wasm and one wasm per program
-    make test-web     # Node checks VC, VZ edits/saves, Rogue, BASIC, Logo, CGA pixels and sound
+    make test-web     # Node checks VC, DOS shell/utilities, editors, games, Kermit, graphics and sound
 
 Serve `build/web/` over HTTP to open it. The design is in `docs/plans/2026-10-01-browser-build.md`.
 
@@ -286,6 +316,7 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 | `test-exec` | Byte-identical EXEC, DOS search order, command tails, safe F4/associations, VZ path/temp limits and child cleanup. |
 | `test-machine` | Timer interrupts, IF, HLT, Ctrl-Break, PIT speaker frequencies and declared mutable operands. |
 | `test-kermit-build` | Unedited, licensed Kermit sources, a reproducible pure-assembly EXE and complete linked listings. |
+| `test-msdos2-build` | Unedited Microsoft sources, reproducible COMMAND.COM and six utilities, and per-program shipped-binary comparisons. |
 | `test-modem`, `test-serial-machine` | UART registers, DLAB, real IRQ 4/8259 EOI, INT 14h, Hayes commands, guard timing, 14400-bps pacing and exact telnet replies to the captured BBS. |
 | `test-modem-transport` | Real nonblocking TCP on loopback, including failure and disconnect behavior. |
 | `test-embed` | Exact native/web DOS-file round trips, VC image deduplication, and bounded startup decompression with corruption checks. |
@@ -293,7 +324,7 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 | `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,600 checks. |
 | `test-cga` | Every CGA mode and pixel address, palette, XOR/readback, graphics glyphs, cursor and scrolling: over 823,000 checks. |
 | `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
-| `test-web` | The WebAssembly build under Node: VC, VZ F4/edit/save/quit with MEMFS readback, Rogue play/save/restore, GW-BASIC, bootLogo, Kermit BBS dial/type/hangup/EXIT, exact CGA pixels, canvas transitions and sound. Needs Emscripten. |
+| `test-web` | The WebAssembly build under Node: VC, COMMAND.COM DIR/batch commands and all seven lazy DOS modules, VZ F4/edit/save/quit with MEMFS readback, Rogue play/save/restore, GW-BASIC, bootLogo, Kermit BBS dial/type/hangup/EXIT, exact CGA pixels, canvas transitions and sound. Needs Emscripten. |
 | `test-e2e` | VC in a pseudo-terminal: file operations and keys, real DOS launches, identity/injection checks, VZ editing and backups, Rogue play/save/restore, Kermit's full BBS workflow, Ctrl-Break, every shipped BASIC game's first prompt, Logo drawings and BASIC graphics. |
 
 Every finding from the three code reviews was fixed with a test that failed on the old code first.
@@ -391,6 +422,12 @@ VZ Editor 1.6 is by c.mos (Village Center), BSD-3-Clause (`third_party/vzeditor/
 The pinned US executable is reproduced byte-for-byte, with its original English definitions
 installed alongside it except for the backup-enabled `VZ.DEF` default described above.
 The browser drive includes its licence as `VZLIC.TXT`.
+
+MS-DOS 2.0's COMMAND.COM, EDLIN, DEBUG, FIND, MORE, SORT and FC are Microsoft
+source releases under the MIT licence (`third_party/msdos2/LICENSE`). Their
+source-built DOS files are translated independently and lazily loaded in the
+browser; `H:\DOS\DOSLIC.TXT` carries the licence there. A program-specific SETVER
+table reports DOS 2.0 to these seven images without changing other programs.
 
 The translator, runtime and tests are BSD 2-Clause (`LICENSE`). They were built with Claude Code
 and OpenAI Codex.

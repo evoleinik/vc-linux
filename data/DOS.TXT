@@ -1,0 +1,51 @@
+Microsoft's MS-DOS 2.0 command line
+
+COMMAND.COM is the original DOS shell: DIR, TYPE, COPY, ECHO and .BAT
+files run Microsoft's own assembly, built from source and translated to C.
+EDLIN.COM is the line editor; DEBUG.COM examines files and memory.
+FIND.EXE selects matching lines, MORE.COM pages text, SORT.EXE sorts lines,
+and FC.EXE compares files. Each utility is a real source-built DOS file.
+
+Source: https://github.com/microsoft/MS-DOS, v2.0/source
+Commit: 2d04cacc5322951f187bb17e017c12920ac8ebe2
+Microsoft released these sources under the MIT licence. DOSLIC.TXT has it.
+The unedited sources, README, licence and provenance are in third_party/msdos2.
+Some sources postdate the shipped 2.0 binaries; the build report records
+the first differing byte of each program. These are the source builds.
+
+In the browser COMMAND.COM is H:\COMMAND.COM; these utilities and this
+guide are in H:\DOS, on DOS PATH. Type COMMAND for a prompt, EXIT to return
+to VC. Ordinary commands on VC's command line also use COMMAND.COM.
+On Linux DOS2 opens the same DOS shell; ordinary VC commands still use
+/bin/sh. The seven programs install in the config directory's DOS2 folder,
+which is on PATH only inside COMMAND. A byte-identical DOS2.COM alias and
+this guide live in the config directory. FIND, SORT, MORE, FC and COMMAND
+on VC's command line keep their host-shell meaning; COMSPEC stays /bin/sh.
+Unchanged old flat copies are retired; edited files and symlinks are kept.
+No extra files are put directly in your home directory.
+
+Three things to try in the browser (or at the DOS2 prompt on Linux):
+On Linux, substitute one of your own text files for README.TXT.
+
+1. DIR
+   TYPE README.TXT
+   COPY README.TXT COPY.TXT
+   Inspect COPY.TXT with VC's F3 viewer.
+
+2. EDLIN HELLO.BAT
+   At the * prompt type I, then enter these two lines:
+   ECHO hello from a batch file
+   DIR
+   Press Ctrl-Z, Enter to finish inserting, then E, Enter to save and exit.
+   Run HELLO. On Linux, run it from the DOS2 prompt.
+
+3. FIND "DOS" DOS\DOS.TXT
+   SORT < HELLO.BAT
+   MORE < DOS\DOS.TXT
+   FC README.TXT COPY.TXT
+   On Linux use the guide's DOS path in the config directory instead.
+
+DEBUG shows a - prompt; Q quits. Newly assembled or modified machine code
+has no ahead-of-time translation: DEBUG's G/T are not a general emulator.
+There are no physical floppy disks or raw disk devices to format or repair.
+As with every H: file in the browser, edits disappear when the page reloads.

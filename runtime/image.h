@@ -38,6 +38,13 @@ extern const Image image_bootlogo;
 extern const Image image_rogue;
 extern const Image image_vz;
 extern const Image image_kermit;
+extern const Image image_command;
+extern const Image image_edlin;
+extern const Image image_debug;
+extern const Image image_find;
+extern const Image image_more;
+extern const Image image_sort;
+extern const Image image_fc;
 /* Additional source-listed indirect DRAW entries; the original generated
  * GW-BASIC Image and its bytes remain unchanged. */
 int run_gwbasic_graphics(uint32_t off, uint16_t loadseg);

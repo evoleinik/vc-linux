@@ -13,5 +13,8 @@
 int embed_lzma_decode(uint8_t *dst, size_t dst_size,
                       const uint8_t *src, size_t src_size);
 uint32_t embed_adler32(const uint8_t *data, size_t size);
+/* Invert tools/embed.py's E8/E9 16-bit operand filter in place, after bounded
+ * decompression and BEFORE verifying the Adler-32 of the original bytes. */
+void embed_x86_16_restore(uint8_t *data, size_t size);
 
 #endif

@@ -614,6 +614,15 @@ class _InstructionEmitter:
                     (("cf", 0), ("pf", 2), ("af", 4), ("zf", 6), ("sf", 7))], False
         if op == "salc":
             return ["cpu.a.l = cpu.cf ? 0xffu : 0;"], False
+        if op == "daa":
+            return ["uint8_t old_al = cpu.a.l, old_cf = cpu.cf;", "cpu.cf = 0;",
+                    "if ((old_al & 15u) > 9u || cpu.af) {",
+                    "    cpu.a.l = (uint8_t)(cpu.a.l + 6u);",
+                    "    cpu.cf = old_cf || old_al > 0xf9u;", "    cpu.af = 1;",
+                    "} else { cpu.af = 0; }",
+                    "if (old_al > 0x99u || old_cf) {",
+                    "    cpu.a.l = (uint8_t)(cpu.a.l + 0x60u);", "    cpu.cf = 1;",
+                    "} else { cpu.cf = 0; }", "tr_szp(cpu.a.l, 8);"], False
         if op == "das":
             return ["uint8_t old_al = cpu.a.l, old_cf = cpu.cf;", "cpu.cf = 0;",
                     "if ((old_al & 15u) > 9u || cpu.af) {",

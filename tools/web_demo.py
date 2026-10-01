@@ -1,6 +1,6 @@
 """Assemble the shared, offline H: drive for the browser and native BBS doors.
 
-Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE KERMIT_EXE
+Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE KERMIT_EXE [MSDOS_DIR]
 The original assembly lives only in asm/; this copies it at build time.
 """
 from pathlib import Path
@@ -13,11 +13,12 @@ from vz_defaults import installed_definition
 
 
 ROOT = Path(__file__).resolve().parent.parent
-# Keep the previous programs within their 600 KB raw-drive budget. Kermit
-# adds one real DOS executable; the whole drive has a separate finite cap.
+# Keep the pre-Kermit programs within their original 600 KB raw-drive budget.
+# Later programs add real DOS executables; the whole drive has a finite cap.
 # First-load HTTP gzip remains independently limited to 1.3 MB by web_size.
 LEGACY_LIMIT = 600_000
 LIMIT = 1_000_000
+MSDOS_PROGRAMS = ("COMMAND.COM", "EDLIN.COM", "DEBUG.COM", "FIND.EXE", "MORE.COM", "SORT.EXE", "FC.EXE")
 
 
 def history_text(readme: str) -> bytes:
@@ -38,12 +39,16 @@ def history_text(readme: str) -> bytes:
 
 
 def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
-               vz: Path, kermit: Path) -> dict[str, bytes]:
+               vz: Path, kermit: Path, msdos: Path | None = None) -> dict[str, bytes]:
     """The sole content list/generator for both demo environments.
 
     Keep pathnames as UTF-8 host names and DOS text in its original encoding.
     Native doors embed this exact mapping, not a hand-maintained second list.
     """
+    # Preserve the shared door generator's six-image interface. Both callers
+    # use the same build tree; the browser can also name an explicit DOS tree.
+    if msdos is None:
+        msdos = kermit.parent.parent / "msdos2"
     files = {
         "README.TXT": (ROOT / "web/README.TXT").read_text(encoding="ascii").encode("ascii"),
         # Keep a readable UTF-8 source in git; only Russian has a complete
@@ -62,12 +67,16 @@ def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
         "BBS.TAK": (ROOT / "data/BBS.TAK").read_bytes(),
         "KERMIT.TXT": (ROOT / "data/KERMIT.TXT").read_bytes(),
         "KERMLIC.TXT": (ROOT / "third_party/mskermit/LICENSE").read_bytes(),
+        "DOS/DOS.TXT": (ROOT / "data/DOS.TXT").read_bytes(),
+        "DOS/DOSLIC.TXT": (ROOT / "third_party/msdos2/LICENSE").read_bytes(),
         "GAMES/SPIRAL.BAS": (ROOT / "web/GAMES/SPIRAL.BAS").read_text(encoding="ascii").replace("\n", "\r\n").encode("ascii"),
         "GAMES/ROGUE.EXE": rogue.read_bytes(),
         "GAMES/ROGUELIC.TXT": (ROOT / "third_party/rogue/LICENSE.TXT").read_bytes(),
         "GAMES/PDCLIC.TXT": (ROOT / "third_party/pdcurses/README.md").read_bytes(),
         "GAMES/OWLIC.TXT": rogue.with_name("OWLIC.TXT").read_bytes(),
     }
+    for name in MSDOS_PROGRAMS:
+        files[name if name == "COMMAND.COM" else f"DOS/{name}"] = (msdos / name).read_bytes()
     for name in ("VZFLE.DEF", "HELPE.DEF", "BLOCK.DEF", "PALET.DEF", "BW.DEF"):
         files[name] = (ROOT / "third_party/vzeditor/VZ-IBM" / name).read_bytes()
     for path in sorted(games.iterdir()):
@@ -76,7 +85,8 @@ def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
         files[f"SRC/{name}"] = (ROOT / "asm" / name).read_bytes()
 
     total = sum(map(len, files.values()))
-    legacy = total - sum(len(files[name]) for name in ("KERMIT.EXE", "BBS.TAK", "KERMIT.TXT", "KERMLIC.TXT"))
+    later_files = {"KERMIT.EXE", "BBS.TAK", "KERMIT.TXT", "KERMLIC.TXT", "COMMAND.COM"}
+    legacy = sum(len(data) for name, data in files.items() if name not in later_files and not name.startswith("DOS/"))
     if legacy >= LEGACY_LIMIT:
         raise SystemExit(f"Pre-Kermit demo is {legacy:,} bytes; it must stay below {LEGACY_LIMIT:,}")
     if total >= LIMIT:
@@ -85,7 +95,7 @@ def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
 
 
 def main() -> None:
-    if len(sys.argv) != 8:
+    if len(sys.argv) not in (8, 9):
         raise SystemExit(__doc__)
     destination = Path(sys.argv[1])
     files = demo_files(*(Path(arg) for arg in sys.argv[2:]))

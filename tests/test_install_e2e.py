@@ -1,18 +1,23 @@
 """VC's own images survive missing files and concurrent installer updates."""
 from contextlib import contextmanager
+from pathlib import Path
 import os
+import pty
 import resource
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
 from test_gwbasic_e2e import ROOT, VcSession, panels, running_vc, until
 
 
-PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE")
+MSDOS_PROGRAMS = ("COMMAND.COM", "EDLIN.COM", "DEBUG.COM", "FIND.EXE", "MORE.COM", "SORT.EXE", "FC.EXE")
+PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE",
+            "DOS2.COM", *(f"DOS2/{name}" for name in MSDOS_PROGRAMS))
 
 
 @contextmanager
@@ -34,6 +39,43 @@ def test_install_bootlogo_uses_its_own_name():
         assert not (config / "LOGO.COM").exists(), "the bundled interpreter must not shadow host logo"
 
 
+def test_install_msdos_programs_in_config_without_home_writes():
+    with tempfile.TemporaryDirectory(prefix="vcdos-", dir="/tmp") as path:
+        root = Path(path)
+        work, user_home, config_base = root / "work", root / "home", root / "config"
+        work.mkdir()
+        user_home.mkdir()
+        sentinel = user_home / "OWNED.TXT"
+        sentinel.write_bytes(b"the user's own file\n")
+        before = sentinel.stat()
+        session = VcSession(work, user_home, extra_env={
+            "XDG_CONFIG_HOME": str(config_base),
+            "XDG_CACHE_HOME": str(root / "cache"),
+            "VC_LOG": str(root / "vc.log"),
+            "VC_SCREEN_DUMP": str(root / "screen.txt"),
+            "VC_FRAME_DUMP": str(root / "frame.pgm"),
+        })
+        try:
+            session.wait_for("10Quit", timeout=15)
+            until(session, lambda: panels(session.text()))
+            config = config_base / "vc-linux"
+            for name in MSDOS_PROGRAMS:
+                assert (config / "DOS2" / name).read_bytes() == (ROOT / "build/msdos2" / name).read_bytes()
+                assert not (config / name).exists(), "a flat DOS program would capture a host command"
+            assert (config / "DOS2.COM").read_bytes() == (ROOT / "build/msdos2/COMMAND.COM").read_bytes()
+            assert (config / "DOS.TXT").read_bytes() == (ROOT / "data/DOS.TXT").read_bytes()
+            assert (config / "DOSLIC.TXT").read_bytes() == (ROOT / "third_party/msdos2/LICENSE").read_bytes()
+            assert not (config / "DOS").exists(), "the browser's DOS directory is not installed on Linux"
+            assert not (config / "SRC").exists(), "the browser's source demo must not install on Linux"
+            assert not (config / "GAMES").exists(), "the browser's games demo must not install on Linux"
+            assert sorted(entry.name for entry in user_home.iterdir()) == ["OWNED.TXT"]
+            after = sentinel.stat()
+            assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+            assert sentinel.read_bytes() == b"the user's own file\n"
+        finally:
+            session.close()
+
+
 @pytest.mark.parametrize("quick", [False, True], ids=["comspec", "int2e"])
 def test_install_leaves_logo_command_for_host(monkeypatch, quick):
     # Debian's UCBLogo owns the command "logo". A small host executable proves
@@ -51,6 +93,93 @@ def test_install_leaves_logo_command_for_host(monkeypatch, quick):
         assert result.read_text() == "host logo ran"
         until(session, lambda: panels(session.text()))
         assert session.poll() is None
+
+
+@pytest.mark.parametrize("quick", [False, True], ids=["comspec", "int2e"])
+@pytest.mark.parametrize("command", [
+    "find . -name MATCH.TXT", "sort INPUT.TXT", "more INPUT.TXT",
+    "fc INPUT.TXT MATCH.TXT", "command -v git",
+], ids=["find", "sort", "more", "fc", "command"])
+def test_install_preserves_host_shell_commands(monkeypatch, quick, command):
+    # No DOS executables in this working directory. Compare real /bin/sh
+    # output AND status, including a shell's own missing-command error for
+    # fc on hosts that do not provide it. Merely returning to VC is not a
+    # pass: all five names were captured by the bundled DOS installation.
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    with running_vc(quick=quick, files={
+            "INPUT.TXT": b"beta\nalpha\n", "MATCH.TXT": b"match\n",
+    }) as (session, work, _):
+        # MORE also checks whether stdin is a tty when stdout is redirected.
+        # Give the reference shell the same terminal/input conditions as VC.
+        master, slave = pty.openpty()
+        try:
+            baseline = subprocess.run(["/bin/sh", "-c", command, "sh"], cwd=work,
+                                      env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+                                           "TERM": "xterm-256color"}, stdin=slave,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      timeout=8)
+        finally:
+            os.close(slave)
+            os.close(master)
+        output, status = work / "HOST.TXT", work / "STATUS.TXT"
+        script = command + " > HOST.TXT 2>&1; printf '%s' $? > STATUS.TXT"
+        assert len(script) < 126
+        before = len(session.log.read_text())
+        session.send(script.encode(), "enter")
+        until(session, lambda: status.exists() or any(
+            f"translation {name}" in session.log.read_text()[before:]
+            for name in MSDOS_PROGRAMS) or session.poll() is not None)
+        log = session.log.read_text()[before:]
+        assert status.exists(), f"{command!r} did not reach /bin/sh:\n{log}"
+        until(session, lambda: panels(session.text()))
+        assert output.read_bytes() == baseline.stdout
+        assert int(status.read_text()) == baseline.returncode
+        assert f"run: {script} (in {work})" in log
+        assert not any(f"translation {name}" in log for name in MSDOS_PROGRAMS)
+        assert session.poll() is None
+
+
+@pytest.mark.parametrize("old_file", ["installed", "modified", "symlink", "dangling-symlink"])
+def test_install_retires_only_unchanged_flat_dos_programs(old_file):
+    with running_vc() as (_, work, config):
+        before = {}
+        for name in MSDOS_PROGRAMS:
+            original = (ROOT / "build/msdos2" / name).read_bytes()
+            legacy, target = config / name, work / ("USER" + Path(name).suffix)
+            if legacy.exists():
+                legacy.unlink()
+            if old_file in ("symlink", "dangling-symlink"):
+                # Use a distinct target for each image, not a shared .COM.
+                target = work / ("USER-" + name)
+                if old_file == "symlink":
+                    target.write_bytes(original)
+                legacy.symlink_to(target)
+                contents = original
+            else:
+                contents = original if old_file == "installed" else original[:-1] + bytes([original[-1] ^ 1])
+                legacy.write_bytes(contents)
+            before[name] = (legacy.lstat(), contents, target)
+        with another_vc(work, config) as second:
+            second.wait_for("10Quit", timeout=15)
+            until(second, lambda: panels(second.text()))
+            for name, (previous, contents, target) in before.items():
+                legacy = config / name
+                if old_file == "installed":
+                    assert not legacy.exists(), f"the old {name} still shadows a host command"
+                else:
+                    now = legacy.lstat()
+                    assert (now.st_ino, now.st_mtime_ns, now.st_mode) == (
+                        previous.st_ino, previous.st_mtime_ns, previous.st_mode)
+                    if old_file in ("symlink", "dangling-symlink"):
+                        assert legacy.is_symlink() and legacy.readlink() == target
+                        if old_file == "symlink":
+                            assert target.read_bytes() == contents
+                        else:
+                            assert not target.exists()
+                    else:
+                        assert legacy.read_bytes() == contents
+                assert (config / "DOS2" / name).read_bytes() == (ROOT / "build/msdos2" / name).read_bytes()
+            assert (config / "DOS2.COM").read_bytes() == (ROOT / "build/msdos2/COMMAND.COM").read_bytes()
 
 
 @pytest.mark.parametrize("old_file", ["installed", "modified", "symlink"])
@@ -135,6 +264,7 @@ def web_demo(destination):
         str(ROOT / "build/rogue/ROGUE.EXE"),
         str(ROOT / "build/vz/VZ.COM"),
         str(ROOT / "build/kermit/KERMIT.EXE"),
+        str(ROOT / "build/msdos2"),
     ], text=True, capture_output=True)
 
 
@@ -172,6 +302,21 @@ def test_web_demo_installs_real_rogue_and_licenses_in_games(tmp_path):
     assert (tmp_path / "GAMES/OWLIC.TXT").read_bytes() == (ROOT / "build/rogue/OWLIC.TXT").read_bytes()
     readme = (tmp_path / "README.TXT").read_text()
     assert all(text in readme for text in ("ROGUE.EXE", "Q then y", "S then y", "h (left)"))
+
+
+def test_web_demo_installs_source_built_dos_shell_and_utilities(tmp_path):
+    result = web_demo(tmp_path)
+    assert result.returncode == 0, result.stderr
+    for name in MSDOS_PROGRAMS:
+        target = tmp_path / name if name == "COMMAND.COM" else tmp_path / "DOS" / name
+        assert target.read_bytes() == (ROOT / "build/msdos2" / name).read_bytes()
+        if name != "COMMAND.COM":
+            assert not (tmp_path / name).exists(), "utilities belong in H:\\DOS, not H:'s root"
+    assert (tmp_path / "DOS/DOS.TXT").read_bytes() == (ROOT / "data/DOS.TXT").read_bytes()
+    assert (tmp_path / "DOS/DOSLIC.TXT").read_bytes() == (ROOT / "third_party/msdos2/LICENSE").read_bytes()
+    guide = (tmp_path / "DOS/DOS.TXT").read_text()
+    assert all(word in guide for word in (*MSDOS_PROGRAMS, "Microsoft", "MIT", "github.com/microsoft/MS-DOS"))
+    assert "1." in guide and "2." in guide and "3." in guide
 
 
 def test_web_demo_installs_vz_and_all_definitions_alongside_rogue(tmp_path):

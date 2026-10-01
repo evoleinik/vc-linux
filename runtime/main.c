@@ -163,9 +163,47 @@ static int install_file(const char *path, const EmbeddedFile *file) {
     return 0;
 }
 
+static int msdos_program(const char *name) {
+    static const char *const names[] = {
+        "COMMAND.COM", "EDLIN.COM", "DEBUG.COM", "FIND.EXE", "MORE.COM", "SORT.EXE", "FC.EXE",
+    };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (!strcmp(name, names[i])) return 1;
+    return 0;
+}
+
+/* Retire only our exact old default after publishing its replacement.
+ * Edited files, directories, and user-created links are not ours to remove. */
+static void retire_unchanged_program(const char *dir, const char *name, const EmbeddedFile *file) {
+    char path[4096];
+    int length = snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (length < 0 || (size_t)length >= sizeof path) {
+        fputs("vc: legacy program path is too long\n", stderr);
+        exit(1);
+    }
+    struct stat legacy;
+    if (!lstat(path, &legacy) && S_ISREG(legacy.st_mode) && file_matches(path, file) &&
+        unlink(path) && errno != ENOENT) {
+        fprintf(stderr, "vc: cannot retire %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+}
+
 /* Setup files are written once and then belong to the user. Program images
  * are updated to this binary's bytes, leaving matching installations alone. */
 static void install_files(const char *dir) {
+#ifndef __EMSCRIPTEN__
+    char dos_directory[4096];
+    int dos_length = snprintf(dos_directory, sizeof dos_directory, "%s/DOS2", dir);
+    if (dos_length < 0 || (size_t)dos_length >= sizeof dos_directory) {
+        fputs("vc: DOS2 program path is too long\n", stderr);
+        exit(1);
+    }
+    if (mkdirs(dos_directory)) {
+        fprintf(stderr, "vc: cannot create %s: %s\n", dos_directory, strerror(errno));
+        exit(1);
+    }
+#endif
     for (int i = 0; i < embedded_file_count; i++) {
         const EmbeddedFile *f = &embedded_files[i];
         char path[4096];
@@ -174,17 +212,25 @@ static void install_files(const char *dir) {
          * of sight under /var/vc/config, as before. */
         int rogue_asset = !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "ROGUELIC.TXT") ||
                           !strcmp(f->name, "PDCLIC.TXT") || !strcmp(f->name, "OWLIC.TXT");
+        int dos_asset = (msdos_program(f->name) && strcmp(f->name, "COMMAND.COM")) ||
+                        !strcmp(f->name, "DOS.TXT") || !strcmp(f->name, "DOSLIC.TXT");
         const char *ext = strrchr(f->name, '.');
         /* VZ loads its English definitions next to its COM, not VC.INI. */
         const char *target = rogue_asset ? "/home/vc/GAMES" :
+            dos_asset ? "/home/vc/DOS" :
             !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
             !strcmp(f->name, "VZ.COM") || !strcmp(f->name, "VZLIC.TXT") ||
             !strcmp(f->name, "KERMIT.EXE") || !strcmp(f->name, "KERMIT.TXT") ||
             !strcmp(f->name, "KERMLIC.TXT") || !strcmp(f->name, "BBS.TAK") ||
+            !strcmp(f->name, "COMMAND.COM") ||
+            !strcmp(f->name, "SRC/VC.ASM") || !strcmp(f->name, "SRC/VCOVL.ASM") ||
+            !strncmp(f->name, "GAMES/", 6) ||
             (ext && !strcmp(ext, ".DEF"))
             ? "/home/vc" : dir;
 #else
-        const char *target = dir;
+        /* VC still uses /bin/sh. Keep colliding utility names off its DOS
+         * PATH; only the explicit DOS2.COM shell alias belongs there. */
+        const char *target = msdos_program(f->name) ? dos_directory : dir;
 #endif
         int length = snprintf(path, sizeof path, "%s/%s", target, f->name);
         if (length < 0 || (size_t)length >= sizeof path) {
@@ -194,7 +240,7 @@ static void install_files(const char *dir) {
         int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL") ||
                       !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
                       !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "VZ.COM") ||
-                      !strcmp(f->name, "KERMIT.EXE");
+                      !strcmp(f->name, "KERMIT.EXE") || msdos_program(f->name);
         struct stat existing;
         if (!program && !lstat(path, &existing) &&
             (!S_ISREG(existing.st_mode) ||
@@ -203,21 +249,23 @@ static void install_files(const char *dir) {
             fprintf(stderr, "vc: cannot write %s: %s\n", path, strerror(errno));
             exit(1);
         }
-        if (!strcmp(f->name, "BOOTLOGO.COM")) {
-            /* Retire the old DOS PATH alias only after its replacement is
-             * installed. Changed files and user-created symlinks are not ours. */
-            length = snprintf(path, sizeof path, "%s/LOGO.COM", target);
+#ifndef __EMSCRIPTEN__
+        if (!strcmp(f->name, "COMMAND.COM")) {
+            /* Matching remains by bytes: DOS2.COM is the same unedited
+             * Microsoft image, not a wrapper or another translation. */
+            length = snprintf(path, sizeof path, "%s/DOS2.COM", dir);
             if (length < 0 || (size_t)length >= sizeof path) {
-                fputs("vc: legacy program path is too long\n", stderr);
+                fputs("vc: DOS2 alias path is too long\n", stderr);
                 exit(1);
             }
-            struct stat legacy;
-            if (!lstat(path, &legacy) && S_ISREG(legacy.st_mode) && file_matches(path, f) &&
-                unlink(path) && errno != ENOENT) {
-                fprintf(stderr, "vc: cannot retire %s: %s\n", path, strerror(errno));
+            if (!file_matches(path, f) && install_file(path, f)) {
+                fprintf(stderr, "vc: cannot write %s: %s\n", path, strerror(errno));
                 exit(1);
             }
         }
+        if (msdos_program(f->name)) retire_unchanged_program(dir, f->name, f);
+#endif
+        if (!strcmp(f->name, "BOOTLOGO.COM")) retire_unchanged_program(target, "LOGO.COM", f);
     }
 }
 
@@ -228,10 +276,14 @@ int main(int argc, char **argv) {
     /* Settings and the log live outside H:, so the demo drive shows only
      * the demo files. */
     char cache[] = "/var/vc/cache";
+    char dos_directory[] = "/home/vc/DOS";
+    char source_directory[] = "/home/vc/SRC";
+    char games_directory[] = "/home/vc/GAMES";
     if (setenv("HOME", "/home/vc", 1) ||
         setenv("XDG_CONFIG_HOME", "/var/vc/config", 1) ||
         setenv("XDG_CACHE_HOME", cache, 1) ||
-        mkdirs(cache) || chdir("/home/vc")) {
+        mkdirs(cache) || mkdirs(dos_directory) || mkdirs(source_directory) ||
+        mkdirs(games_directory) || chdir("/home/vc")) {
         fprintf(stderr, "vc: cannot prepare browser home: %s\n", strerror(errno));
         return 1;
     }

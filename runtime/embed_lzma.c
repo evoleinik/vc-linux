@@ -172,3 +172,20 @@ uint32_t embed_adler32(const uint8_t *data, size_t size) {
     }
     return (b << 16) | a;
 }
+
+void embed_x86_16_restore(uint8_t *data, size_t size) {
+    if (size < 3) return;
+    for (size_t at = 0; at <= size - 3;) {
+        if (data[at] != 0xe8 && data[at] != 0xe9) {
+            ++at;
+            continue;
+        }
+        uint16_t absolute = (uint16_t)(data[at + 1] | (unsigned)data[at + 2] << 8);
+        uint16_t relative = (uint16_t)(absolute - (uint16_t)(at + 3));
+        data[at + 1] = (uint8_t)relative;
+        data[at + 2] = (uint8_t)(relative >> 8);
+        /* Operand bytes can themselves be E8/E9. The encoder skipped them,
+         * so the inverse must too; incomplete final operands stay untouched. */
+        at += 3;
+    }
+}

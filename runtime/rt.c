@@ -370,7 +370,7 @@ struct Known {
 
 /* VC's two parts plus BASIC, Logo, Rogue and VZ need six entries, which
  * survive child termination. Leave two slots for further compiled-C images. */
-#define MAX_KNOWN 8
+#define MAX_KNOWN 16
 static Known known[MAX_KNOWN];
 static int nknown;
 static struct { const Image *image; RtImageRunner run; } supplements[MAX_KNOWN];
@@ -563,6 +563,26 @@ static int code_matches(const Known *k, uint32_t off, uint32_t L, uint32_t n) {
             return 0;
     }
     return 1;
+}
+
+const Image *rt_image_return(const char *name, uint16_t cs, uint16_t ip) {
+    Known *k = NULL;
+    for (int i = nknown - 1; i >= 0; --i)
+        if (!strcmp(known[i].img->name, name)) { k = &known[i]; break; }
+    if (!k || ip < 2) return NULL;
+    const Image *img = k->img;
+    uint32_t L = lin(cs, ip);
+    /* The two bytes before an INT frame's return are the actual CD nn,
+     * even when the next instruction has not yet been dispatched. */
+    int64_t off = (int64_t)L - k->base;
+    if (off >= 2 && off <= img->size &&
+        code_matches(k, (uint32_t)off - 2, L - 2, 2)) return img;
+    for (int i = 0; i < k->ndeltas; ++i) {
+        off = (int64_t)L - k->base - k->deltas[i];
+        if (off >= 2 && off <= img->size &&
+            code_matches(k, (uint32_t)off - 2, L - 2, 2)) return img;
+    }
+    return NULL;
 }
 
 #ifdef __EMSCRIPTEN__
@@ -835,7 +855,7 @@ static int do_int(uint8_t n) {
         if (trace < 0) trace = getenv("VC_TRACE") != NULL;
         Cpu before = cpu;
         rt_update_clock();
-        if (!dos_con_int21() && !dos_fs_int21() && !dos_core_int21()) unimplemented_21();
+        if (!dos_fs_int21() && !dos_con_int21() && !dos_core_int21()) unimplemented_21();
         if (trace && before.a.h > 0x0C) {
             char str[80];
             int i = 0;

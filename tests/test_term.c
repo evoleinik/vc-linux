@@ -5,6 +5,7 @@
 #include "hle.h"
 #include "bios.h"
 #include "term.h"
+#include "guest_mem.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1660,6 +1661,72 @@ static void test_console_io(void)
     check_number(cpu.a.l, '$', "DOS AH09 returns dollar terminator");
 }
 
+static void test_console_tabs(void)
+{
+    static const unsigned functions[] = {2, 6, 9, 0x40};
+    for (unsigned i = 0; i < sizeof functions / sizeof functions[0]; i++) {
+        reset();
+        video(0x0200, 0, 0, 3);
+        if (functions[i] == 9) {
+            cpu.ds = 0x1000; cpu.d.x = 0x100;
+            CHECK(!guest_write(lin(cpu.ds, cpu.d.x), "\tX$", 3), "store DOS TAB string");
+            (void)console(9);
+        } else if (functions[i] == 0x40) {
+            /* AH=40h's DOS CON path is con_write, not INT 10h teletype. */
+            con_write((const uint8_t *)"\tX", 2);
+        } else {
+            cpu.d.l = '\t'; (void)console(functions[i]);
+            cpu.d.l = 'X'; (void)console(functions[i]);
+        }
+        check_number(word(0x450), 9, "DOS TAB expands to the next eight-column stop");
+        for (unsigned column = 3; column < 8; column++)
+            check_number(mem[cell(0, column)], ' ', "DOS TAB emits spaces, never the CP437 glyph");
+        check_number(mem[cell(0, 8)], 'X', "DOS output resumes at the TAB stop");
+    }
+    reset();
+    video(0x0200, 0, 0, 3);
+    video(0x0e09, 0, 0, 0);
+    check_number(word(0x450), 4, "BIOS TAB remains one glyph wide");
+    check_number(mem[cell(0, 3)], '\t', "BIOS teletype preserves the CP437 TAB glyph");
+    video(0x0200, 0, 0, 79);
+    con_write((const uint8_t *)"\tX", 2);
+    check_number(word(0x450), 0x0101, "DOS TAB wraps at the right screen edge");
+    check_number(mem[cell(1, 0)], 'X', "DOS text after a wrapping TAB begins the next row");
+}
+
+static void handle_read(unsigned count)
+{
+    cpu.ds = 0x1000; cpu.d.x = 0x180; cpu.c.x = (uint16_t)count;
+    CHECK(console(0x3f), "DOS cooked CON handle read is handled");
+}
+
+static void test_console_handle_input(void)
+{
+    reset();
+    CHECK(!guest_fill(lin(0x1000, 0x180), 0xa5, 256), "guard cooked CON output buffer");
+    feed("ab\bC\r", 100);
+    handle_read(1);
+    check_number(cpu.a.x, 1, "short handle read returns the first edited character");
+    check_number(rd8(0x1000, 0x180), 'a', "CON handle returns typed input");
+    handle_read(16);
+    check_number(cpu.a.x, 3, "CON preserves the unread suffix of a cooked line");
+    CHECK(!memcmp(guest_span(lin(0x1000, 0x180), 3), "C\r\n", 3),
+          "CON handle input includes CR/LF after line editing");
+    check_number(mem[cell(0, 0)], 'a', "CON handle input echoes first character");
+    check_number(mem[cell(0, 1)], 'C', "CON handle editing erases the replaced character");
+    check_number(word(0x450), 0x0100, "CON Enter echoes CR/LF");
+    feed("\032\r", 200);
+    handle_read(16);
+    check_number(cpu.a.x, 0, "Ctrl-Z ends cooked CON input without leaking an EOF byte");
+    check_number(mem[cell(1, 0)], '^', "CON Ctrl-Z echoes caret");
+    check_number(mem[cell(1, 1)], 'Z', "CON Ctrl-Z echoes Z");
+    feed("next\r", 300);
+    handle_read(16);
+    check_number(cpu.a.x, 6, "a new CON read works after the previous Ctrl-Z");
+    CHECK(!memcmp(guest_span(lin(0x1000, 0x180), 6), "next\r\n", 6),
+          "CON EOF does not permanently close the console");
+}
+
 static void test_console_line_and_flush(void)
 {
     unsigned address;
@@ -1684,6 +1751,12 @@ static void test_console_line_and_flush(void)
     CHECK(memcmp(mem + address + 2, "ab\r", 3) == 0,
           "DOS buffered line input does not exceed maximum");
     check_number(pop_raw(), 0x10000, "overflow characters consumed through Enter");
+    clear_input();
+    feed("\032\r", 250);
+    (void)console(0x0a);
+    check_number(mem[address + 1], 1, "DOS line input preserves EDLIN's Ctrl-Z sentinel");
+    CHECK(mem[address + 2] == 0x1a && mem[address + 3] == '\r',
+          "Ctrl-Z is a literal buffered input byte, not BIOS EOF");
     (void)bios_key_push(0x1e61);
     (void)bios_key_push(0x3062);
     cpu.a.l = 6;
@@ -2610,6 +2683,8 @@ int main(void)
     RUN(test_mouse);
     RUN(test_sgr_mouse_input);
     RUN(test_console_io);
+    RUN(test_console_tabs);
+    RUN(test_console_handle_input);
     RUN(test_console_line_and_flush);
     RUN(test_console_flush_typeahead);
     RUN(test_noops);

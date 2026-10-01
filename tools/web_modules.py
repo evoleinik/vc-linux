@@ -11,8 +11,9 @@ import sys
 import tempfile
 
 
-PROGRAMS = ("gwbasic", "bootlogo", "rogue", "vz", "kermit")
-GENERATED_NAME = re.compile(r"(?:gwbasic|bootlogo|rogue|vz|kermit)(?:\.[0-9a-f]{12})?\.wasm")
+PROGRAMS = ("gwbasic", "bootlogo", "rogue", "vz", "kermit",
+            "command", "edlin", "debug", "find", "more", "sort", "fc")
+GENERATED_NAME = re.compile(r"(?:" + "|".join(PROGRAMS) + r")(?:\.[0-9a-f]{12})?\.wasm")
 
 
 def update(path: Path, data: bytes) -> None:

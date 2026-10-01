@@ -1,0 +1,161 @@
+--- a/src/tokenize.c
++++ b/src/tokenize.c
+@@ -766,6 +766,15 @@
+         return( NOT_ERROR );
+     }
+     index = FindResWord( p->output, size );
++    /* Old source also uses listing/conditional words as ordinary labels. */
++    if ( Options.masm51_compat && ( index == T_IFDIF || index == T_PAGE ) ) {
++        char *next = src;
++        while ( isspace( *next ) ) next++;
++        if ( *next == ':' ||
++             ( p->index > 0 && !( p->index == 2 &&
++               ( buf[-1].token == T_COLON || buf[-1].token == T_DBL_COLON ) ) ) )
++            index = 0;
++    }
+     if( index == 0 ) {
+         /* if ID begins with a DOT, check for OPTION DOTNAME.
+          * if not set, skip the token and return a T_DOT instead!
+@@ -824,6 +833,20 @@
+                 return( NOT_ERROR );
+             }
+         }
++        /* MASM 2 permits IN/OUT/TEST as labels and procedure operands while
++         * retaining both I/O opcodes in instruction position. DEBUG uses
++         * both meanings in the same module, so NOKEYWORD is not enough. */
++        if ( Options.masm51_compat && ( buf->tokval == T_IN || buf->tokval == T_OUT || buf->tokval == T_TEST ) ) {
++            char *next = src;
++            while ( isspace( *next ) ) next++;
++            if ( *next == ':' ||
++                 ( p->index > 0 && !( p->index == 2 &&
++                   ( buf[-1].token == T_COLON || buf[-1].token == T_DBL_COLON ) ) ) ) {
++                buf->token = T_ID;
++                buf->idarg = 0;
++                return( NOT_ERROR );
++            }
++        }
+         buf->token = T_INSTRUCTION;
+         return( NOT_ERROR );
+     }
+@@ -891,6 +914,18 @@
+ ret_code GetToken( struct asm_tok token[], struct line_status *p )
+ /****************************************************************/
+ {
++    /* MASM's old macro escape spelling is used by DOSMAC.ASM for
++     * &ENDM and &.CREF/&.XCREF. Consume the escape while tokenizing,
++     * including StoreMacro's nesting scan; retain the original source.
++     * Restrict this to the legacy directives, never identifier '&'
++     * concatenation or expression operators. */
++    if ( Options.masm51_compat && p->index == 0 && *p->input == '&' &&
++         ( ( _memicmp( p->input + 1, "endm", 4 ) == 0 &&
++             !is_valid_id_char( p->input[5] ) ) ||
++           ( _memicmp( p->input + 1, ".cref", 5 ) == 0 &&
++             !is_valid_id_char( p->input[6] ) ) ||
++           ( _memicmp( p->input + 1, ".xcref", 6 ) == 0 &&
++             !is_valid_id_char( p->input[7] ) ) ) ) p->input++;
+     if( isdigit( *p->input ) ) {
+         return( get_number( token, p ) );
+     } else if( is_valid_id_start( *p->input ) ) {
+--- a/src/condasm.c
++++ b/src/condasm.c
+@@ -188,6 +188,12 @@
+             DebugMsg1(("check_defd(%s): state=%u defined=%u\n", name, sym->state, sym->isdefined ));
+             /* v2.04: changed. the "defined" flag is active for ALL symbols */
+             //if ( sym->state == SYM_INTERNAL || sym->state == SYM_MACRO || sym->state == SYM_TMACRO || sym->state == SYM_UNDEFINED ) {
++            /* In a real second MASM pass, ordinary forward labels from
++             * pass one are defined. Keep assembly-time variables ordered
++             * within the current pass, as old conditional macros require. */
++            if ( Options.masm51_compat && Parse_Pass != PASS_1 &&
++                 sym->state == SYM_INTERNAL && !sym->isvariable )
++                return( TRUE );
+             return( sym->isdefined );
+         }
+         DebugMsg1(("check_defd(%s): sym=NULL\n", name ));
+@@ -340,7 +346,13 @@
+     case CC_PASS1: /* [ELSE]IF1 */
+         /* v2.04: changed */
+         //NextIfState = ((Parse_Pass == PASS_1) ? BLOCK_ACTIVE : BLOCK_INACTIVE);
+-        NextIfState = BLOCK_ACTIVE;
++        /* MASM's actual pass tests are essential for DOSMAC_v211's
++         * delayed forward-external declarations. */
++#if FASTPASS
++        if ( Options.masm51_compat ) SkipSavedState();
++#endif
++        NextIfState = ( !Options.masm51_compat || Parse_Pass == PASS_1 ) ?
++                      BLOCK_ACTIVE : BLOCK_INACTIVE;
+         break;
+     case CC_PASS2: /* [ELSE]IF2 */
+         if ( ModuleInfo.setif2 == FALSE ) {
+@@ -350,7 +362,11 @@
+         }
+         /* v2.04: changed */
+         //NextIfState = ((Parse_Pass == PASS_1) ? BLOCK_INACTIVE : BLOCK_ACTIVE);
+-        NextIfState = BLOCK_ACTIVE;
++#if FASTPASS
++        if ( Options.masm51_compat ) SkipSavedState();
++#endif
++        NextIfState = ( Options.masm51_compat && Parse_Pass == PASS_1 ) ?
++                      BLOCK_INACTIVE : BLOCK_ACTIVE;
+         break;
+     case CC_SYMARG: /* [ELSE]IF[N]DEF */
+         NextIfState = BLOCK_INACTIVE;
+--- a/src/equate.c
++++ b/src/equate.c
+@@ -60,6 +60,12 @@
+     sym->isequate = TRUE;
+     sym->state = SYM_INTERNAL;
+     sym->isdefined = TRUE;
++    /* MASM's mutable relocatable aliases are freshly defined by '=' in
++     * this pass. branch.c otherwise mistakes them for stale forward
++     * labels and emits a jump to itself. DOSMAC_v211 condret uses ret_l
++     * to branch back to the most recently emitted RET. */
++    if ( Options.masm51_compat && sym->isvariable )
++        sym->asmpass = Parse_Pass;
+     if ( opndx->kind == EXPR_CONST ) {
+         /* v2.07: use expression's memtype;
+          * v2.21: set mem_type to EMPTY unless set explicitely - fixes 'TYPE equate';
+--- a/src/expans.c
++++ b/src/expans.c
+@@ -281,6 +281,11 @@
+                      * the expression will be always expanded and evaluated.
+                      * Else it is expanded only.
+                      */
++                    /* MASM 2/5's name&%expression concatenates the expanded
++                     * number directly onto the preceding macro argument.
++                     * DOSMAC's generated external chains use ?z&%?i. */
++                    if ( Options.masm51_compat && ptr > currparm && ptr[-1] == '&' )
++                        ptr--;
+                     idx++;
+                     DebugMsg1(("RunMacro(%s.%u): %% token found\n", macro->sym.name, parmidx ));
+                     while ( tokenarray[idx].token == T_PERCENT ) idx++;
+--- a/src/segment.c
++++ b/src/segment.c
+@@ -1369,7 +1369,11 @@
+         /* Check if new definition is different from previous one */
+ 
+         // oldobj = dir->e.seginfo->segrec;
+-        if ( oldalign    != dir->e.seginfo->alignment )
++        /* Old MASM permits an empty ordering declaration to be reopened
++         * with the actual alignment (COMSEG uses this throughout).
++         * Once anything has occupied the segment, retain the strict check. */
++        if ( oldalign != dir->e.seginfo->alignment &&
++             !( Options.masm51_compat && dir->sym.max_offset == 0 ) )
+             txt = TXT_ALIGNMENT;
+         else if ( oldcombine  != dir->e.seginfo->combine )
+             txt = TXT_COMBINE;
+--- a/src/input.c
++++ b/src/input.c
+@@ -361,7 +361,12 @@
+     while( ptr < last ) {
+         switch ( c ) {
+         case '\r':
+-            break; /* don't store CR */
++            /* Some original distribution files have parity-marked LFs.
++             * Recognize CR/8A as CR/LF in legacy mode, without changing
++             * any source byte or any 8-bit character inside a line. */
++            c = getc( fp );
++            if ( Options.masm51_compat && c == 0x8a ) c = '\n';
++            continue; /* don't store CR */
+         case '\n':
+             /* fall through */
+         //case '\0': /* v2.08: */

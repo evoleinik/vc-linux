@@ -6,6 +6,7 @@
 #include "cpu.h"
 #include "hle.h"
 #include "dos_fs.h"
+#include "guest_mem.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -29,6 +30,8 @@ static unsigned checks, failures;
 static char fixture[PATH_MAX], original_cwd[PATH_MAX], home_root[PATH_MAX];
 static unsigned char console_bytes[1024];
 static size_t console_size;
+static const char *console_input;
+static unsigned console_read_calls;
 static uint16_t called[256];
 static size_t called_count;
 
@@ -57,6 +60,18 @@ void con_write(const uint8_t *buf, size_t n)
     if (n > room) n = room;
     memcpy(console_bytes + console_size, buf, n);
     console_size += n;
+}
+int dos_con_int21(void)
+{
+    if (cpu.a.h != 0x3f) return 0;
+    ++console_read_calls;
+    size_t count = console_input ? strlen(console_input) : 0;
+    if (count > cpu.c.x) count = cpu.c.x;
+    CHECK(!guest_write(lin(cpu.ds, cpu.d.x), console_input, count), "copy mocked cooked console line");
+    if (console_input) console_input += count;
+    cpu.a.x = (uint16_t)count;
+    cpu.cf = 0;
+    return 1;
 }
 uint8_t port_in8(uint16_t port) { (void)port; return 0; }
 uint16_t port_in16(uint16_t port) { (void)port; return 0; }
@@ -1892,6 +1907,98 @@ static void test_devices_and_ioctl(void)
     if (ok("drive after failed change")) CHECK(cpu.a.l == 2, "invalid drive selection preserves C");
 }
 
+static void test_named_devices_and_console_handles(void)
+{
+    console_input = "typed line\r\n";
+    console_read_calls = 0;
+    read_equals(0, console_input, "stdin handle reads a cooked console line");
+    CHECK(console_read_calls == 1, "stdin dispatches into the BIOS/DOS console reader");
+    uint16_t con = open_file("CON", 2);
+    if (con != 0xffff) {
+        console_input = "another line\r\n";
+        read_equals(con, console_input, "named CON handle reads typed input");
+        console_size = 0;
+        write_bytes(con, "console output");
+        CHECK(console_size == 14 && !memcmp(console_bytes, "console output", 14),
+              "named CON handle writes to the console");
+        close_file(con);
+    }
+    console_input = NULL;
+
+    static const char *names[] = {"nul", "NUL.TXT", "H:\\NUL", "NUL:"};
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+        path_begin(0x3c00, names[i]);
+        if (!ok("create opens NUL as a device")) continue;
+        uint16_t h = cpu.a.x;
+        console_size = 0;
+        write_bytes(h, "discarded\toutput");
+        CHECK(console_size == 0, "NUL output never reaches CON");
+        begin(0x4400); cpu.b.x = h;
+        if (ok("NUL device information"))
+            CHECK((cpu.d.x & 0x84) == 0x84, "NUL reports the DOS null-device bit");
+        close_file(h);
+        h = open_file(names[i], 0);
+        if (h != 0xffff) { read_equals(h, "", "NUL reads EOF"); close_file(h); }
+    }
+    struct stat st;
+    CHECK(host_stat("nul", &st) < 0 && errno == ENOENT, "NUL is not created on the host filesystem");
+    CHECK(host_stat("NUL.TXT", &st) < 0 && errno == ENOENT, "NUL with an extension is still a device");
+    CHECK(host_stat("home/NUL", &st) < 0 && errno == ENOENT, "drive-qualified NUL is not a host file");
+    uint16_t saved = 0xffff;
+    begin(0x4500); cpu.b.x = 1;
+    if (ok("save stdout before NUL redirection")) saved = cpu.a.x;
+    uint16_t nul = open_file("NUL", 1);
+    if (nul != 0xffff && saved != 0xffff) {
+        begin(0x4600); cpu.b.x = nul; cpu.c.x = 1; ok("redirect stdout to NUL");
+        console_size = 0;
+        begin(0x0900); putstr(DS, ARG, "hidden directory listing$");
+        CHECK(invoke() == 1, "DOS AH09 honors NUL redirection");
+        CHECK(console_size == 0, "redirected dollar string is discarded");
+        begin(0x4600); cpu.b.x = saved; cpu.c.x = 1; ok("restore stdout after NUL redirection");
+    }
+    if (nul != 0xffff) close_file(nul);
+    if (saved != 0xffff) close_file(saved);
+}
+
+static void test_private_command_pipe_files(void)
+{
+    /* HOME is this test's own private fixture, never the user's HOME. */
+    host_file("home/%PIPE1.$$$", "home sentinel", 0644);
+    host_file("home/%PIPE2.$$$", "other home sentinel", 0644);
+    static const char *drives_to_test[] = {"C:\\%PIPE1.$$$", "C:\\%PIPE2.$$$",
+                                           "H:\\%PIPE1.$$$", "H:\\%PIPE2.$$$"};
+    for (unsigned i = 0; i < sizeof drives_to_test / sizeof drives_to_test[0]; i++) {
+        path_begin(0x3c00, drives_to_test[i]);
+        if (!ok("COMMAND pipe creation succeeds on every drive")) continue;
+        uint16_t h = cpu.a.x;
+        write_bytes(h, i < 2 ? "C pipe bytes" : "H pipe bytes");
+        close_file(h);
+        h = open_file(drives_to_test[i], 0);
+        if (h != 0xffff) {
+            read_equals(h, i < 2 ? "C pipe bytes" : "H pipe bytes", "COMMAND can reopen its private pipe");
+            close_file(h);
+        }
+    }
+    host_equals("home/%PIPE1.$$$", "home sentinel", "pipe creation never truncates a file in HOME");
+    host_equals("home/%PIPE2.$$$", "other home sentinel", "second pipe never truncates a file in HOME");
+    path_begin(0x3d00, "C:\\%PIPE1.$$$");
+    if (ok("open first drive's pipe after writing second drive")) {
+        uint16_t h = cpu.a.x;
+        read_equals(h, "C pipe bytes", "per-drive private pipe backing does not collide");
+        close_file(h);
+    }
+    for (unsigned i = 0; i < sizeof drives_to_test / sizeof drives_to_test[0]; i++) {
+        path_begin(0x4100, drives_to_test[i]); ok("COMMAND removes its private pipe");
+    }
+    host_equals("home/%PIPE1.$$$", "home sentinel", "pipe deletion never removes a file in HOME");
+    host_equals("home/%PIPE2.$$$", "other home sentinel", "second pipe deletion never removes a file in HOME");
+    char sentinel[PATH_MAX];
+    host_path(sentinel, sizeof sentinel, "home/%PIPE1.$$$");
+    host_require(unlink(sentinel) == 0 || errno == ENOENT, "remove private pipe-test sentinel");
+    host_path(sentinel, sizeof sentinel, "home/%PIPE2.$$$");
+    host_require(unlink(sentinel) == 0 || errno == ENOENT, "remove second private pipe-test sentinel");
+}
+
 static uint16_t packed_date(unsigned year, unsigned month, unsigned day)
 {
     return (uint16_t)(((year - 1980) << 9) | (month << 5) | day);
@@ -2370,10 +2477,134 @@ static void test_fcb_io(void)
     fcb_name(FCB, "  ,;fcbtest.bas", 1, 0);
     CHECK(!memcmp(mem + lin(DS, FCB + 1), "FCBTEST BAS", 11), "FCB parse option skips separators");
     fcb_name(FCB, "FCBTEST.BAS", 0, 0);
-    fcb_op(0x11, FCB, 0, 0xff);
+    set_dta(DATA);
+    fcb_op(0x11, FCB, 0, 0);
+    CHECK(rd8(DS, DATA) == 3 && !memcmp(mem + lin(DS, DATA + 1), "FCBTEST BAS", 11),
+          "FCB find returns the one-based drive and padded directory entry");
+    CHECK(get32(DS, DATA + 29) == 300, "FCB directory entry preserves exact file size");
     fcb_op(0x12, FCB, 0, 0xff);
     fcb_op(0x17, FCB, 0, 0xff);
     begin(0x0d00); ok("DOS reset flushes files");
+}
+
+static void test_fcb_directory_search(void)
+{
+    enum { FCB = 0x4000, COPY = 0x4100 };
+    host_file("FSFIRST.TXT", "first", 0644);
+    host_file("FSSECOND.TXT", "second", 0644);
+    char path[PATH_MAX];
+    host_path(path, sizeof path, "FSDIR");
+    host_require(mkdir(path, 0755) == 0, "FCB directory fixture");
+    memset(mem + lin(DS, FCB), 0, 44);
+    wr8(DS, FCB, 0xff); wr8(DS, FCB + 6, A_DIR);
+    fcb_name(FCB + 7, "FS*.*", 0, 1);
+    set_dta(DATA);
+    fcb_op(0x11, FCB, 0, 0);
+    CHECK(rd8(DS, DATA) == 0xff && rd8(DS, DATA + 6) == A_DIR && rd8(DS, DATA + 7) == 3,
+          "extended FCB directory search preserves header, attributes and drive");
+    unsigned files = 0, directories = 0;
+    for (unsigned i = 0; i < 3; ++i) {
+        if (rd8(DS, DATA + 8 + 11) & A_DIR) ++directories;
+        else ++files;
+        if (!i) memcpy(mem + lin(DS, COPY), mem + lin(DS, FCB), 44);
+        fcb_op(0x12, COPY, 0, i == 2 ? 0xff : 0);
+    }
+    CHECK(files == 2 && directories == 1, "copied FCB search state finds two files and a directory");
+    fcb_op(0x12, FCB, 0, 0xff);
+    fcb_name(FCB, "FS*.*", 0, 1);
+    fcb_op(0x11, FCB, 0, 0);
+    CHECK(!(rd8(DS, DATA + 12) & A_DIR), "ordinary FCB search excludes directories");
+    fcb_op(0x12, FCB, 0, 0);
+    fcb_op(0x12, FCB, 0, 0xff);
+    memset(mem + lin(DS, FCB), 0, 44);
+    wr8(DS, FCB, 0xff); wr8(DS, FCB + 6, A_DIR);
+    memset(mem + lin(DS, FCB + 8), ' ', 11);
+    wr8(DS, FCB + 8, '.');
+    fcb_op(0x11, FCB, 0, 0);
+    CHECK(!memcmp(mem + lin(DS, DATA + 8), ".          ", 11),
+          "FCB dot directory keeps its name, not a file extension");
+    fcb_op(0x12, FCB, 0, 0xff);
+}
+
+static void test_fcb_rename(void)
+{
+    enum { FCB = 0x4000 };
+    host_file("FCBOLD.TXT", "original", 0644);
+    fcb_name(FCB, "FCBOLD.TXT", 0, 0);
+    fcb_name(FCB + 16, "FCBNEW.BAK", 0, 0);
+    fcb_op(0x17, FCB, 0, 0);
+    host_equals("FCBNEW.BAK", "original", "FCB rename retains all source bytes");
+    struct stat st;
+    CHECK(host_stat("FCBOLD.TXT", &st) < 0 && errno == ENOENT,
+          "FCB rename removes the old name");
+    host_file("FCBOLD.TXT", "do not overwrite", 0644);
+    fcb_name(FCB, "FCBNEW.BAK", 0, 0);
+    fcb_name(FCB + 16, "FCBOLD.TXT", 0, 0);
+    fcb_op(0x17, FCB, 0, 0xff);
+    host_equals("FCBNEW.BAK", "original", "failed FCB rename preserves its source");
+    host_equals("FCBOLD.TXT", "do not overwrite", "FCB rename never overwrites an existing destination");
+}
+
+static void test_fcb_wildcard_mutations(void)
+{
+    enum { FCB = 0x4000 };
+    struct stat st;
+    host_file("WR.TXT", "short", 0644);
+    host_file("WRA.TXT", "one character", 0644);
+    host_file("WRAB.TXT", "two characters", 0644);
+    fcb_name(FCB, "WR?.TXT", 0, 1);
+    fcb_name(FCB + 16, "Q??.BAK", 0, 1);
+    fcb_op(0x17, FCB, 0, 0);
+    host_equals("QR.BAK", "short", "FCB rename ? copies a padded blank from the source");
+    host_equals("QRA.BAK", "one character", "FCB rename ? copies the matching source character");
+    host_equals("WRAB.TXT", "two characters", "one FCB ? does not consume two characters");
+    CHECK(host_stat("WR.TXT", &st) < 0 && errno == ENOENT, "wildcard FCB rename removes short source");
+    CHECK(host_stat("WRA.TXT", &st) < 0 && errno == ENOENT, "wildcard FCB rename removes matching source");
+    fcb_name(FCB, "Q??.B??", 0, 1);
+    fcb_op(0x13, FCB, 0, 0);
+    CHECK(host_stat("QR.BAK", &st) < 0 && errno == ENOENT, "FCB delete ? matches a padded blank");
+    CHECK(host_stat("QRA.BAK", &st) < 0 && errno == ENOENT, "FCB delete removes every matching file");
+    fcb_op(0x13, FCB, 0, 0xff);
+
+    host_file("WD.A", "extension", 0644);
+    host_file("WDA", "no extension", 0644);
+    host_file("WDB.AB", "longer extension", 0644);
+    fcb_name(FCB, "WD?.?", 0, 1);
+    fcb_op(0x13, FCB, 0, 0);
+    CHECK(host_stat("WD.A", &st) < 0 && errno == ENOENT, "FCB delete matches a one-letter extension");
+    CHECK(host_stat("WDA", &st) < 0 && errno == ENOENT, "FCB delete extension ? matches no extension");
+    host_equals("WDB.AB", "longer extension", "FCB delete extension ? does not match two characters");
+    host_file("WP1.TXT", "protected", 0444);
+    fcb_name(FCB, "WP?.TXT", 0, 1);
+    fcb_op(0x13, FCB, 0, 0xff);
+    host_equals("WP1.TXT", "protected", "wildcard FCB delete respects read-only files");
+
+    host_file("home/HW.TXT", "other drive blank", 0644);
+    host_file("home/HWA.TXT", "other drive character", 0644);
+    fcb_name(FCB, "H:HW?.TXT", 0, 1);
+    fcb_name(FCB + 16, "K??.BAK", 0, 1);
+    fcb_op(0x17, FCB, 0, 0);
+    host_equals("home/KW.BAK", "other drive blank", "unqualified rename target uses the source drive");
+    host_equals("home/KWA.BAK", "other drive character", "wildcard rename works on a noncurrent drive");
+    fcb_name(FCB, "H:K??.BAK", 0, 1);
+    fcb_op(0x13, FCB, 0, 0);
+}
+
+static void test_fcb_device_lookup(void)
+{
+    enum { FCB = 0x4000 };
+    set_dta(DATA);
+    fcb_name(FCB, "CON", 0, 0);
+    fcb_op(0x11, FCB, 0, 0);
+    CHECK(!memcmp(guest_span(lin(DS, DATA + 1), 11), "CON        ", 11),
+          "FCB find reports literal CON so COMMAND can copy from it");
+    CHECK(rd8(DS, DATA + 12) & 0x40, "FCB CON directory entry has DOS device attribute");
+    fcb_op(0x12, FCB, 0, 0xff);
+    fcb_name(FCB, "NUL.TXT", 0, 0);
+    fcb_op(0x11, FCB, 0, 0);
+    CHECK(!memcmp(guest_span(lin(DS, DATA + 1), 11), "NUL     TXT", 11),
+          "FCB NUL with extension remains a literal device lookup");
+    fcb_op(0x12, FCB, 0, 0xff);
 }
 
 static void test_errors_bounds_and_dispatch(void)
@@ -3140,6 +3371,53 @@ static void test_door_filesystem(void)
     close_file(seed);
 }
 
+static void test_door_command_devices_and_pipes(void)
+{
+    char root[PATH_MAX], pipe[PATH_MAX];
+    host_path(root, sizeof root, "door-command");
+    host_require(mkdir(root, 0700) == 0, "private door COMMAND fixture");
+    CHECK(dos_fs_init_door(root, 4096) == 0, "initialize door COMMAND fixture");
+    path_begin(0x3c00, "H:\\%PIPE1.$$$");
+    uint16_t h = ok("door pipe is confined to its already-private root") ? cpu.a.x : 0xffff;
+    if (h != 0xffff) {
+        write_bytes(h, "door pipe"); close_file(h);
+        host_equals("door-command/%PIPE1.$$$", "door pipe", "door pipe never uses a host /tmp bypass");
+        host_path(pipe, sizeof pipe, "door-command/%PIPE1.$$$");
+        check_host_resolution("H:\\%PIPE1.$$$", pipe);
+        path_begin(0x4100, "H:\\%PIPE1.$$$"); ok("door deletes pipe through confined quota path");
+    }
+    path_begin(0x3c00, "C:\\%PIPE2.$$$"); error(15, "door pipe cannot expose an absent C drive");
+    path_begin(0x3c00, "H:\\NUL");
+    if (ok("NUL device works in a door")) {
+        h = cpu.a.x; write_bytes(h, "not a quota-consuming host file"); close_file(h);
+    }
+    struct stat st;
+    CHECK(host_stat("door-command/NUL", &st) < 0 && errno == ENOENT,
+          "door NUL cannot create a real file");
+
+    path_begin(0x3c00, "H:\\FULL.TXT");
+    h = ok("create full redirected-output fixture") ? cpu.a.x : 0xffff;
+    if (h != 0xffff) {
+        char page[4097];
+        memset(page, 'x', sizeof page - 1); page[sizeof page - 1] = 0;
+        write_bytes(h, page);
+        begin(0x4500); cpu.b.x = 1;
+        uint16_t saved = ok("save door stdout") ? cpu.a.x : 0xffff;
+        if (saved != 0xffff) {
+            begin(0x4600); cpu.b.x = h; cpu.c.x = 1; ok("redirect door stdout to full file");
+            begin(0x0200); cpu.d.l = 'X'; CHECK(invoke() == 1, "redirected AH02 is handled");
+            begin(0x0600); cpu.d.l = 'Y'; CHECK(invoke() == 1, "redirected AH06 is handled");
+            begin(0x0900); putstr(DS, ARG, "Z$"); CHECK(invoke() == 1, "redirected AH09 is handled");
+            CHECK(host_stat("door-command/FULL.TXT", &st) == 0 && st.st_size == 4096,
+                  "redirected DOS character output cannot bypass the door quota");
+            begin(0x4600); cpu.b.x = saved; cpu.c.x = 1; ok("restore door stdout");
+            close_file(saved);
+        }
+        close_file(h);
+    }
+    dos_fs_init();
+}
+
 static void door_entry_full(const char *name, const char *why)
 {
     path_begin(0x3c00, name);
@@ -3288,11 +3566,11 @@ static void test_door_tiny_files_page_quota(void)
     CHECK(dos_fs_init_door(root, LIMIT) == 0, "initialize page quota door");
     unsigned written = 0, full = 0;
     for (unsigned group = 0; group < GROUPS && !full; ++group) {
-        snprintf(dos, sizeof dos, "H:\P%02u", group);
+        snprintf(dos, sizeof dos, "H:\\P%02u", group);
         path_begin(0x3900, dos);
         if (!ok("page quota group mkdir")) goto done;
         for (unsigned i = 0; i < PER_GROUP; ++i) {
-            snprintf(dos, sizeof dos, "H:\P%02u\T%02u", group, i);
+            snprintf(dos, sizeof dos, "H:\\P%02u\\T%02u", group, i);
             path_begin(0x3c00, dos);
             if (!ok("tiny file create")) goto done;
             uint16_t handle = cpu.a.x;
@@ -3384,6 +3662,8 @@ int main(void)
     test_share_modes();
     test_cross_device_rename();
     test_devices_and_ioctl();
+    test_named_devices_and_console_handles();
+    test_private_command_pipe_files();
     test_attributes_and_times();
     test_filetime_conversion();
     test_creation_time_symlink_identity();
@@ -3391,6 +3671,10 @@ int main(void)
     test_free_space_and_country();
     test_calendar();
     test_fcb_io();
+    test_fcb_directory_search();
+    test_fcb_rename();
+    test_fcb_wildcard_mutations();
+    test_fcb_device_lookup();
     test_errors_bounds_and_dispatch();
     test_empty_file_specs();
     test_reinitialization();
@@ -3399,6 +3683,7 @@ int main(void)
     test_home_drive_queries();
     test_home_drive_initialization();
     test_door_filesystem();
+    test_door_command_devices_and_pipes();
     test_door_entry_quota();
     test_door_tiny_files_page_quota();
     test_function_coverage();

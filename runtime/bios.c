@@ -54,6 +54,13 @@ static struct {
     uint8_t widths[255];
     int active;
 } line_read;
+static struct {
+    uint16_t ss, sp, segment, offset;
+    size_t count, next;
+    uint8_t bytes[257], widths[255];
+    int active, ready, eof;
+} handle_line;
+static void console_put(uint8_t ch);
 
 typedef struct {
     int show;
@@ -317,6 +324,7 @@ void bios_init(void)
     break_pending = 0;
     read_retry = 0;
     line_read.active = 0;
+    memset(&handle_line, 0, sizeof handle_line);
     mem[0x471] = 0;
     mouse_reset();
     /* The runtime owns the timer at 046Ch: it is deliberately untouched. */
@@ -397,6 +405,7 @@ void bios_cancel_read(void)
     read_retry = 0;
     console_scan_pending = 0;
     line_read.active = 0;
+    memset(&handle_line, 0, sizeof handle_line);
 }
 
 static int legacy_key(uint16_t *key)
@@ -622,7 +631,7 @@ static void teletype(uint8_t ch, uint8_t color)
 void con_write(const uint8_t *buf, size_t n)
 {
     for (size_t i = 0; i < n; ++i)
-        teletype(buf[i], 3);
+        console_put(buf[i]);
 }
 
 void bios_int10(void)
@@ -1019,17 +1028,88 @@ static void console_line(void)
         } else if (ch == 0x1b) {
             while (line_read.count != 0)
                 console_erase(line_read.widths[--line_read.count]);
-        } else if (ch >= ' ' || ch == '\t') {
+        } else if (ch >= ' ' || ch == '\t' || ch == 0x1a) {
             if (line_read.count + 1 < maximum) {
                 wr8(segment, (uint16_t)(offset + 2 + line_read.count), ch);
                 line_read.widths[line_read.count++] = ch == '\t' ?
-                    (uint8_t)(8 - (mem[0x450] & 7)) : 1;
-                console_put(ch);
+                    (uint8_t)(8 - (mem[0x450] & 7)) : ch == 0x1a ? 2 : 1;
+                /* DOS buffered input returns Ctrl-Z literally (EDLIN uses
+                 * it to end insertion), displaying its customary caret. */
+                if (ch == 0x1a) { console_put('^'); console_put('Z'); }
+                else console_put(ch);
             } else {
                 term_bell();
             }
         }
     }
+}
+
+/* AH=3Fh CON is cooked, unlike the DOS single-key calls. Keep one line in
+ * the device, because applications may ask for fewer bytes than were typed.
+ * A break interrupt unwinds the blocking read without fabricating EOF. */
+static void console_handle_read(void)
+{
+    if (!cpu.c.x) { cpu.a.x = 0; cpu.cf = 0; return; }
+    if (handle_line.active && !handle_line.ready &&
+        (handle_line.ss != cpu.ss || handle_line.sp != cpu.sp ||
+         handle_line.segment != cpu.ds || handle_line.offset != cpu.d.x))
+        memset(&handle_line, 0, sizeof handle_line);
+    if (!handle_line.active) {
+        handle_line.ss = cpu.ss; handle_line.sp = cpu.sp;
+        handle_line.segment = cpu.ds; handle_line.offset = cpu.d.x;
+        handle_line.active = 1;
+    }
+    while (!handle_line.ready) {
+        uint8_t ch;
+        int extended;
+        if (!console_get(1, &ch, &extended)) return;
+        if (extended) continue;
+        if (ch == '\r') {
+            console_put('\r'); console_put('\n');
+            size_t length = handle_line.count;
+            for (size_t i = 0; i < length; i++)
+                if (handle_line.bytes[i] == 0x1a) {
+                    handle_line.count = i;
+                    handle_line.eof = 1;
+                    break;
+                }
+            if (!handle_line.eof) {
+                handle_line.bytes[handle_line.count++] = '\r';
+                handle_line.bytes[handle_line.count++] = '\n';
+            }
+            handle_line.ready = 1;
+        } else if (ch == '\b') {
+            if (handle_line.count) console_erase(handle_line.widths[--handle_line.count]);
+        } else if (ch == 0x1b) {
+            while (handle_line.count) console_erase(handle_line.widths[--handle_line.count]);
+        } else if (ch >= ' ' || ch == '\t' || ch == 0x1a) {
+            if (handle_line.count == sizeof handle_line.widths) { term_bell(); continue; }
+            handle_line.widths[handle_line.count] = ch == '\t' ?
+                (uint8_t)(8 - (mem[0x450] & 7)) : ch == 0x1a ? 2 : 1;
+            handle_line.bytes[handle_line.count++] = ch;
+            if (ch == 0x1a) { console_put('^'); console_put('Z'); }
+            else console_put(ch);
+        }
+    }
+    size_t count = handle_line.count - handle_line.next;
+    if (count > cpu.c.x) count = cpu.c.x;
+    size_t first = 0x10000u - cpu.d.x;
+    if (first > count) first = count;
+    /* Preserve the segment-offset wrapping used by the DOS file layer,
+     * while every actual native copy is checked by guest_mem.h. */
+    if (!guest_span(lin(cpu.ds, cpu.d.x), first) ||
+        !guest_span(lin(cpu.ds, 0), count - first)) {
+        cpu.a.x = 5; cpu.cf = 1; return;
+    }
+    (void)guest_write(lin(cpu.ds, cpu.d.x), handle_line.bytes + handle_line.next, first);
+    (void)guest_write(lin(cpu.ds, 0), handle_line.bytes + handle_line.next + first, count - first);
+    handle_line.next += count;
+    /* A mid-line ^Z reports the prefix first, and EOF on the following
+     * read. Consuming EOF clears it so another COPY CON can start afresh. */
+    if (handle_line.next == handle_line.count && (!handle_line.eof || !count))
+        memset(&handle_line, 0, sizeof handle_line);
+    cpu.a.x = (uint16_t)count;
+    cpu.cf = 0;
 }
 
 int dos_con_int21(void)
@@ -1095,6 +1175,7 @@ int dos_con_int21(void)
         key_bounds(&start, &end);
         bda_set_word(0x1a, bda_word(0x1c));
         console_scan_pending = 0;
+        memset(&handle_line, 0, sizeof handle_line);
         if (function == 1 || function == 6 || function == 7 ||
             function == 8 || function == 0x0a) {
             cpu.a.h = (uint8_t)function;
@@ -1102,6 +1183,9 @@ int dos_con_int21(void)
         }
         return 1;
     }
+    case 0x3f:
+        console_handle_read();
+        return 1;
     default:
         return 0;
     }

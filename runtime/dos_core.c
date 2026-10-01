@@ -47,12 +47,22 @@ typedef struct {
     const Image *image;
     RtProcessState *machine;
     uint32_t break_vector; /* Inherited INT 1Bh is not the child's hook. */
+    uint8_t exec_break, exec_break_state; /* 0 idle, 1 queried, 2 temporarily off. */
     Cpu parent;        /* parent registers at its EXEC call */
     uint16_t dta_seg, dta_off;
     char temp_dir[32]; /* Private, short VZ swap directory; not guest memory. */
 } Proc;
 static Proc procs[8];
 static int nprocs;
+
+/* AH55 also creates PSPs for programs such as DEBUG that later switch back
+ * with AH50 without ever EXECing the copy. Their inherited handle references
+ * belong to the creating program, not to the guest's current-PSP register. */
+typedef struct PspCopy {
+    uint16_t psp, owner;
+    struct PspCopy *next;
+} PspCopy;
+static PspCopy *psp_copies;
 
 /* ---- MCB chain ------------------------------------------------------------ */
 
@@ -227,6 +237,21 @@ static void cp866_to_utf8(const uint8_t *in, size_t n, char *out, size_t cap) {
 
 /* ---- environment and PSP -------------------------------------------------- */
 
+/* SETVER is keyed to the byte-matched translation, never its launch name.
+ * Keeping this data together prevents DOS 2's exact version checks from
+ * changing the version seen by VC or by any unrelated translated program. */
+static const struct { const char *image; uint16_t version; } version_table[] = {
+    {"COMMAND.COM", 0x0002}, {"EDLIN.COM", 0x0002}, {"DEBUG.COM", 0x0002},
+    {"FIND.EXE", 0x0002}, {"MORE.COM", 0x0002}, {"SORT.EXE", 0x0002},
+    {"FC.EXE", 0x0002},
+};
+
+static uint16_t image_version(const Image *img) {
+    for (size_t i = 0; i < sizeof version_table / sizeof version_table[0]; ++i)
+        if (!strcmp(img->name, version_table[i].image)) return version_table[i].version;
+    return 0x0A07;
+}
+
 /* Build an environment block: the strings, an empty string, the word 1, then
  * the program's DOS path. Returns its segment, or 0 when out of memory. */
 static uint16_t make_env(const char *strings, size_t slen, const char *prog, uint16_t owner) {
@@ -274,7 +299,7 @@ static int build_psp(uint16_t psp, uint16_t end_seg, uint16_t env, uint16_t pare
     wr16(psp, 0x12, vec_off(0x24));
     wr16(psp, 0x14, vec_seg(0x24));
     wr16(psp, 0x16, parent);
-    static const uint8_t jft[5] = {1, 1, 1, 0, 2};
+    static const uint8_t jft[5] = {0, 1, 2, 3, 4};
     for (int i = 0; i < 20; i++) wr8(psp, (uint16_t)(0x18 + i), i < 5 ? jft[i] : 0xFF);
     wr16(psp, 0x2C, env);
     wr16(psp, 0x32, 20);
@@ -290,6 +315,30 @@ static int build_psp(uint16_t psp, uint16_t end_seg, uint16_t env, uint16_t pare
     for (int i = 0; i < 11; i++) { wr8(psp, (uint16_t)(0x5D + i), ' '); wr8(psp, (uint16_t)(0x6D + i), ' '); }
     if (tail) return guest_write(a + 0x80, tail, 128) ? 8 : 0;
     wr8(psp, 0x81, 0x0D);
+    return 0;
+}
+
+/* A grown JFT lives in an ordinary DOS block owned by its PSP. Allocate the
+ * full supported capacity once: later smaller requests leave active handles
+ * intact, and normal process cleanup frees the block with its other memory. */
+static int grow_job_file_table(uint16_t requested) {
+    if (requested > DOS_MAX_HANDLES) return 4;
+    if (!cur_psp) return 6;
+    uint16_t count = rd16(cur_psp, 0x32);
+    uint32_t old = lin(rd16(cur_psp, 0x36), rd16(cur_psp, 0x34));
+    if (count > DOS_MAX_HANDLES || old + count > MEM_SIZE) return 6;
+    if (requested <= count) return 0;
+    uint16_t seg, largest;
+    int error = mem_alloc((DOS_MAX_HANDLES + 15) / 16, cur_psp, &seg, &largest);
+    if (error) return error;
+    if (guest_fill((uint32_t)seg << 4, 0xFF, DOS_MAX_HANDLES) ||
+        guest_move((uint32_t)seg << 4, old, count)) {
+        mem_free(seg);
+        return 8;
+    }
+    wr16(cur_psp, 0x32, DOS_MAX_HANDLES);
+    wr16(cur_psp, 0x34, 0);
+    wr16(cur_psp, 0x36, seg);
     return 0;
 }
 
@@ -332,6 +381,8 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
 
     err = build_psp(psp, (uint16_t)(psp + block), env, parent ? parent : psp, term_cs, term_ip, tail);
     if (err) { mem_free(psp); mem_free(env); return err; }
+    wr16(psp, 0x40, image_version(img));
+    dos_fs_inherit_process(psp, parent);
     const char *base = strrchr(dos_prog, '\\');
     base = base ? base + 1 : dos_prog;
     for (int i = 0; i < 8; i++) {
@@ -361,7 +412,22 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
     cur_psp = psp;
     dos_fs_set_process(cur_psp);
     fs_call(0x1A, psp, 0x80);
+    /* The native command bridge has no resident COMMAND to prepare EXEC's
+     * two default FCBs. Parse the command tail with the same DOS service a
+     * shell uses; EDLIN consumes PSP:5Ch for an unqualified filename. */
+    uint16_t fcb_status = 0;
+    if (tail) {
+        cpu.ds = cpu.es = psp;
+        cpu.si = 0x81;
+        for (unsigned i = 0; i < 2; ++i) {
+            cpu.di = (uint16_t)(0x5C + 16 * i);
+            cpu.a.x = 0x2901;
+            dos_fs_int21();
+            if (cpu.a.l == 0xFF) fcb_status |= (uint16_t)(0xFFu << (8 * i));
+        }
+    }
     memset(&cpu.a, 0, sizeof cpu.a);
+    cpu.a.x = fcb_status;
     cpu.b.x = cpu.c.x = cpu.d.x = cpu.si = cpu.di = cpu.bp = 0;
     cpu.ds = cpu.es = psp;
     if (img->is_exe) {
@@ -388,7 +454,8 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
 #else
 static const Image *const images[] = {
     &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue, &image_vz,
-    &image_kermit
+    &image_kermit, &image_command, &image_edlin, &image_debug, &image_find, &image_more,
+    &image_sort, &image_fc
 };
 #define IMAGE_COUNT (sizeof images / sizeof images[0])
 #endif
@@ -866,6 +933,16 @@ static int dos_program_command(const uint8_t *cmd, size_t len) {
     if (begin) pos++;
     if (pos < len && cmd[pos] != ' ' && cmd[pos] != '\t') return -1;
     int association = dos_file_association(word);
+#ifdef __EMSCRIPTEN__
+    if (!association) {
+        int quoted = 0;
+        for (size_t i = 0; i < len; ++i) {
+            if (cmd[i] == '"') quoted = !quoted;
+            else if (!quoted && (cmd[i] == '<' || cmd[i] == '>' || cmd[i] == '|'))
+                return -1; /* COMMAND.COM owns redirection and pipe parsing. */
+        }
+    }
+#endif
     char dos[256], host[4096];
     int found = find_program(word, dos, sizeof dos, host, sizeof host);
     /* Typed commands only belong to DOS after a complete byte match.
@@ -984,7 +1061,26 @@ static int run_dos_command(const uint8_t *cmd, size_t len) {
     }
     int program = dos_program_command(cmd, len);
     if (program >= 0) return program;
+#ifdef __EMSCRIPTEN__
+    /* VC's private editor/association bridge above remains safe; actual
+     * DOS commands and batch syntax belong to Microsoft's shell. */
+    if (len > 122) return command_error(11);
+    char shell[260], host[4096];
+    environment_value("COMSPEC", shell, sizeof shell);
+    if (!*shell || dos_path_host(shell, host, sizeof host)) return command_error(2);
+    const Image *img;
+    int err = known_image(host, &img);
+    if (err || strcmp(img->name, "COMMAND.COM")) return command_error(err ? err : 11);
+    uint8_t tail[128] = {0};
+    tail[0] = (uint8_t)(len + 4);
+    memcpy(tail + 1, " /C ", 4);
+    memcpy(tail + 5, cmd, len);
+    tail[len + 5] = '\r';
+    err = start_child(img, shell, tail, 0);
+    return err ? command_error(err) : 0;
+#else
     return host_run(utf8, NULL, NULL);
+#endif
 }
 
 /* A DOS command line holds 126 bytes. VC cuts a longer one silently, so a
@@ -1218,6 +1314,70 @@ static int prepare_vz_paths(const char *program, char short_program[128],
     return err;
 }
 
+#ifndef __EMSCRIPTEN__
+/* Captured from the first native VC, not from a renamed COMMAND or a guest
+ * environment. Only secondary DOS shells get this directory on PATH. */
+static char native_dos2_directory[128];
+#endif
+
+static int command_environment(char *env, size_t *length, size_t cap, const char *program) {
+    /* Microsoft's transient reload uses a 40-byte COMSPEC buffer. The
+     * executable may be DOS2.COM or any other byte-identical renamed copy. */
+    char shell[128];
+    int err = short_dos_path(program, shell);
+    if (err || strlen(shell) >= 40) return err ? err : 3;
+    size_t read = 0, used = 0;
+    while (read < *length) {
+        const char *end = memchr(env + read, 0, *length - read);
+        if (!end) return 8;
+        size_t size = (size_t)(end - (env + read)) + 1;
+        if (strncasecmp(env + read, "COMSPEC=", 8)) {
+            memmove(env + used, env + read, size);
+            used += size;
+        }
+        read += size;
+    }
+    int size = snprintf(env + used, cap - used, "COMSPEC=%s", shell);
+    if (size < 0 || (size_t)size >= cap - used) return 8;
+    used += (size_t)size + 1;
+#ifndef __EMSCRIPTEN__
+    if (!door_mode && native_dos2_directory[0]) {
+        char directory[128];
+        err = short_dos_path(native_dos2_directory, directory);
+        if (err) return err;
+        size_t dlen = strlen(directory), at = 0;
+        int found = 0;
+        while (at < used) {
+            size_t size = strlen(env + at) + 1;
+            if (!strncasecmp(env + at, "PATH=", 5)) {
+                size_t value = at + 5, first = strcspn(env + value, ";");
+                found = 1;
+                /* A nested shell inherits this prefix already. Keep its
+                 * parent's complete PATH without multiplying entries. */
+                if (first != dlen || strncasecmp(env + value, directory, dlen)) {
+                    int separator = env[value] != 0;
+                    size_t extra = dlen + separator;
+                    if (extra > cap - used) return 8;
+                    memmove(env + value + extra, env + value, used - value);
+                    memcpy(env + value, directory, dlen);
+                    if (separator) env[value + dlen] = ';';
+                    used += extra;
+                }
+                break;
+            }
+            at += size;
+        }
+        if (!found) {
+            size = snprintf(env + used, cap - used, "PATH=%s", directory);
+            if (size < 0 || (size_t)size >= cap - used) return 8;
+            used += (size_t)size + 1;
+        }
+    }
+#endif
+    *length = used;
+    return 0;
+}
+
 static int start_child(const Image *img, const char *dos_prog, const uint8_t *tail, uint16_t envseg) {
     if (nprocs == (int)(sizeof procs / sizeof procs[0])) return 8;
     char short_program[128];
@@ -1248,6 +1408,7 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
         return 8;
     }
     p->image = img;
+    p->exec_break_state = 0;
     p->break_vector = lin(rd16(0, 0x1b * 4 + 2), rd16(0, 0x1b * 4));
     p->parent = cpu;
     get_dta(&p->dta_seg, &p->dta_off);
@@ -1255,7 +1416,9 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     uint16_t parent_psp = cur_psp;
     static char envbuf[32768];
     size_t elen = env_strings(envseg ? envseg : rd16(cur_psp, 0x2C), envbuf, sizeof envbuf);
-    int err = is_vz_image(img) ? vz_environment(envbuf, &elen, sizeof envbuf, p) : 0;
+    int err = !strcmp(img->name, "COMMAND.COM") ?
+        command_environment(envbuf, &elen, sizeof envbuf, dos_prog) : 0;
+    if (!err && is_vz_image(img)) err = vz_environment(envbuf, &elen, sizeof envbuf, p);
     if (!err) err = load_image(img, envbuf, elen, tail, dos_prog, parent_psp, ret_cs, ret_ip);
     if (err) {
         dos_fs_release_path(directory);
@@ -1272,6 +1435,92 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     nprocs++;
     hle_redirect = 1;
     return 0;
+}
+
+/* The supplied COMMAND snapshot contains Microsoft's own EXEC implementation.
+ * It reads/relocates the image itself, then calls DOS 2's AH=55h to create its
+ * child PSP. Adopt that child only after BOTH the just-closed complete file
+ * and the bytes actually loaded in memory match a preserved translation.
+ * No program bytes are decoded or executed by the host. */
+static int loaded_bytes_match(const Image *img, uint16_t loadseg) {
+    uint32_t base = (uint32_t)loadseg << 4;
+    const uint8_t *loaded = guest_span(base, img->size);
+    if (!loaded) return 0;
+    uint8_t *expected = malloc(img->size ? img->size : 1);
+    if (!expected) return 0;
+    memcpy(expected, img->bytes, img->size);
+    for (uint32_t i = 0; i < img->nrelocs; ++i) {
+        uint32_t at = img->relocs[i];
+        if (at + 1 >= img->size) { free(expected); return 0; }
+        uint16_t value = (uint16_t)(expected[at] | expected[at + 1] << 8);
+        value = (uint16_t)(value + loadseg);
+        expected[at] = (uint8_t)value;
+        expected[at + 1] = (uint8_t)(value >> 8);
+    }
+    int matched = !memcmp(expected, loaded, img->size);
+    free(expected);
+    return matched;
+}
+
+static Cpu dos2_saved_frame(uint16_t psp) {
+    Cpu saved = cpu;
+    uint16_t seg = rd16(psp, 0x30), off = rd16(psp, 0x2E);
+    saved.a.x = rd16(seg, off); saved.b.x = rd16(seg, (uint16_t)(off + 2));
+    saved.c.x = rd16(seg, (uint16_t)(off + 4)); saved.d.x = rd16(seg, (uint16_t)(off + 6));
+    saved.si = rd16(seg, (uint16_t)(off + 8)); saved.di = rd16(seg, (uint16_t)(off + 10));
+    saved.bp = rd16(seg, (uint16_t)(off + 12)); saved.ds = rd16(seg, (uint16_t)(off + 14));
+    saved.es = rd16(seg, (uint16_t)(off + 16));
+    saved.ss = seg; saved.sp = (uint16_t)(off + 18); /* IP, CS, FLAGS remain. */
+    return saved;
+}
+
+static int adopt_dos2_child(uint16_t child) {
+    uint16_t ip = rd16(cpu.ss, cpu.sp), cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
+    /* COMMAND hooks INT 21h for all of its descendants. The process on top
+     * may be VC, Kermit or BASIC; the loader is identified by its INT frame,
+     * including COMMAND's relocated transient code. */
+    const Image *loader = rt_image_return("COMMAND.COM", cs, ip);
+    if (!loader) return 0;
+    char host[4096];
+    const Image *img = NULL;
+    int err = !dos_fs_take_closed_file(cur_psp, host, sizeof host) ? 11 : known_image(host, &img);
+    uint16_t loadseg = (uint16_t)(child + 0x10);
+    if (!err && !loaded_bytes_match(img, loadseg)) {
+        /* MZ max-allocation=0 asks DOS to load at the top of its allocation. */
+        uint16_t high = (uint16_t)(child + mcb_size((uint16_t)(child - 1)) - (img->size + 15) / 16);
+        if (!img->is_exe || img->max_alloc || !loaded_bytes_match(img, high)) err = 11;
+        else loadseg = high;
+    }
+    if (nprocs == (int)(sizeof procs / sizeof procs[0])) err = 8;
+    RtProcessState *machine = NULL;
+    const Image *parent_image = nprocs ? procs[nprocs - 1].image : loader;
+    if (!err && !(machine = rt_save_process_state(parent_image))) err = 8;
+    if (err) {
+        /* AH=55h has no error convention. Restore the original EXEC caller's
+         * saved frame, returning the ordinary DOS error there instead of
+         * letting an unapproved loader target run (or killing its shell). */
+        Cpu saved = dos2_saved_frame(cur_psp);
+        /* This early unwind bypasses EXEC.ASM's restore_ctrlc. Restore only
+         * its recorded query -> disable sequence, not arbitrary BREAK edits. */
+        Proc *shell = nprocs ? &procs[nprocs - 1] : NULL;
+        if (shell && shell->exec_break_state == 2) break_flag = shell->exec_break;
+        if (shell) shell->exec_break_state = 0;
+        mem_free_owned(child);
+        cpu = saved;
+        cpu.ip = pop16(); cpu.cs = pop16(); flags_set(pop16());
+        cpu.a.x = (uint16_t)err; cpu.cf = 1;
+        hle_redirect = 1;
+        return -1;
+    }
+    Proc *p = &procs[nprocs++];
+    memset(p, 0, sizeof *p);
+    p->child = child; p->image = img; p->machine = machine;
+    p->parent = dos2_saved_frame(cur_psp);
+    p->break_vector = lin(vec_seg(0x1B), vec_off(0x1B));
+    get_dta(&p->dta_seg, &p->dta_off);
+    rt_register_image(img, loadseg);
+    rt_log("load %s: translation %s (DOS-hosted loader)", host, img->name);
+    return 1;
 }
 
 static void do_exec(void) {
@@ -1304,6 +1553,25 @@ static void do_exec(void) {
         cpu.cf = 0;
         return;
     }
+#ifdef __EMSCRIPTEN__
+    /* The VC command-line bridge must still recognize vc-edit and the
+     * injection-safe shipped associations before passing normal /C text
+     * to COMMAND.COM. A shell's own EXEC is not intercepted. */
+    if (!strcasecmp(command_path, "H:\\COMMAND.COM") &&
+        (!nprocs || procs[nprocs - 1].image == &image_vc_com ||
+         procs[nprocs - 1].image == &image_vc_ovl)) {
+        size_t pos = 1;
+        while (pos <= tail[0] && (tail[pos] == ' ' || tail[pos] == '\t')) ++pos;
+        if (pos + 1 <= tail[0] && tail[pos] == '/' &&
+            (tail[pos + 1] == 'C' || tail[pos + 1] == 'c')) {
+            int status = exec_host(NULL, tail);
+            if (hle_redirect) return;
+            last_retcode = (uint16_t)(status & 0xFF);
+            cpu.cf = 0;
+            return;
+        }
+    }
+#endif
     /* These two images are vc itself. In particular, VC.COM reloads VC.OVL
      * after every command, even if another vc replaced its installation or
      * the config directory no longer exists. Do not consult the disk. */
@@ -1323,6 +1591,26 @@ static void do_exec(void) {
     if (err) fail((uint16_t)err);
 }
 
+static void forget_psp_copy(uint16_t psp) {
+    for (PspCopy **link = &psp_copies; *link;) {
+        PspCopy *copy = *link;
+        if (copy->psp != psp) { link = &copy->next; continue; }
+        *link = copy->next;
+        free(copy);
+    }
+}
+
+static void close_psp_copies(uint16_t owner) {
+    for (PspCopy **link = &psp_copies; *link;) {
+        PspCopy *copy = *link;
+        if (copy->owner != owner) { link = &copy->next; continue; }
+        *link = copy->next;
+        dos_fs_close_process(copy->psp);
+        mem_free_owned(copy->psp);
+        free(copy);
+    }
+}
+
 static void terminate(uint8_t code, int tsr, uint16_t keep) {
     uint16_t psp = cur_psp;
     last_retcode = (uint16_t)(code | (tsr ? 0x300 : 0));
@@ -1334,7 +1622,9 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
         uint16_t maxp;
         mem_resize(psp, keep < 6 ? 6 : keep, &maxp);
     } else {
+        close_psp_copies(psp);
         dos_fs_close_process(psp);
+        forget_psp_copy(psp);
         mem_free_owned(psp);
     }
     set_vec(0x22, rd16(psp, 0x0C), rd16(psp, 0x0A));
@@ -1371,14 +1661,36 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
 static Proc *abortable_child(void) {
     if (!nprocs) return NULL;
     Proc *p = &procs[nprocs - 1];
-    if (p->child != cur_psp || p->image == &image_vc_com || p->image == &image_vc_ovl)
-        return NULL;
-    return p;
+    if (p->image == &image_vc_com || p->image == &image_vc_ovl) {
+        /* Keep fatal diagnostics for the outer VC and its overlay, but a
+         * nested VC belongs to its DOS caller too. A fault there must not
+         * take down the COMMAND/Kermit/BASIC session that launched it. */
+        int nested = 0;
+        for (int i = 0; i + 1 < nprocs; ++i)
+            if (procs[i].image != &image_vc_com && procs[i].image != &image_vc_ovl) {
+                nested = 1;
+                break;
+            }
+        if (!nested) return NULL;
+    }
+    /* DEBUG and similar programs run a PSP they made with AH55/AH26. Walk
+     * its DOS ancestry back to the registered program. A forged cycle is
+     * bounded by the number of possible 16-bit PSP segments. */
+    uint16_t psp = cur_psp;
+    for (unsigned depth = 0; depth < 0x10000u; ++depth) {
+        if (psp == p->child) return p;
+        uint16_t parent = rd16(psp, 0x16);
+        if (!parent || parent == psp) break;
+        psp = parent;
+    }
+    return NULL;
 }
 
 static void abort_child(Proc *p, uint8_t code, uint8_t how) {
     RtProcessState *machine = p->machine;
     p->machine = NULL;
+    cur_psp = p->child;
+    dos_fs_set_process(cur_psp);
     terminate(code, 0, 0);
     last_retcode |= (uint16_t)how << 8;
     /* terminate also writes DOS exit vectors; restore the full parent IVT
@@ -1447,6 +1759,11 @@ static void init_dos_data(void) {
 }
 
 void dos_core_init(void) {
+    while (psp_copies) {
+        PspCopy *copy = psp_copies;
+        psp_copies = copy->next;
+        free(copy);
+    }
     (void)guest_fill(0, 0, MEM_SIZE);
     for (int n = 0; n < 256; n++) set_vec((uint8_t)n, STUB_SEG, (uint16_t)n);
     (void)guest_fill((uint32_t)STUB_SEG << 4, 0xCF, STUB_END); /* IRET bytes, for anyone who looks */
@@ -1480,16 +1797,34 @@ int dos_core_int21(void) {
         wr16(cpu.d.x, 0x16, cur_psp);
         return 1;
     case 0x35: cpu.es = vec_seg(cpu.a.l); cpu.b.x = vec_off(cpu.a.l); return 1;
-    case 0x30: cpu.a.l = 7; cpu.a.h = 10; cpu.b.h = 0xFF; cpu.b.l = 0; cpu.c.x = 0; return 1;
+    case 0x30: cpu.a.x = cur_psp ? rd16(cur_psp, 0x40) : 0x0A07; cpu.b.h = 0xFF; cpu.b.l = 0; cpu.c.x = 0; return 1;
     case 0x31: terminate(cpu.a.l, 1, cpu.d.x); return 1;
-    case 0x33:
+    case 0x33: {
+        Proc *shell = nprocs ? &procs[nprocs - 1] : NULL;
+        uint16_t ip = rd16(cpu.ss, cpu.sp), cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
+        if (shell && !rt_image_return("COMMAND.COM", cs, ip) &&
+            (shell->child != cur_psp || strcmp(shell->image->name, "COMMAND.COM")))
+            shell = NULL;
         switch (cpu.a.l) {
-        case 0x00: cpu.d.l = break_flag; return 1;
-        case 0x01: break_flag = cpu.d.l & 1; return 1;
+        case 0x00:
+            if (shell) { shell->exec_break = break_flag; shell->exec_break_state = 1; }
+            cpu.d.l = break_flag;
+            return 1;
+        case 0x01: {
+            int exec_disable = shell && shell->exec_break_state == 1 &&
+                !(cpu.d.l & 1) && shell->exec_break == break_flag;
+            /* BREAK is global. Any later explicit write supersedes old
+             * snapshots, including the source's normal restore in a child. */
+            for (int i = 0; i < nprocs; ++i) procs[i].exec_break_state = 0;
+            if (exec_disable) shell->exec_break_state = 2;
+            break_flag = cpu.d.l & 1;
+            return 1;
+        }
         case 0x05: cpu.d.l = 3; return 1;
         case 0x06: cpu.b.l = 7; cpu.b.h = 10; cpu.d.l = 0; cpu.d.h = 0; return 1;
         default: cpu.a.l = 0xFF; return 1;
         }
+    }
     case 0x34: cpu.es = DOS_SEG; cpu.b.x = INDOS_OFF; return 1;
     case 0x37: if (cpu.a.l == 0) { cpu.a.l = 0; cpu.d.l = '/'; } else cpu.a.l = 0xFF; return 1;
     case 0x48:
@@ -1513,14 +1848,36 @@ int dos_core_int21(void) {
     case 0x50: cur_psp = cpu.b.x; dos_fs_set_process(cur_psp); return 1;
     case 0x51: case 0x62: cpu.b.x = cur_psp; return 1;
     case 0x52: cpu.es = DOS_SEG; cpu.b.x = LOL_OFF; return 1;
-    case 0x55:
+    case 0x55: {
+        /* Preflight before adoption: a bad copy must not leave a process
+         * registered after the PSP creation itself has failed. */
+        if (!guest_span((uint32_t)cpu.d.x << 4, 256) ||
+            !guest_span((uint32_t)cur_psp << 4, 256)) { fail(8); return 1; }
+        err = adopt_dos2_child(cpu.d.x);
+        if (err < 0) return 1;
+        PspCopy *copy = NULL;
+        if (!err && cpu.d.x != cur_psp) {
+            copy = malloc(sizeof *copy);
+            if (!copy) { fail(8); return 1; }
+            copy->psp = cpu.d.x;
+            copy->owner = nprocs ? procs[nprocs - 1].child : cur_psp;
+            forget_psp_copy(cpu.d.x);
+            copy->next = psp_copies;
+            psp_copies = copy;
+        }
         /* The new PSP may overlap the current one: memmove, never memcpy. */
         if (guest_move((uint32_t)cpu.d.x << 4, (uint32_t)cur_psp << 4, 256)) { fail(8); return 1; }
         wr16(cpu.d.x, 0x16, cur_psp);
         wr16(cpu.d.x, 0x02, cpu.si);
+        wr16(cpu.d.x, 0x32, 20); /* EXEC inherits only the inline twenty slots. */
+        wr16(cpu.d.x, 0x34, 0x18);
+        wr16(cpu.d.x, 0x36, cpu.d.x);
+        if (err > 0) wr16(cpu.d.x, 0x40, image_version(procs[nprocs - 1].image));
+        dos_fs_inherit_process(cpu.d.x, cur_psp);
         cur_psp = cpu.d.x;
         dos_fs_set_process(cur_psp);
         return 1;
+    }
     case 0x58:
         switch (cpu.a.l) {
         case 0x00: cpu.a.x = alloc_strategy; cpu.cf = 0; return 1;
@@ -1534,6 +1891,11 @@ int dos_core_int21(void) {
         if (cpu.a.l == 1) { cpu.b.x = cpu.d.x = 866; cpu.cf = 0; }
         else if (cpu.a.l == 2) cpu.cf = 0;
         else fail(1);
+        return 1;
+    case 0x67:
+        err = grow_job_file_table(cpu.b.x);
+        if (err) fail((uint16_t)err);
+        else cpu.cf = 0;
         return 1;
     default:
         return 0;
@@ -1611,8 +1973,13 @@ static int start_first(const Image *image, const char *dos_prog,
     uint8_t conv[128];
     if (tmp && tmp[0] == '/' && !utf8_to_dos(tmp, conv, sizeof conv)) snprintf(tmpdos, sizeof tmpdos, "%s", conv);
     if (door_mode) strcpy(tmpdos, "H:\\");
-    const char *vars[] = {door_mode ? "COMSPEC=H:\\COMMAND.COM" : "COMSPEC=C:\\bin\\sh",
-                          "PROMPT=$P$G", NULL};
+    const char *vars[] = {
+#ifdef __EMSCRIPTEN__
+        "COMSPEC=H:\\COMMAND.COM",
+#else
+        door_mode ? "COMSPEC=H:\\COMMAND.COM" : "COMSPEC=C:\\bin\\sh",
+#endif
+        "PROMPT=$P$G", NULL};
     for (int i = 0; vars[i]; i++) n += (size_t)snprintf(env + n, sizeof env - n, "%s", vars[i]) + 1;
     char program_dir[128];
     snprintf(program_dir, sizeof program_dir, "%s", dos_prog);
@@ -1620,11 +1987,16 @@ static int start_first(const Image *image, const char *dos_prog,
     if (slash) slash[1] = 0;
     else strcpy(program_dir, "C:\\");
 #ifdef __EMSCRIPTEN__
-    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\GAMES;%s;C:\\", program_dir) + 1;
+    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\DOS;H:\\GAMES;%s;C:\\", program_dir) + 1;
 #else
+    native_dos2_directory[0] = 0;
     if (door_mode)
         n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\GAMES;H:\\.VC") + 1;
-    else n += (size_t)snprintf(env + n, sizeof env - n, "PATH=%s;C:\\", program_dir) + 1;
+    else {
+        int size = snprintf(native_dos2_directory, sizeof native_dos2_directory, "%sDOS2", program_dir);
+        if (size < 0 || (size_t)size >= sizeof native_dos2_directory) return 3;
+        n += (size_t)snprintf(env + n, sizeof env - n, "PATH=%s;C:\\", program_dir) + 1;
+    }
 #endif
     n += (size_t)snprintf(env + n, sizeof env - n, "TEMP=%s", tmpdos) + 1;
     n += (size_t)snprintf(env + n, sizeof env - n, "TMP=%s", tmpdos) + 1;

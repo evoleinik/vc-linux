@@ -7,6 +7,7 @@
 Cpu cpu;
 uint8_t mem[MEM_SIZE];
 void con_write(const uint8_t *bytes, size_t size) { (void)bytes; (void)size; }
+int dos_con_int21(void) { cpu.a.x = 0; cpu.cf = 0; return 1; }
 
 static int dos_path_call(uint16_t ax, const char *source, const char *target) {
     memset(&cpu, 0, sizeof cpu);

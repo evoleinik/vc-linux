@@ -1,0 +1,79 @@
+[
+  {
+    "program": "COMMAND.COM",
+    "identical": false,
+    "first_difference": 1,
+    "built_size": 17952,
+    "shipped_size": 15480,
+    "built_sha256": "46c053a9f51ad18518dfefe0f85c5b6d8e6015998a83f1412764e0cf15210a35",
+    "shipped_sha256": "4cc71b3692b894eef9a7c8b3ac0fc63a71bdfa08175089562fdc4c7c5b038e8a",
+    "built_byte": 205,
+    "shipped_byte": 109
+  },
+  {
+    "program": "EDLIN.COM",
+    "identical": false,
+    "first_difference": 0,
+    "built_size": 8158,
+    "shipped_size": 4389,
+    "built_sha256": "7d10dac8dae0349c0b5ce470d60bdeab73a69f9a57409fd1d7e9c2644ab05f81",
+    "shipped_sha256": "799767e5bc6727fd3fb1b0c54a2099c5c53d46dcab5b7b5012b688f3c718b444",
+    "built_byte": 233,
+    "shipped_byte": 235
+  },
+  {
+    "program": "DEBUG.COM",
+    "identical": false,
+    "first_difference": 9,
+    "built_size": 12149,
+    "shipped_size": 11764,
+    "built_sha256": "c439875ce8e0deb1b7b3bf34a62edd7ff41541bf807afaeb82d58e508f335a4f",
+    "shipped_sha256": "cbb171acca2a5581d926b6782aebeaad49111ecd359e64cf6f2e5dd0a000b4ca",
+    "built_byte": 51,
+    "shipped_byte": 49
+  },
+  {
+    "program": "FIND.EXE",
+    "identical": false,
+    "first_difference": 2,
+    "built_size": 5851,
+    "shipped_size": 5796,
+    "built_sha256": "7dfa3addf35dc47125a1e1108512545c3b484497af51fbc0860ff349061da6e1",
+    "shipped_sha256": "d57bab73ba6a77be1aa8d2d3f1fd7d1d6ce6d459b2ab067d26cf63228e940198",
+    "built_byte": 219,
+    "shipped_byte": 164
+  },
+  {
+    "program": "MORE.COM",
+    "identical": false,
+    "first_difference": 12,
+    "built_size": 4380,
+    "shipped_size": 4364,
+    "built_sha256": "c729f5e7c784320cdaa6fca53802371977b4104c2e4a674c9f272d5bb9c45e7b",
+    "shipped_sha256": "56830889fef22d56ef5938df0394bf30a8416cc06225b8dc35adc74bb13416b7",
+    "built_byte": 252,
+    "shipped_byte": 236
+  },
+  {
+    "program": "SORT.EXE",
+    "identical": false,
+    "first_difference": 2,
+    "built_size": 1152,
+    "shipped_size": 1216,
+    "built_sha256": "23b33b636bb67ecec8404e9bda3279533d8aaf1b6acc3e1c348177afa5612cb6",
+    "shipped_sha256": "f2135e16cd1ebff6233b4d01fcb7f73b311a1f5524ddca21056248b29fa015b8",
+    "built_byte": 128,
+    "shipped_byte": 194
+  },
+  {
+    "program": "FC.EXE",
+    "identical": false,
+    "first_difference": 2,
+    "built_size": 2095,
+    "shipped_size": 2553,
+    "built_sha256": "00a598b0ccee18e3efdcf90290f679ba552a5c16f066083185184f461fc9d2ae",
+    "shipped_sha256": "6bf625fcfcd05466f07f3cb7585c22031523d3981cee0f252cf39b7fb4a173e0",
+    "built_byte": 47,
+    "shipped_byte": 249
+  }
+]
