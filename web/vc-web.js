@@ -196,7 +196,8 @@ async function start() {
   terminal.open(container);
   fit();
   terminal.focus();
-  terminal.write("\x1b[?1002h\x1b[?1006h");
+  // Any-motion tracking, so VC's mouse cursor follows the pointer without a click.
+  terminal.write("\x1b[?1003h\x1b[?1006h");
 
   const initialRender = terminal.onRender(() => {
     const text = screenText();

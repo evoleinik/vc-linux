@@ -124,7 +124,7 @@ static const int fatal_signals[] = {
 static struct sigaction saved_fatal[NSIG], saved_winch;
 static sigset_t installed_fatal;
 static const char leave_modes[] =
-    "\033[>4m\033[?1006l\033[?1002l\033>\033[0m\033[?25h\033[?7h\033[?1049l";
+    "\033[>4m\033[?1006l\033[?1003l\033>\033[0m\033[?25h\033[?7h\033[?1049l";
 
 static int is_fatal_signal(int number)
 {
@@ -493,10 +493,12 @@ static void acquire_terminal(void)
     input_eof = 0;
     term_reset_input();
     read_host_size();
-    /* Ask kitty-protocol terminals what they support, and ask xterm-style
+    /* Any-motion mouse tracking (1003), so VC's own mouse cursor follows the
+     * pointer; 1002 reports motion only while a button is held.
+     * Ask kitty-protocol terminals what they support, and ask xterm-style
      * ones for modifyOtherKeys. Either one tells Ctrl-[ from Esc, Ctrl-I
      * from Tab and Ctrl-M from Enter, which VC binds to different jobs. */
-    emit_string("\033[?1049h\033[?7l\033=\033[?1002h\033[?1006h\033[?25l\033[?u"
+    emit_string("\033[?1049h\033[?7l\033=\033[?1003h\033[?1006h\033[?25l\033[?u"
                 "\033[>4;2m");
     term_invalidate();
     sigprocmask(SIG_SETMASK, &previous, NULL);

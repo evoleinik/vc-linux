@@ -1123,6 +1123,11 @@ static void test_sgr_mouse_input(void)
     click_settles();
     mouse(3, 0, 0, 0);
     check_number(cpu.b.x, 0, "SGR release clears button");
+    feed("\033[<35;20;7M", 104);
+    mouse(3, 0, 0, 0);
+    check_number(cpu.b.x, 0, "SGR motion with no button keeps buttons up");
+    check_number(cpu.c.x, 152, "SGR motion with no button moves X");
+    check_number(cpu.d.x, 48, "SGR motion with no button moves Y");
     feed("\033[<2;10;14M", 103);
     mouse(3, 0, 0, 0);
     check_number(cpu.b.x, 2, "SGR right button maps DOS button bit one");
@@ -1752,7 +1757,8 @@ static void check_enter_modes(void)
 {
     CHECK(strstr(output, "\033[?1049h") != NULL, "PTY enters alternate screen");
     CHECK(strstr(output, "\033=") != NULL, "PTY enters application keypad mode");
-    CHECK(strstr(output, "\033[?1002h") != NULL, "PTY enables button-event mouse mode");
+    CHECK(strstr(output, "\033[?1003h") != NULL,
+          "PTY enables any-motion mouse mode, so VC's mouse cursor follows the pointer");
     CHECK(strstr(output, "\033[?1006h") != NULL, "PTY enables SGR mouse coordinates");
     CHECK(strstr(output, "\033[?u") != NULL, "PTY queries kitty support");
     CHECK(strstr(output, "\033[>11u") == NULL,
@@ -1765,7 +1771,7 @@ static void check_leave_modes(int kitty)
 {
     CHECK(strstr(output, "\033[?1049l") != NULL, "cleanup leaves alternate screen");
     CHECK(strstr(output, "\033>") != NULL, "cleanup leaves application keypad mode");
-    CHECK(strstr(output, "\033[?1002l") != NULL, "cleanup disables button-event mouse mode");
+    CHECK(strstr(output, "\033[?1003l") != NULL, "cleanup disables any-motion mouse mode");
     CHECK(strstr(output, "\033[?1006l") != NULL, "cleanup disables SGR mouse coordinates");
     CHECK(strstr(output, "\033[?25h") != NULL, "cleanup makes host cursor visible");
     CHECK(strstr(output, "\033[0m") != NULL, "cleanup resets character attributes");

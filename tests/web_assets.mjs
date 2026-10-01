@@ -27,6 +27,10 @@ for (const [file, text] of Object.entries(sources)) {
 if (!/locateFile:[^\n]*\?v=([0-9a-f]+)/.test(sources["vc-web.js"]))
   failures.push("vc-web.js: locateFile does not append ?v= to vc.wasm");
 else versions.add(sources["vc-web.js"].match(/locateFile:[^\n]*\?v=([0-9a-f]+)/)[1]);
+// Any-motion tracking (1003), so VC's own mouse cursor follows the pointer
+// without a click. Button-event tracking (1002) reports motion only while held.
+if (!sources["vc-web.js"].includes("\\x1b[?1003h"))
+  failures.push("vc-web.js: does not enable any-motion mouse tracking (?1003h)");
 if (versions.size !== 1) failures.push(`expected one build hash, found: ${[...versions].join(", ") || "none"}`);
 
 if (failures.length) {
