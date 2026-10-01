@@ -26,7 +26,7 @@ uint8_t mem[MEM_SIZE];
 int32_t rt_budget;
 
 static unsigned checks, failures;
-static char fixture[PATH_MAX], original_cwd[PATH_MAX];
+static char fixture[PATH_MAX], original_cwd[PATH_MAX], home_root[PATH_MAX];
 static unsigned char console_bytes[1024];
 static size_t console_size;
 static uint16_t called[256];
@@ -1475,12 +1475,12 @@ static void test_devices_and_ioctl(void)
     begin(0x4402); cpu.b.x = 1; error(1, "unsupported IOCTL subfunction");
     begin(0x44ff); cpu.b.x = 1; error(1, "unknown IOCTL subfunction");
     begin(0x0e00); cpu.d.l = 2;
-    if (ok("select C drive")) CHECK(cpu.a.l == 3, "0E returns three drive positions");
+    if (ok("select C drive")) CHECK(cpu.a.l == 8, "0E returns LASTDRIVE H (eight drive positions)");
     begin(0x1900);
     if (ok("current drive")) CHECK(cpu.a.l == 2, "19 returns C index2");
     for (unsigned drive = 0; drive < 26; ++drive) {
-        if (drive == 2) continue;
-        begin(0x0e00); cpu.d.l = (uint8_t)drive; error(15, "only C is valid");
+        if (drive == 2 || drive == 7) continue;
+        begin(0x0e00); cpu.d.l = (uint8_t)drive; error(15, "only C and H are valid");
     }
     begin(0x1900);
     if (ok("drive after failed change")) CHECK(cpu.a.l == 2, "invalid drive selection preserves C");
@@ -1954,6 +1954,460 @@ static void test_reinitialization(void)
     close_file(h);
 }
 
+static void check_current_drive(unsigned drive, const char *why)
+{
+    begin(0x1900);
+    if (ok(why)) CHECK(cpu.a.l == drive, "%s: drive index %u, got %u", why, drive, cpu.a.l);
+}
+
+static void select_drive(unsigned drive)
+{
+    begin(0x0e00); cpu.d.l = (uint8_t)drive;
+    if (ok("select valid drive")) CHECK(cpu.a.l == 8, "valid selection returns LASTDRIVE H");
+    check_current_drive(drive, "current drive follows selection");
+}
+
+static void check_drive_cwd(int lfn, unsigned drive, const char *expected)
+{
+    char out[PATH_MAX];
+    begin(lfn ? 0x7147 : 0x4700); cpu.d.l = (uint8_t)drive; cpu.si = OUT;
+    if (!ok("get drive-specific current directory")) return;
+    getstr(DS, OUT, out, sizeof out);
+    CHECK(!strcmp(out, expected), "%s getcwd DL=%u: expected '%s', got '%s'",
+          lfn ? "LFN" : "classic", drive, expected, out);
+    CHECK(out[0] != '\\' && strchr(out, ':') == NULL,
+          "47h/7147h preserve DOS's no-drive/no-leading-slash output contract");
+}
+
+static int check_host_resolution(const char *dos, const char *expected)
+{
+    char out[PATH_MAX] = "";
+    putstr(DS, ARG, dos);
+    int resolved = dos_fs_to_host(DS, ARG, out, sizeof out);
+    int matches = resolved == 0 && !strcmp(out, expected);
+    CHECK(matches, "HOME DRIVE: '%s' resolves to '%s', got result %d '%s'",
+          dos, expected, resolved, out);
+    return matches;
+}
+
+static void check_file_drive(uint16_t handle, unsigned drive)
+{
+    begin(0x4400); cpu.b.x = handle;
+    if (ok("file-handle drive information"))
+        CHECK(!(cpu.d.x & 0x80) && (cpu.d.x & 0x1f) == drive,
+              "file handle %u retains opened drive %u, got DX=%04x", handle, drive, cpu.d.x);
+}
+
+static void test_home_drive_paths(void)
+{
+    char path[PATH_MAX], expected[PATH_MAX], out[PATH_MAX], dos_path[PATH_MAX + 3];
+    host_file("home/x.bin", "home-data", 0644);
+    host_path(path, sizeof path, "home/Work directory");
+    host_require(mkdir(path, 0755) == 0, "mkdir H current-directory fixture");
+    host_file("home/Work directory/x.bin", "home-subdir", 0644);
+    host_file("subdir/cdrive.bin", "C-current-directory", 0644);
+    host_path(path, sizeof path, "home/outside");
+    host_require(symlink("..", path) == 0, "H symlink to outside its root");
+    dos_fs_init();
+    check_current_drive(2, "host cwd outside HOME starts on C");
+    check_drive_cwd(0, 8, ""); check_drive_cwd(1, 8, "");
+    check_host_resolution("C:\\", "/");
+    const char *roots[] = {"H:\\", "h:/", "H:", "H:\\..", "H:\\..\\..\\..",
+                           "H:/./../Work directory/../../.."};
+    for (size_t i = 0; i < sizeof roots / sizeof roots[0]; ++i)
+        check_host_resolution(roots[i], home_root);
+    host_path(expected, sizeof expected, "home/x.bin");
+    check_host_resolution("H:\\..\\..\\x.bin", expected);
+
+    path_begin(0x3b00, "H:\\Work directory"); ok("classic chdir changes inactive H directory");
+    check_current_drive(2, "classic H chdir does not select H");
+    check_drive_cwd(0, 8, "WORKDI~1"); check_drive_cwd(1, 8, "Work directory");
+    host_path(expected, sizeof expected, "home/Work directory/x.bin");
+    check_host_resolution("H:x.bin", expected);
+    host_path(path, sizeof path, "subdir");
+    snprintf(dos_path, sizeof dos_path, "C:%s", path);
+    path_begin(0x713b, dos_path); ok("LFN chdir changes C directory");
+    select_drive(7);
+    check_drive_cwd(0, 0, "WORKDI~1"); check_drive_cwd(1, 0, "Work directory");
+    check_host_resolution("x.bin", expected);
+    host_path(expected, sizeof expected, "subdir/cdrive.bin");
+    check_host_resolution("C:cdrive.bin", expected);
+    host_path(expected, sizeof expected, "home/x.bin");
+    check_host_resolution("\\x.bin", expected);
+    path_begin(0x713b, "C:.."); ok("LFN chdir changes inactive C directory");
+    check_current_drive(7, "LFN C chdir does not select C");
+    host_path(expected, sizeof expected, "plain.txt");
+    check_host_resolution("C:plain.txt", expected);
+    select_drive(2);
+    check_drive_cwd(0, 8, "WORKDI~1"); check_drive_cwd(1, 8, "Work directory");
+    select_drive(7);
+    check_drive_cwd(1, 0, "Work directory");
+    select_drive(2);
+
+    const uint16_t chdirs[] = {0x3b00, 0x713b};
+    for (size_t i = 0; i < sizeof chdirs / sizeof chdirs[0]; ++i) {
+        path_begin(chdirs[i], "H:\\"); ok("change H to its drive root");
+        path_begin(chdirs[i], "H:..\\..\\.."); ok("H parent at root remains at root");
+        check_drive_cwd(0, 8, ""); check_drive_cwd(1, 8, "");
+        check_current_drive(2, "H parent chdir leaves current drive unchanged");
+        path_begin(chdirs[i], "H:Work directory"); ok("drive-relative H chdir");
+        path_begin(chdirs[i], "H:no-such-directory"); error(3, "failed H chdir");
+        check_drive_cwd(1, 8, "Work directory");
+    }
+
+    for (unsigned lfn = 0; lfn < 2; ++lfn) {
+        Found list[8];
+        size_t n = find_entries(lfn, "H:*.bin", 0, 1, list, 8);
+        CHECK(n == 1 && list[0].size == strlen("home-subdir") &&
+              !strcmp(list[0].name, lfn ? "x.bin" : "X.BIN"),
+              "drive-relative find uses inactive H's saved directory");
+        n = find_entries(lfn, "H:\\*.bin", 0, 1, list, 8);
+        CHECK(n == 1 && list[0].size == strlen("home-data"),
+              "absolute H find starts at HOME, not its saved directory");
+        n = find_entries(lfn, "H:\\*", A_DIR, 1, list, 8);
+        CHECK(!found_name(list, n, ".") && !found_name(list, n, ".."),
+              "H root find omits dot entries, just as C root does");
+        char c_pattern[PATH_MAX + 5];
+        snprintf(c_pattern, sizeof c_pattern, "C:%s\\*", home_root);
+        n = find_entries(lfn, c_pattern, A_DIR, 1, list, 8);
+        CHECK(found_name(list, n, ".") && found_name(list, n, ".."),
+              "C listing of HOME retains dot entries because HOME is not C's root");
+    }
+
+    const uint16_t true_calls[] = {0x6000, 0x7160, 0x7160, 0x7160};
+    const unsigned modes[] = {0, 0, 1, 2};
+    host_path(expected, sizeof expected, "home/Work directory/x.bin");
+    snprintf(dos_path, sizeof dos_path, "C:%s", expected);
+    const char *names[] = {"H:\\Work directory\\x.bin", dos_path};
+    for (size_t n = 0; n < sizeof names / sizeof names[0]; ++n) {
+        for (size_t i = 0; i < sizeof true_calls / sizeof true_calls[0]; ++i) {
+            path_begin(true_calls[i], names[n]); cpu.c.x = (uint16_t)modes[i];
+            if (!ok("truename chooses H for a host path under HOME")) continue;
+            getstr(ES, OUT, out, sizeof out);
+            CHECK(!strncmp(out, "H:\\", 3), "HOME DRIVE: canonical letter is H: '%s'", out);
+            if (i == 0 || modes[i] == 1)
+                CHECK(!strcmp(out, "H:\\WORKDI~1\\X.BIN"), "H short truename has drive-local aliases: '%s'", out);
+            if (modes[i] == 2)
+                CHECK(!strcmp(out, "H:\\Work directory\\x.bin"), "H long truename preserves spelling: '%s'", out);
+            check_host_resolution(out, expected);
+        }
+    }
+    host_path(path, sizeof path, "home/missing/leaf.dat");
+    snprintf(dos_path, sizeof dos_path, "C:%s", path);
+    for (unsigned lfn = 0; lfn < 2; ++lfn) {
+        path_begin(lfn ? 0x7160 : 0x6000, dos_path); cpu.c.x = 0;
+        if (ok("nonexistent-parent truename still chooses HOME's H letter")) {
+            getstr(ES, OUT, out, sizeof out);
+            CHECK(!strcmp(out, lfn ? "H:\\missing\\leaf.dat" : "H:\\MISSING\\LEAF.DAT"),
+                  "lexical truename retains a nonexistent suffix below H: '%s'", out);
+        }
+    }
+
+    /* C's current directory remains relative to C even when that host path
+     * also has an H name. In particular C:.. may leave HOME; H:.. may not. */
+    snprintf(dos_path, sizeof dos_path, "C:%s", home_root);
+    path_begin(0x713b, dos_path); ok("C chdir to a host directory also named H root");
+    snprintf(expected, sizeof expected, "%s", home_root + 1);
+    for (char *p = expected; *p; ++p) if (*p == '/') *p = '\\';
+    check_drive_cwd(1, 3, expected);
+    check_drive_cwd(1, 8, "Work directory");
+    check_host_resolution("C:..", fixture);
+    path_begin(0x7160, "C:.."); cpu.c.x = 2;
+    if (ok("C parent leaves HOME before canonical drive is chosen")) {
+        getstr(ES, OUT, out, sizeof out);
+        CHECK(!strncmp(out, "C:\\", 3), "parent outside HOME keeps C letter: '%s'", out);
+        check_host_resolution(out, fixture);
+    }
+    path_begin(0x7160, "C:x.bin"); cpu.c.x = 2;
+    if (ok("drive-relative C truename below HOME")) {
+        getstr(ES, OUT, out, sizeof out);
+        CHECK(!strcmp(out, "H:\\x.bin"), "C input under HOME displays with H letter");
+    }
+    snprintf(dos_path, sizeof dos_path, "C:%s", fixture);
+    path_begin(0x3b00, dos_path); ok("restore C fixture directory");
+
+    /* Both spellings identify the same inode; 4400h describes the drive used
+     * to open the handle, not the preferred letter used by truename. */
+    host_path(path, sizeof path, "home/x.bin");
+    snprintf(dos_path, sizeof dos_path, "C:%s", path);
+    const char *same_file[] = {"H:\\x.bin", dos_path};
+    struct stat st;
+    host_require(stat(path, &st) == 0, "stat dual-drive file");
+    for (unsigned lfn = 0; lfn < 2; ++lfn) {
+        for (size_t i = 0; i < sizeof same_file / sizeof same_file[0]; ++i) {
+            path_begin(lfn ? 0x716c : 0x3d00, same_file[i]);
+            if (lfn) { cpu.b.x = 0x40; cpu.d.x = 1; }
+            if (!ok("open the same file by C and H, classic and LFN")) continue;
+            uint16_t h = cpu.a.x;
+            unsigned drive = i ? 2 : 7;
+            read_equals(h, "home-data", "dual-drive open reads the same payload");
+            check_file_drive(h, drive);
+            begin(0x71a6); cpu.b.x = h; cpu.d.x = OUT;
+            if (ok("identity of dual-drive file handle"))
+                CHECK(get32(DS, OUT + 28) == (uint32_t)st.st_dev &&
+                      (((uint64_t)get32(DS, OUT + 44) << 32) | get32(DS, OUT + 48)) == (uint64_t)st.st_ino,
+                      "C and H opens refer to exactly the fixture inode");
+            begin(0x4500); cpu.b.x = h;
+            if (ok("duplicate drive-tagged handle")) {
+                uint16_t duplicate = cpu.a.x;
+                check_file_drive(duplicate, drive); close_file(duplicate);
+            }
+            begin(0x4600); cpu.b.x = h; cpu.c.x = 60;
+            if (ok("force-duplicate drive-tagged handle")) {
+                check_file_drive(60, drive); close_file(60);
+            }
+            close_file(h);
+        }
+    }
+    host_path(expected, sizeof expected, "home/outside/plain.txt");
+    check_host_resolution("H:\\outside\\plain.txt", expected);
+    uint16_t h = open_file("H:\\outside\\plain.txt", 0);
+    if (h != 0xffff) { read_equals(h, "plain-data", "H may follow a filesystem symlink outside its root"); close_file(h); }
+    host_path(expected, sizeof expected, "home/x.bin");
+    check_host_resolution("H:\\outside\\..\\x.bin", expected);
+
+    /* Keep the required H->/ planted-defect run read-only outside the private
+     * fixture: do not create anything unless the H root is verified first. */
+    if (check_host_resolution("H:\\", home_root)) {
+        const char *temp_dirs[] = {"H:\\", "H:"};
+        for (size_t i = 0; i < sizeof temp_dirs / sizeof temp_dirs[0]; ++i) {
+            path_begin(0x5a00, temp_dirs[i]);
+            if (!ok("create temporary file on absolute or drive-relative H")) continue;
+            uint16_t temp = cpu.a.x;
+            getstr(DS, ARG, out, sizeof out);
+            CHECK(!strncmp(out, temp_dirs[i], strlen(temp_dirs[i])),
+                  "temporary filename retains its H drive prefix");
+            check_file_drive(temp, 7); close_file(temp);
+            const char *leaf = out + strlen(temp_dirs[i]);
+            char relative[PATH_MAX];
+            int n = snprintf(relative, sizeof relative, "home/%s%s", i ? "Work directory/" : "", leaf);
+            host_require(n >= 0 && (size_t)n < sizeof relative, "H temporary fixture path");
+            host_path(expected, sizeof expected, relative);
+            if (check_host_resolution(out, expected)) {
+                CHECK(stat(expected, &st) == 0 && S_ISREG(st.st_mode), "H temporary file exists in its own drive directory");
+                path_begin(0x4100, out); ok("delete private H temporary file");
+            }
+        }
+    }
+    host_require(getcwd(out, sizeof out) != NULL, "getcwd after home-drive calls");
+    CHECK(!strcmp(out, fixture), "home-drive changes never change the host process cwd");
+    dos_fs_init();
+}
+
+static void test_home_drive_cwd_rebases(void)
+{
+    /* Renames use explicit C paths bounded to our fixture; the guard also
+     * makes the planted H-root defect skip all directory mutations here. */
+    if (!check_host_resolution("H:\\", home_root)) return;
+    char path[PATH_MAX], target[PATH_MAX], expected[PATH_MAX];
+    char source_dos[PATH_MAX + 3], target_dos[PATH_MAX + 3];
+    host_path(path, sizeof path, "home-parent-alias");
+    host_require(symlink(".", path) == 0, "symlink to HOME's parent inside the fixture");
+    struct stat home_before, st;
+    host_require(stat(home_root, &home_before) == 0, "record protected HOME root identity");
+    const uint16_t renames[] = {0x5600, 0x7156};
+    for (size_t i = 0; i < sizeof renames / sizeof renames[0]; ++i) {
+        host_path(path, sizeof path, "home-parent-alias/home");
+        host_path(target, sizeof target, "home-root-renamed");
+        snprintf(source_dos, sizeof source_dos, "C:%s", path);
+        snprintf(target_dos, sizeof target_dos, "C:%s", target);
+        rename_file(renames[i], source_dos, target_dos, 5);
+        CHECK(lstat(home_root, &st) == 0 && st.st_dev == home_before.st_dev && st.st_ino == home_before.st_ino,
+              "HOME root cannot be renamed through a symlinked parent");
+        /* Recover the exact private inode if a regression allowed the move,
+         * so following tests and fixture cleanup still operate on HOME. */
+        if (lstat(target, &st) == 0 && st.st_dev == home_before.st_dev && st.st_ino == home_before.st_ino) {
+            struct stat home_state;
+            if (lstat(home_root, &home_state) < 0 && errno == ENOENT)
+                host_require(rename(target, home_root) == 0, "restore an incorrectly renamed private HOME");
+        }
+
+        char relative[64];
+        snprintf(relative, sizeof relative, "home-final-link-%zu", i);
+        host_path(path, sizeof path, relative);
+        host_require(symlink("home", path) == 0, "create final symlink to HOME");
+        snprintf(relative, sizeof relative, "home-final-link-renamed-%zu", i);
+        host_path(target, sizeof target, relative);
+        snprintf(source_dos, sizeof source_dos, "C:%s", path);
+        snprintf(target_dos, sizeof target_dos, "C:%s", target);
+        rename_file(renames[i], source_dos, target_dos, 0);
+        CHECK(lstat(path, &st) < 0 && errno == ENOENT, "renaming final HOME symlink removes the link's old name");
+        CHECK(lstat(target, &st) == 0 && S_ISLNK(st.st_mode), "a final HOME symlink may itself be renamed");
+        CHECK(stat(home_root, &st) == 0 && st.st_dev == home_before.st_dev && st.st_ino == home_before.st_ino,
+              "renaming a final symlink never renames HOME itself");
+    }
+    dos_fs_init();
+    host_path(path, sizeof path, "home/saved");
+    host_require(mkdir(path, 0755) == 0, "mkdir inactive H cwd");
+    path_begin(0x3b00, "H:\\saved"); ok("save inactive H cwd before C-side mutations");
+    check_current_drive(2, "H cwd for mutation tests is inactive");
+    snprintf(source_dos, sizeof source_dos, "C:%s", path);
+    path_begin(0x3a00, source_dos); error(16, "classic rmdir protects another drive's cwd");
+    path_begin(0x713a, source_dos); error(16, "LFN rmdir protects another drive's cwd");
+    host_file("home/saved/marker.bin", "saved-directory", 0644);
+    host_path(target, sizeof target, "home/renamed");
+    snprintf(target_dos, sizeof target_dos, "C:%s", target);
+    rename_file(0x7156, source_dos, target_dos, 0);
+    check_drive_cwd(0, 8, "RENAMED"); check_drive_cwd(1, 8, "renamed");
+    host_path(expected, sizeof expected, "home/renamed/marker.bin");
+    check_host_resolution("H:marker.bin", expected);
+    path_begin(0x713b, target_dos); ok("save C cwd at the same renamed directory");
+    strcpy(source_dos, target_dos);
+    host_path(target, sizeof target, "moved-outside-home");
+    snprintf(target_dos, sizeof target_dos, "C:%s", target);
+    rename_file(0x5600, source_dos, target_dos, 0);
+    check_current_drive(2, "C-side rename leaves C selected");
+    check_drive_cwd(0, 8, ""); check_drive_cwd(1, 8, "");
+    host_path(expected, sizeof expected, "moved-outside-home/marker.bin");
+    check_host_resolution("C:marker.bin", expected);
+    host_path(expected, sizeof expected, "home/marker.bin");
+    check_host_resolution("H:marker.bin", expected);
+    check_host_resolution("H:..\\..", home_root);
+    dos_fs_init();
+}
+
+static void test_home_drive_queries(void)
+{
+    select_drive(7);
+    for (unsigned i = 0; i < 2; ++i) {
+        begin(0x3600); cpu.d.l = i ? 8 : 0;
+        if (ok("classic free space on H or current H")) {
+            CHECK(cpu.a.x > 0 && cpu.a.x <= 64 && cpu.c.x == 512,
+                  "H classic free-space geometry is representable by DOS");
+            CHECK(cpu.b.x <= cpu.d.x && cpu.d.x > 0, "H free clusters do not exceed total");
+        }
+    }
+    path_begin(0x7303, "H:\\"); cpu.c.x = 44;
+    if (ok("extended free space on H")) {
+        struct statvfs fs;
+        host_require(statvfs(home_root, &fs) == 0, "statvfs HOME fixture");
+        uint64_t blocks = fs.f_blocks;
+        CHECK(rd16(ES, OUT) == 44 && get32(ES, OUT + 8) == 512,
+              "H extended free space has the documented layout");
+        CHECK(get32(ES, OUT + 32) == (blocks > UINT32_MAX ? UINT32_MAX : (uint32_t)blocks),
+              "H extended free space is measured on HOME's filesystem");
+    }
+    path_begin(0x71a0, "H:\\"); cpu.c.x = 16;
+    if (ok("LFN volume info on H")) {
+        char out[20]; getstr(ES, OUT, out, sizeof out);
+        CHECK(!strcmp(out, "LINUX") && (cpu.b.x & 0x4002) == 0x4002,
+              "H volume exposes Linux long-name support");
+    }
+    const uint16_t ioctls[] = {0x4408, 0x4409, 0x440e, 0x440f};
+    for (size_t i = 0; i < sizeof ioctls / sizeof ioctls[0]; ++i) {
+        for (unsigned current = 0; current < 2; ++current) {
+            begin(ioctls[i]); cpu.b.l = current ? 0 : 8;
+            if (!ok("IOCTL on drive 8 and current H")) continue;
+            if (ioctls[i] == 0x4408) CHECK(cpu.a.x == 1, "H is a fixed disk");
+            else if (ioctls[i] == 0x4409) CHECK(!(cpu.d.x & 0x9000), "H is local and not SUBST");
+            else CHECK(cpu.a.l == 0, "H has a single logical mapping");
+        }
+    }
+    const unsigned bad_drives[] = {3, 25}; /* D and Z, zero based. */
+    for (size_t b = 0; b < sizeof bad_drives / sizeof bad_drives[0]; ++b) {
+        unsigned drive = bad_drives[b];
+        char name[] = "D:\\", out[PATH_MAX];
+        name[0] = (char)('A' + drive);
+        begin(0x0e00); cpu.d.l = (uint8_t)drive; error(15, "D/Z selection is invalid");
+        check_current_drive(7, "invalid selection preserves H");
+        for (size_t i = 0; i < sizeof ioctls / sizeof ioctls[0]; ++i) {
+            begin(ioctls[i]); cpu.b.l = (uint8_t)(drive + 1); error(15, "D/Z IOCTL is invalid");
+        }
+        const uint16_t getcwds[] = {0x4700, 0x7147};
+        const uint16_t path_calls[] = {0x3b00, 0x713b, 0x6000, 0x7160, 0x71a0, 0x7303};
+        for (size_t i = 0; i < sizeof getcwds / sizeof getcwds[0]; ++i) {
+            begin(getcwds[i]); cpu.d.l = (uint8_t)(drive + 1); cpu.si = OUT;
+            error(15, "D/Z getcwd is invalid");
+        }
+        for (size_t i = 0; i < sizeof path_calls / sizeof path_calls[0]; ++i) {
+            path_begin(path_calls[i], name); cpu.c.x = path_calls[i] == 0x7160 ? 2 : 60;
+            error(15, "D/Z pathname-based drive query is invalid");
+        }
+        begin(0x3600); cpu.d.l = (uint8_t)(drive + 1);
+        sentinel(0xffff, 0xffff, "D/Z classic free space uses AX=FFFFh");
+        putstr(DS, ARG, name);
+        CHECK(dos_fs_to_host(DS, ARG, out, sizeof out) < 0 && errno == ENODEV,
+              "D/Z public resolution reports ENODEV");
+    }
+    select_drive(2);
+}
+
+static void test_home_drive_initialization(void)
+{
+    char path[PATH_MAX], expected[PATH_MAX], out[PATH_MAX], link_home[PATH_MAX];
+    host_require(chdir(home_root) == 0, "enter HOME root before init");
+    dos_fs_init();
+    check_current_drive(7, "host cwd at HOME root starts on H");
+    check_drive_cwd(0, 0, ""); check_drive_cwd(1, 0, "");
+    check_drive_cwd(0, 3, ""); check_drive_cwd(1, 3, "");
+    check_host_resolution("\\", home_root);
+    host_path(path, sizeof path, "home/Work directory");
+    host_require(chdir(path) == 0, "enter HOME descendant before init");
+    dos_fs_init();
+    check_current_drive(7, "host cwd below HOME starts on H");
+    check_drive_cwd(0, 8, "WORKDI~1"); check_drive_cwd(1, 8, "Work directory");
+    check_drive_cwd(1, 3, "");
+
+    host_path(path, sizeof path, "home-sibling");
+    host_require(mkdir(path, 0755) == 0, "mkdir HOME-prefix sibling");
+    host_require(chdir(path) == 0, "enter HOME-prefix sibling before init");
+    dos_fs_init();
+    check_current_drive(2, "HOME prefix without path boundary is outside H");
+    snprintf(expected, sizeof expected, "%s", path + 1);
+    for (char *p = expected; *p; ++p) if (*p == '/') *p = '\\';
+    check_drive_cwd(1, 3, expected); check_drive_cwd(1, 8, "");
+    path_begin(0x7160, "."); cpu.c.x = 2;
+    if (ok("truename for a HOME-prefix sibling")) {
+        getstr(ES, OUT, out, sizeof out);
+        CHECK(!strncmp(out, "C:\\", 3), "prefix sibling canonical name stays C: '%s'", out);
+        check_host_resolution(out, path);
+    }
+    host_require(chdir(fixture) == 0, "restore host fixture for HOME configuration checks");
+    host_path(link_home, sizeof link_home, "home-link");
+    host_require(symlink("home", link_home) == 0, "symlink HOME configuration");
+    host_require(setenv("HOME", link_home, 1) == 0, "set HOME through symlink");
+    host_require(chdir(home_root) == 0, "enter canonical HOME for symlink init");
+    dos_fs_init();
+    check_current_drive(7, "HOME is canonicalized before start-drive classification");
+    check_host_resolution("H:\\", home_root);
+    check_drive_cwd(1, 0, "");
+    host_require(chdir(fixture) == 0, "restore fixture before invalid HOME cases");
+
+    char missing[PATH_MAX], not_directory[PATH_MAX], root_link[PATH_MAX];
+    host_path(missing, sizeof missing, "missing-home");
+    host_path(not_directory, sizeof not_directory, "plain.txt");
+    host_path(root_link, sizeof root_link, "root-home-link");
+    host_require(symlink("/", root_link) == 0, "symlink HOME to filesystem root");
+    const char *invalid[] = {NULL, "", "home", "/", missing, not_directory, root_link};
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; ++i) {
+        if (invalid[i]) host_require(setenv("HOME", invalid[i], 1) == 0, "set invalid HOME fixture");
+        else host_require(unsetenv("HOME") == 0, "unset HOME fixture");
+        dos_fs_init();
+        check_current_drive(2, "invalid HOME starts on C");
+        begin(0x0e00); cpu.d.l = 7; error(15, "invalid HOME disables H selection");
+        check_current_drive(2, "failed H selection leaves C selected");
+        putstr(DS, ARG, "H:\\");
+        CHECK(dos_fs_to_host(DS, ARG, out, sizeof out) < 0 && errno == ENODEV,
+              "invalid HOME disables public H resolution (case %zu)", i);
+        begin(0x4700); cpu.d.l = 8; cpu.si = OUT; error(15, "invalid HOME disables classic H getcwd");
+        begin(0x7147); cpu.d.l = 8; cpu.si = OUT; error(15, "invalid HOME disables LFN H getcwd");
+        begin(0x3600); cpu.d.l = 8; sentinel(0xffff, 0xffff, "invalid HOME disables H free space");
+        path_begin(0x7303, "H:\\"); cpu.c.x = 44; error(15, "invalid HOME disables extended H free space");
+        path_begin(0x71a0, "H:\\"); cpu.c.x = 16; error(15, "invalid HOME disables H volume info");
+        begin(0x4408); cpu.b.l = 8; error(15, "invalid HOME disables H IOCTL");
+        check_host_resolution("C:\\", "/");
+    }
+    char trailing_home[PATH_MAX + 3];
+    snprintf(trailing_home, sizeof trailing_home, "%s/", home_root);
+    host_require(setenv("HOME", trailing_home, 1) == 0, "set HOME with trailing separator");
+    dos_fs_init();
+    check_host_resolution("H:\\", home_root);
+    host_require(setenv("HOME", home_root, 1) == 0, "restore valid HOME fixture");
+    dos_fs_init();
+    check_current_drive(2, "restored host fixture starts on C");
+    check_drive_cwd(1, 8, "");
+}
+
 static int remove_fixture_entry(const char *path, const struct stat *st, int type, struct FTW *walk)
 {
     (void)st; (void)walk;
@@ -1982,6 +2436,9 @@ static void setup_fixture(void)
     host_path(path, sizeof path, "link.txt"); host_require(symlink("plain.txt", path) == 0, "file symlink fixture");
     host_path(path, sizeof path, "dirlink"); host_require(symlink("subdir", path) == 0, "directory symlink fixture");
     host_path(path, sizeof path, "dangling"); host_require(symlink("no-such-target", path) == 0, "dangling symlink fixture");
+    host_path(home_root, sizeof home_root, "home");
+    host_require(mkdir(home_root, 0755) == 0, "mkdir HOME inside fixture");
+    host_require(setenv("HOME", home_root, 1) == 0, "set deterministic fixture HOME before init");
     host_require(chdir(fixture) == 0, "enter fixture before dos_fs_init");
     host_require(setenv("TZ", "UTC0", 1) == 0, "set deterministic test timezone");
     tzset();
@@ -2019,6 +2476,10 @@ int main(void)
     test_errors_bounds_and_dispatch();
     test_empty_file_specs();
     test_reinitialization();
+    test_home_drive_paths();
+    test_home_drive_cwd_rebases();
+    test_home_drive_queries();
+    test_home_drive_initialization();
     test_function_coverage();
     /* Reinitialization also exercises releasing live classic-search state. */
     dos_fs_init();

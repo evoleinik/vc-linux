@@ -26,6 +26,7 @@
 #define DOS_PATH_MAX 4096
 #define DOS_NAME_MAX 255
 #define LFN_PATH_MAX 260
+#define DOS_DRIVES 8
 #define ATTR_RO 0x01
 #define ATTR_HIDDEN 0x02
 #define ATTR_SYSTEM 0x04
@@ -34,9 +35,16 @@
 #define ATTR_ARCHIVE 0x20
 
 enum { DEV_NONE, DEV_IN, DEV_OUT, DEV_AUX, DEV_PRN };
+enum { DRIVE_C = 2, DRIVE_H = 7 };
+typedef struct {
+    /* Empty root means absent. Both paths are absolute host spellings; cwd
+     * must remain at or below root, even after a rename through C:. */
+    char root[PATH_MAX], cwd[PATH_MAX];
+} DosDrive;
+
 typedef struct {
     int fd, device, access;
-    unsigned mode;
+    unsigned mode, drive;
     char path[PATH_MAX];
 } DosHandle;
 
@@ -69,7 +77,8 @@ typedef struct BirthTime {
     struct BirthTime *next;
 } BirthTime;
 
-static char dos_cwd[PATH_MAX] = "/";
+static DosDrive drives[DOS_DRIVES] = {[DRIVE_C] = {"/", "/"}};
+static unsigned current_drive = DRIVE_C;
 static DosHandle handles[DOS_HANDLES];
 static Search searches[SEARCH_SLOTS];
 static BirthTime *birth_times;
@@ -87,6 +96,60 @@ static int handle_info(void);
 static int convert_filetime(void);
 static int generate_shortname(void);
 static void forget_birth(const struct stat *st);
+
+static bool drive_present(unsigned drive)
+{
+    return drive < DOS_DRIVES && *drives[drive].root;
+}
+
+/* Query functions number drives from one, with zero meaning current. The
+ * select/current-drive functions instead use zero-based drive numbers. */
+static DosDrive *query_drive(unsigned number)
+{
+    unsigned drive = number ? number - 1 : current_drive;
+    return drive_present(drive) ? drives + drive : NULL;
+}
+
+static bool path_below(const char *path, const char *root)
+{
+    size_t n = strlen(root);
+    return n && (!strcmp(root, "/") ||
+                 (!strncmp(path, root, n) && (!path[n] || path[n] == '/')));
+}
+
+static unsigned host_drive(const char *path)
+{
+    return drive_present(DRIVE_H) && path_below(path, drives[DRIVE_H].root) ?
+           DRIVE_H : DRIVE_C;
+}
+
+static bool drive_root(const char *path)
+{
+    for (unsigned i = 0; i < DOS_DRIVES; ++i)
+        if (drive_present(i) && !strcmp(path, drives[i].root)) return true;
+    return false;
+}
+
+static bool drive_ancestor(const char *path)
+{
+    for (unsigned i = 0; i < DOS_DRIVES; ++i)
+        if (drive_present(i) && path_below(drives[i].root, path)) return true;
+    return false;
+}
+
+static int path_drive(const char **path, unsigned *drive)
+{
+    const char *p = *path;
+    *drive = current_drive;
+    if (*p && p[1] == ':') {
+        *drive = (unsigned)(cp866_upper((uint8_t)*p) - 'A');
+        p += 2;
+    }
+    if (!drive_present(*drive)) return 15;
+    if (strchr(p, ':')) return 3;
+    *path = p;
+    return 0;
+}
 
 static int dos_errno(int e)
 {
@@ -549,12 +612,11 @@ static int resolve_path(const char *dos, char out[PATH_MAX], bool allow_missing)
 {
     if (!*dos) return 3;
     const char *p = dos;
-    if (p[1] == ':') {
-        if (cp866_upper((uint8_t)*p) != 'C') return 15;
-        p += 2;
-    }
-    if (strchr(p, ':')) return 3;
-    strcpy(out, (*p == '/' || *p == '\\') ? "/" : dos_cwd);
+    unsigned drive;
+    int error = path_drive(&p, &drive);
+    if (error) return error;
+    const DosDrive *d = drives + drive;
+    strcpy(out, (*p == '/' || *p == '\\') ? d->root : d->cwd);
     while (*p) {
         while (*p == '/' || *p == '\\') ++p;
         if (!*p) break;
@@ -566,9 +628,12 @@ static int resolve_path(const char *dos, char out[PATH_MAX], bool allow_missing)
         memcpy(part, start, n);
         part[n] = 0;
         if (!strcmp(part, ".")) continue;
-        if (!strcmp(part, "..")) { parent_path(out); continue; }
+        if (!strcmp(part, "..")) {
+            if (strcmp(out, d->root)) parent_path(out);
+            continue;
+        }
         char resolved[PATH_MAX];
-        int error = resolve_name(out, part, resolved, allow_missing && !*p);
+        error = resolve_name(out, part, resolved, allow_missing && !*p);
         if (error) return error == 2 && *p ? 3 : error;
         if (*p) {
             struct stat st;
@@ -590,6 +655,7 @@ static int memory_path(uint16_t seg, uint16_t off, char out[PATH_MAX], bool allo
 
 int dos_fs_to_host(uint16_t seg, uint16_t off, char *out, size_t cap)
 {
+    if (!initialized) dos_fs_init();
     char host[PATH_MAX];
     int error = memory_path(seg, off, host, true);
     if (!error && strlen(host) >= cap) error = 3;
@@ -602,13 +668,18 @@ int dos_fs_to_host(uint16_t seg, uint16_t off, char *out, size_t cap)
     return 0;
 }
 
-static int host_to_dos(const char *host, bool short_names, char *out, size_t cap)
+static int host_to_dos_on_drive(const char *host, unsigned drive, bool short_names,
+                                char *out, size_t cap)
 {
-    char dir[PATH_MAX] = "/";
+    const char *root = drives[drive].root;
+    if (!path_below(host, root)) return 3;
+    char dir[PATH_MAX];
+    strcpy(dir, root);
     size_t used = 3;
     if (cap < 4) return 3;
     memcpy(out, "C:\\", 4);
-    const char *p = host;
+    out[0] = (char)('A' + drive);
+    const char *p = host + strlen(root);
     while (*p == '/') ++p;
     while (*p) {
         const char *start = p;
@@ -653,6 +724,11 @@ static int host_to_dos(const char *host, bool short_names, char *out, size_t cap
         while (*p == '/') ++p;
     }
     return 0;
+}
+
+static int host_to_dos(const char *host, bool short_names, char *out, size_t cap)
+{
+    return host_to_dos_on_drive(host, host_drive(host), short_names, out, cap);
 }
 
 static bool pack_time(struct timespec ts, uint16_t *time, uint16_t *date)
@@ -842,7 +918,7 @@ static int split_pattern(const char *dos, char dir[PATH_MAX], char pattern[DOS_N
     if (!*pat) return 3;
     if (strlen(pat) > DOS_NAME_MAX) return 3;
     strcpy(pattern, pat);
-    if (!split) { strcpy(dir, dos_cwd); return 0; }
+    if (!split) { strcpy(dir, drives[current_drive].cwd); return 0; }
     char parent[DOS_PATH_MAX];
     memcpy(parent, dos, split); parent[split] = 0;
     int error = resolve_path(parent, dir, false);
@@ -870,13 +946,17 @@ static bool links_to_ancestor(const char *dir_real, const char *path, const stru
     return ancestor;
 }
 
-static int snapshot(const char *dir, Entry **entries, size_t *count)
+static int snapshot(const char *dir, unsigned drive, Entry **entries, size_t *count)
 {
     int error = list_directory(dir, entries, count);
     if (error) return error;
+    bool at_root = !strcmp(dir, drives[drive].root);
     char *dir_real = realpath(dir, NULL);
     for (size_t i = 0; i < *count; ++i) {
         Entry *e = *entries + i;
+        /* Do not even form an H-root/.. host path. The same directory can
+         * still expose dot entries when enumerated through its C: name. */
+        if (at_root && (!strcmp(e->host, ".") || !strcmp(e->host, ".."))) continue;
         char path[PATH_MAX];
         if (join_path(dir, e->host, path, sizeof(path)) || file_stat(path, &e->st)) continue;
         if (links_to_ancestor(dir_real, path, &e->st)) {
@@ -974,6 +1054,10 @@ static int find_first(bool lfn)
     if (lfn && cpu.si > 1) return 1;
     char dos[DOS_PATH_MAX], dir[PATH_MAX], pattern[DOS_NAME_MAX + 1];
     int error = read_string(cpu.ds, cpu.d.x, dos, sizeof(dos));
+    if (error) return error;
+    const char *name = dos;
+    unsigned drive;
+    error = path_drive(&name, &drive);
     if (error || (error = split_pattern(dos, dir, pattern))) return error;
     if (!lfn) {
         Search *old = classic_search();
@@ -983,7 +1067,7 @@ static int find_first(bool lfn)
     for (slot = 0; slot < SEARCH_SLOTS && searches[slot].active; ++slot) {}
     if (slot == SEARCH_SLOTS) return 4;
     Search *s = searches + slot;
-    error = snapshot(dir, &s->entries, &s->count);
+    error = snapshot(dir, drive, &s->entries, &s->count);
     if (error) return error;
     s->next = 0; s->mask = cpu.c.x; s->lfn = lfn; s->active = true;
     s->generation = ++search_generation;
@@ -1096,7 +1180,8 @@ static int check_sharing(const struct stat *st, unsigned mode, bool truncate)
     return 0;
 }
 
-static int open_path(const char *path, unsigned mode, unsigned attributes, unsigned action)
+static int open_path(const char *path, unsigned drive, unsigned mode,
+                     unsigned attributes, unsigned action)
 {
     if (!valid_access(mode)) return 12;
     if ((action & ~0x13u) || (action & 15) > 2) return 12;
@@ -1128,6 +1213,7 @@ static int open_path(const char *path, unsigned mode, unsigned attributes, unsig
     }
     DosHandle *h = handles + slot;
     h->fd = fd; h->device = DEV_NONE; h->access = mode & 3; h->mode = mode;
+    h->drive = drive;
     strcpy(h->path, path);
     cpu.a.x = (uint16_t)slot;
     cpu.c.x = !exists ? 2 : if_exists == 2 ? 3 : 1;
@@ -1138,11 +1224,15 @@ static int open_file(uint16_t off, unsigned mode, unsigned attributes, unsigned 
 {
     if (!valid_access(mode)) return 12;
     if ((action & ~0x13u) || (action & 15) > 2) return 12;
-    char path[PATH_MAX];
-    int error = memory_path(cpu.ds, off, path, (action & 0x10) != 0);
+    char dos[DOS_PATH_MAX], path[PATH_MAX];
+    int error = read_string(cpu.ds, off, dos, sizeof(dos));
     if (error) return error;
+    const char *name = dos;
+    unsigned drive;
+    error = path_drive(&name, &drive);
+    if (error || (error = resolve_path(dos, path, (action & 0x10) != 0))) return error;
     uint16_t saved_cx = cpu.c.x;
-    error = open_path(path, mode, attributes, action);
+    error = open_path(path, drive, mode, attributes, action);
     if (!extended) cpu.c.x = saved_cx;
     return error;
 }
@@ -1235,13 +1325,11 @@ static int flush_handle(void)
     return h->fd >= 0 && fsync(h->fd) < 0 ? dos_errno(errno) : 0;
 }
 
-static bool valid_drive(unsigned drive) { return drive == 0 || drive == 3; }
-
 static int ioctl_call(void)
 {
     unsigned sub = cpu.a.l;
     if (sub == 8 || sub == 9 || sub == 0x0e || sub == 0x0f) {
-        if (!valid_drive(cpu.b.l)) return 15;
+        if (!query_drive(cpu.b.l)) return 15;
         if (sub == 8) cpu.a.x = 1; /* fixed, not removable */
         else if (sub == 9) cpu.d.x = 0; /* local */
         else cpu.a.l = 0; /* no logical-drive remapping */
@@ -1253,7 +1341,7 @@ static int ioctl_call(void)
     if (!sub) {
         if (h->device) cpu.d.x = (uint16_t)(0x80 | (h->mode & 0x20) |
             (h->device == DEV_IN ? 1 : h->device == DEV_OUT ? 2 : 0));
-        else cpu.d.x = 2;
+        else cpu.d.x = (uint16_t)h->drive;
     } else if (sub == 1) {
         if (!h->device || cpu.d.h) return 1;
         h->mode = (h->mode & ~0x20u) | (cpu.d.x & 0x20);
@@ -1366,8 +1454,13 @@ static int remove_directory(void)
     }
     st = link_st;
     if (!S_ISDIR(st.st_mode)) return 3;
-    if (!strcmp(path, dos_cwd) || (!stat(dos_cwd, &cwd_st) && st.st_dev == cwd_st.st_dev && st.st_ino == cwd_st.st_ino)) return 16;
-    if (!strcmp(path, "/")) return 5;
+    for (unsigned i = 0; i < DOS_DRIVES; ++i) {
+        if (!drive_present(i)) continue;
+        const char *cwd = drives[i].cwd;
+        if (!strcmp(path, cwd) || (!stat(cwd, &cwd_st) &&
+            st.st_dev == cwd_st.st_dev && st.st_ino == cwd_st.st_ino)) return 16;
+    }
+    if (drive_root(path)) return 5;
     if (rmdir(path) < 0) return dos_errno(errno);
     forget_birth(&st);
     return 0;
@@ -1375,22 +1468,32 @@ static int remove_directory(void)
 
 static int change_directory(void)
 {
-    char path[PATH_MAX];
+    char dos[DOS_PATH_MAX], path[PATH_MAX];
     struct stat st;
-    int error = memory_path(cpu.ds, cpu.d.x, path, false);
+    int error = read_string(cpu.ds, cpu.d.x, dos, sizeof(dos));
+    if (error) return error;
+    const char *name = dos;
+    unsigned drive;
+    error = path_drive(&name, &drive);
+    if (error) return error;
+    error = resolve_path(dos, path, false);
     if (error) return error == 2 ? 3 : error;
     error = file_stat(path, &st);
     if (error) return error == 2 ? 3 : error;
     if (!S_ISDIR(st.st_mode)) return 3;
-    strcpy(dos_cwd, path);
+    strcpy(drives[drive].cwd, path);
     return 0;
 }
 
 static int get_directory(bool lfn)
 {
-    if (!valid_drive(cpu.d.l)) return 15;
+    DosDrive *drive = query_drive(cpu.d.l);
+    if (!drive) return 15;
     char path[DOS_PATH_MAX];
-    int error = host_to_dos(dos_cwd, !lfn, path, sizeof(path));
+    /* DOS returns no drive or leading separator. Keep the requested drive's
+     * basis so callers can reconstruct C:\\... even below the H: root. */
+    int error = host_to_dos_on_drive(drive->cwd, (unsigned)(drive - drives),
+                                     !lfn, path, sizeof(path));
     if (error) return error;
     error = write_string(cpu.ds, cpu.si, path + 3, lfn ? LFN_PATH_MAX : 64);
     if (!error) cpu.a.x = 0x0100; /* DOS 3+ documented success value */
@@ -1423,11 +1526,13 @@ static int delete_file(bool lfn)
         return error ? error : unlink_path(path);
     }
     char pattern[DOS_NAME_MAX + 1];
-    error = split_pattern(dos, path, pattern);
-    if (error) return error;
+    const char *name = dos;
+    unsigned drive;
+    error = path_drive(&name, &drive);
+    if (error || (error = split_pattern(dos, path, pattern))) return error;
     Entry *entries;
     size_t count, removed = 0;
-    error = snapshot(path, &entries, &count);
+    error = snapshot(path, drive, &entries, &count);
     if (error) return error;
     size_t selected = count;
     if (!strpbrk(pattern, "*?")) {
@@ -1481,7 +1586,21 @@ static int rename_file(void)
     error = file_stat(old, &st);
     if (error) return error;
     if (!(st.st_mode & S_IWUSR)) return 5;
-    if (!strcmp(old, "/")) return 5;
+    /* A drive root (or its ancestor reached through C:) must stay in place. */
+    if (drive_ancestor(old)) return 5;
+    if (S_ISDIR(st.st_mode)) {
+        struct stat link_st;
+        if (lstat(old, &link_st) < 0) return dos_errno(errno);
+        /* A symlinked parent may give the root another C: spelling. Moving
+         * a final symlink itself is safe: its target stays where it was. */
+        if (!S_ISLNK(link_st.st_mode)) {
+            char *real = realpath(old, NULL);
+            if (!real) return dos_errno(errno);
+            bool protected = drive_ancestor(real);
+            free(real);
+            if (protected) return 5;
+        }
+    }
     if (!strcmp(old, target)) {
         /* Preserve a requested case-only change, but do not replace a real
          * long name with its alias or its lossy display spelling. */
@@ -1498,7 +1617,14 @@ static int rename_file(void)
     /* Unlike POSIX rename(), DOS must never overwrite an existing name.
      * Linux's atomic NOREPLACE also closes the destination-existence race. */
     if (renameat2(AT_FDCWD, old, AT_FDCWD, target, RENAME_NOREPLACE) < 0) return dos_errno(errno);
-    rebase_path(dos_cwd, old, target);
+    for (unsigned i = 0; i < DOS_DRIVES; ++i) {
+        if (!drive_present(i)) continue;
+        rebase_path(drives[i].cwd, old, target);
+        /* C: can move a saved H: directory outside its drive. Forget that
+         * directory rather than letting a later H:relative path escape. */
+        if (!path_below(drives[i].cwd, drives[i].root))
+            strcpy(drives[i].cwd, drives[i].root);
+    }
     for (unsigned i = 0; i < DOS_HANDLES; ++i)
         if (get_handle(i)) rebase_path(handles[i].path, old, target);
     return 0;
@@ -1508,6 +1634,10 @@ static int create_temporary(void)
 {
     char dos[DOS_PATH_MAX], dir[PATH_MAX], path[PATH_MAX];
     int error = read_string(cpu.ds, cpu.d.x, dos, sizeof(dos));
+    if (error) return error;
+    const char *name_start = dos;
+    unsigned drive;
+    error = path_drive(&name_start, &drive);
     if (error || (error = resolve_path(dos, dir, false))) return error;
     struct stat st;
     error = file_stat(dir, &st);
@@ -1523,7 +1653,7 @@ static int create_temporary(void)
         snprintf(name, sizeof(name), "VC%06u.TMP", temp_sequence);
         error = resolve_name(dir, name, path, true);
         if (error) return error;
-        error = open_path(path, 2, attributes, 0x10);
+        error = open_path(path, drive, 2, attributes, 0x10);
         if (error == 80) continue;
         if (error) return error;
         strcpy(dos + n, name);
@@ -1537,14 +1667,15 @@ static int lexical_dos_path(const char *input, char out[DOS_PATH_MAX])
 {
     if (!*input) return 3;
     const char *p = input;
-    if (p[1] == ':') {
-        if (cp866_upper((uint8_t)*p) != 'C') return 15;
-        p += 2;
+    unsigned drive;
+    int error = path_drive(&p, &drive);
+    if (error) return error;
+    if (*p == '/' || *p == '\\') {
+        strcpy(out, "C:\\");
+        out[0] = (char)('A' + drive);
     }
-    if (strchr(p, ':')) return 3;
-    if (*p == '/' || *p == '\\') strcpy(out, "C:\\");
     else {
-        int error = host_to_dos(dos_cwd, false, out, DOS_PATH_MAX);
+        error = host_to_dos_on_drive(drives[drive].cwd, drive, false, out, DOS_PATH_MAX);
         if (error) return error;
     }
     size_t used = strlen(out);
@@ -1571,6 +1702,33 @@ static int lexical_dos_path(const char *input, char out[DOS_PATH_MAX])
     return 0;
 }
 
+/* CL=0 and AH=60's missing-parent fallback do not require the named file to
+ * exist. Resolve only a possible C: spelling of the home-root prefix, so
+ * its aliases/case are recognized without checking any nonexistent suffix. */
+static void prefer_home_truename(char path[DOS_PATH_MAX])
+{
+    if (!drive_present(DRIVE_H) || path[0] != 'C') return;
+    unsigned components = 0;
+    for (const char *p = drives[DRIVE_H].root; *p; ++p)
+        if (*p == '/') ++components;
+    char *end = path + 3;
+    for (unsigned i = 0; i < components; ++i) {
+        if (!*end) return;
+        while (*end && *end != '\\') ++end;
+        if (i + 1 < components) {
+            if (!*end) return;
+            ++end;
+        }
+    }
+    char prefix[DOS_PATH_MAX], host[PATH_MAX];
+    size_t n = (size_t)(end - path);
+    memcpy(prefix, path, n); prefix[n] = 0;
+    if (resolve_path(prefix, host, false) || strcmp(host, drives[DRIVE_H].root)) return;
+    if (*end) ++end;
+    memmove(path + 3, end, strlen(end) + 1);
+    path[0] = 'H';
+}
+
 static int truename(bool lfn)
 {
     unsigned mode = lfn ? cpu.c.l : 1;
@@ -1578,13 +1736,17 @@ static int truename(bool lfn)
     char input[DOS_PATH_MAX], canonical[DOS_PATH_MAX], host[PATH_MAX], output[DOS_PATH_MAX];
     int error = read_string(cpu.ds, cpu.si, input, sizeof(input));
     if (error || (error = lexical_dos_path(input, canonical))) return error;
-    if (lfn && mode == 0) strcpy(output, canonical);
+    if (lfn && mode == 0) {
+        strcpy(output, canonical);
+        prefer_home_truename(output);
+    }
     else {
         error = resolve_path(canonical, host, !lfn);
         if (error && !lfn && (error == 2 || error == 3)) {
             /* AH=60 is also valid for not-yet-existing paths. There is no
              * directory alias to query for a nonexistent parent. */
             strcpy(output, canonical);
+            prefer_home_truename(output);
             for (char *p = output; *p; ++p) *p = (char)cp866_upper((uint8_t)*p);
         } else {
             if (error) return error;
@@ -1619,7 +1781,24 @@ void dos_fs_init(void)
         BirthTime *next = birth_times->next;
         free(birth_times); birth_times = next;
     }
-    if (!getcwd(dos_cwd, sizeof(dos_cwd))) strcpy(dos_cwd, "/");
+    memset(drives, 0, sizeof(drives));
+    strcpy(drives[DRIVE_C].root, "/");
+    strcpy(drives[DRIVE_C].cwd, "/");
+    const char *home = getenv("HOME");
+    if (home && *home == '/') {
+        char *root = realpath(home, NULL);
+        struct stat st;
+        if (root && strlen(root) < PATH_MAX && strcmp(root, "/") &&
+            !stat(root, &st) && S_ISDIR(st.st_mode)) {
+            strcpy(drives[DRIVE_H].root, root);
+            strcpy(drives[DRIVE_H].cwd, root);
+        }
+        free(root);
+    }
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "/");
+    current_drive = host_drive(cwd);
+    strcpy(drives[current_drive].cwd, cwd);
     dta_seg = cpu.ds; dta_off = 0x80;
     last_error = 0; temp_sequence = 0;
     clock_delta = (struct timespec){0, 0};
@@ -1694,10 +1873,10 @@ int dos_fs_int21(void)
     } else if (function == 0x7303) error = disk_space(true);
     else switch (function >> 8) {
     case 0x0e:
-        if (cpu.d.l != 2) error = 15;
-        else cpu.a.l = 3;
+        if (!drive_present(cpu.d.l)) error = 15;
+        else { current_drive = cpu.d.l; cpu.a.l = DOS_DRIVES; }
         break;
-    case 0x19: cpu.a.l = 2; break;
+    case 0x19: cpu.a.l = (uint8_t)current_drive; break;
     case 0x1a: dta_seg = cpu.ds; dta_off = cpu.d.x; break;
     case 0x2f: cpu.es = dta_seg; cpu.b.x = dta_off; break;
     case 0x2a: case 0x2c: {
@@ -1772,7 +1951,11 @@ static int disk_space(bool extended)
         error = file_stat(path, &st);
         if (error) return error;
         if (!S_ISDIR(st.st_mode)) return 3;
-    } else if (cpu.d.l != 0 && cpu.d.l != 3) return 15;
+    } else {
+        const DosDrive *drive = query_drive(cpu.d.l);
+        if (!drive) return 15;
+        strcpy(path, drive->root);
+    }
 
     struct statvfs fs;
     if (statvfs(path, &fs) != 0) return dos_errno(errno);
