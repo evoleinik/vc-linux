@@ -861,6 +861,17 @@ static void queue_protocol_key(unsigned code, unsigned modifiers, unsigned event
         update_modifiers(modifiers, code, event);
     if (event == 3 || modifier_bit(code))
         return;
+    if (((code == 57362 || code == 57359) &&
+         (modifiers & (MOD_CTRL | MOD_ALT)) == MOD_CTRL) ||
+        ((code == 'b' || code == 'B') &&
+         (modifiers & (MOD_CTRL | MOD_SHIFT | MOD_ALT)) ==
+         (MOD_CTRL | MOD_SHIFT))) {
+        /* Ctrl-Pause / Ctrl-ScrollLock, plus the laptop-friendly chord
+         * documented by GW-BASIC. Do not turn a release into a new break. */
+        term_clear_pending();
+        bios_request_break();
+        return;
+    }
     if (code >= 57364 && code <= 57375) {
         queue_function(code - 57364 + 1, modifiers);
     } else if (code >= 57399 && code <= 57414) {

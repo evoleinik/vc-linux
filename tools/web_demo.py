@@ -1,6 +1,6 @@
 """Assemble the small, offline H: drive for the WebAssembly build.
 
-Usage: .venv/bin/python tools/web_demo.py build/web-work/demo
+Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR
 The original assembly lives only in asm/; this copies it at build time.
 """
 from pathlib import Path
@@ -10,7 +10,7 @@ import textwrap
 
 
 ROOT = Path(__file__).resolve().parent.parent
-LIMIT = 200_000  # Decimal KB is stricter than the brief's 200 KB ceiling.
+LIMIT = 400_000  # Decimal KB is stricter than the brief's 400 KB ceiling.
 
 
 def history_text(readme: str) -> bytes:
@@ -31,16 +31,17 @@ def history_text(readme: str) -> bytes:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
+    if len(sys.argv) != 4:
         raise SystemExit(__doc__)
     destination = Path(sys.argv[1])
     files = {
         "README.TXT": (ROOT / "web/README.TXT").read_text(encoding="ascii").encode("ascii"),
         "HISTORY.TXT": history_text((ROOT / "README.md").read_text(encoding="utf-8")),
-        "GAMES/NOTHING.TXT": (
-            b"There are no games here. You are already playing with a file manager.\n"
-        ),
+        "GWBASIC.EXE": Path(sys.argv[2]).read_bytes(),
+        "GWBASIC.TXT": (ROOT / "third_party/gwbasic/LICENSE").read_bytes(),
     }
+    for path in sorted(Path(sys.argv[3]).iterdir()):
+        files[f"GAMES/{path.name}"] = path.read_bytes()
     for name in ("VC.ASM", "VCOVL.ASM", "LICENSE.TXT"):
         files[f"SRC/{name}"] = (ROOT / "asm" / name).read_bytes()
 
@@ -52,6 +53,13 @@ def main() -> None:
         path.relative_to(destination).as_posix()
         for path in destination.rglob("*") if path.is_file()
     } - files.keys()
+    # Retire only the exact generated joke from Brief 10. Never remove a
+    # user-added file merely because it is absent from the new manifest.
+    old_game = destination / "GAMES/NOTHING.TXT"
+    if "GAMES/NOTHING.TXT" in extras and old_game.read_bytes() == (
+            b"There are no games here. You are already playing with a file manager.\n"):
+        old_game.unlink()
+        extras.remove("GAMES/NOTHING.TXT")
     if extras:
         raise SystemExit(f"Unexpected files in {destination}: {', '.join(sorted(extras))}")
     for name, contents in files.items():

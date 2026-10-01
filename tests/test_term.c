@@ -308,6 +308,40 @@ static void test_control_alt_keys(void)
     }
 }
 
+static void test_ctrl_break(void)
+{
+    static const char *chords[] = {
+        "\033[57362;5u",       /* kitty Ctrl-Pause */
+        "\033[57359;5u",       /* kitty Ctrl-ScrollLock */
+        "\033[98;6u",          /* kitty Ctrl-Shift-B, base letter */
+        "\033[66;6u",          /* kitty Ctrl-Shift-B, shifted letter */
+        "\033[27;6;66~",       /* modifyOtherKeys Ctrl-Shift-B */
+    };
+    for (unsigned i = 0; i < sizeof(chords) / sizeof(chords[0]); ++i) {
+        reset();
+        cpu.cs = 0x1234;
+        cpu.ip = 0x5678;
+        feed("abcdefghijklmnopqrstu", 100); /* ring and typeahead both full */
+        feed(chords[i], 110);
+        CHECK(mem[0x471] & 0x80, "Ctrl-Break sets BIOS break flag");
+        check_number(cpu.cs, 0x1234, "terminal must not dispatch Ctrl-Break directly");
+        check_number(cpu.ip, 0x5678, "terminal must not change interrupted IP");
+        check_number((unsigned)bios_take_break(), 1, "Ctrl-Break latches interrupt request");
+        check_number((unsigned)bios_take_break(), 0, "interrupt request consumed once");
+        check_number(pop_raw(), 0, "Ctrl-Break replaces queue with null word");
+        feed("z", 120);
+        check_number(pop_raw(), 0x2c7a, "Ctrl-Break discards pending old typeahead");
+        check_number(pop_raw(), 0x10000, "Ctrl-Break leaves no literal Ctrl-B character");
+    }
+    reset();
+    feed("\033[57362;5:3u\033[98;6:3u", 100);
+    check_number((unsigned)bios_take_break(), 0, "key releases never trigger Ctrl-Break");
+    check_number(pop_raw(), 0x10000, "Ctrl-Break release emits no key");
+    feed("\033[98;5u", 110);
+    check_number((unsigned)bios_take_break(), 0, "plain Ctrl-B remains a character");
+    check_number(pop_raw(), 0x3002, "plain Ctrl-B preserves DOS scan code");
+}
+
 static void test_function_keys(void)
 {
     static const unsigned tilde[12] = {11,12,13,14,15,17,18,19,20,21,23,24};
@@ -1993,6 +2027,7 @@ int main(void)
     RUN(test_bda);
     RUN(test_ascii_keys);
     RUN(test_control_alt_keys);
+    RUN(test_ctrl_break);
     RUN(test_function_keys);
     RUN(test_navigation_keys);
     RUN(test_kitty_keypad_navigation);

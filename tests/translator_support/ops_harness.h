@@ -26,6 +26,7 @@ typedef struct {
     uint32_t offset;
     uint8_t bytes[16];
     uint8_t length, relocation_count, relocations[8];
+    uint8_t mutable_count, mutable_offsets[8];
     uint16_t undefined_flags;
     uint8_t flags_kind, width, count_from_cl, immediate_count;
     uint8_t special, vector, memory_count, stack_write_words;

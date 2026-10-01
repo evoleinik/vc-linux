@@ -1,0 +1,201 @@
+; [ This translation created 12-Jan-83 by Version 4.3 ]
+
+	SUBTTL    MSDOS2U - MS-DOS Constants and Data-Structure Definitions
+
+COMMENT	*
+
+--------- --- ---- -- ---------
+COPYRIGHT (C) 1982 BY MICROSOFT
+--------- --- ---- -- ---------
+
+	Programmer: Tom Corbett,  Microsoft Inc.
+
+Updated 2021 by: TK Chia <https://github.com/tkchia>
+	*
+
+CALLOS	MACRO	FUNC
+IFNB	<FUNC>  
+	MOV	AH,LOW OFFSET FUNC
+ENDIF 
+	INT	33D		;MSDOS system call
+ENDM 
+
+ROFFST	MACRO	NAME,SIZE	;define record macro
+	NAME=_OFFST
+	_OFFST=_OFFST+SIZE
+ENDM 
+
+
+; MSDOS System Call codes
+;
+	C_PRTO=5D		;Printer output
+	C_DCIO=6D		;Direct console I/O
+	C_REST=13D		;INITIALIZE BDOS
+	C_SDRV=14D		;SET CURRENTLY SELECTED DRIVE
+	C_OPEN=15D
+	C_CLOS=16D
+	C_SEAR=17D		;SEARCH FOR FILE
+	C_DELE=19D
+	C_READ=20D
+	C_MAKE=22D
+	C_RENA=23D
+	C_GDRV=25D		;GET CURRENTLY SELECTED DRIVE
+	C_BUFF=26D		;SET DMA ADDRESS
+	C_RNDR=33D		;Random read
+	C_RNDW=34D		;Random write
+	C_RBR=39D		;Random Block Read
+	C_PARS=41D		;Parse Filename
+
+; MSDOS 2+ System Call codes
+;
+	C_VERS=30H		;Get MSDOS version (subject to SETVER...)
+	C_MKDI=39H		;Create subdirectory
+	C_RMDI=3AH		;Remove subdirectory
+	C_CHDI=3BH		;Set current directory
+	C_MAK2=3CH		;Create/truncate file
+	C_OPN2=3DH		;Open file
+	C_CLO2=3EH		;Close file
+	C_REA2=3FH		;Read from file
+	C_WRI2=40H		;Write to file
+	C_DEL2=41H		;Delete file
+	C_SEEK=42H		;Set file read/write position
+	C_SEA2=4EH		;Search for file
+	C_IVAR=52H		;Get the MSDOS-internal List of Lists
+	C_RNA2=56H		;Rename file
+
+	FNAML=11D		;number of bytes in Filename with extension
+	DATPSC=128D		;bytes per sector
+	FCBSIZ=38D		;File Control Block size
+
+;MS-DOS FILE-DATA-BLOCK Record Definition
+;
+	_OFFST=0		;initialize count
+	ROFFST	F_DID1,1	;(GWBASIC) not used by basic interpreter
+				;(GWBASICA) high 8 bits of "dir. id."
+	ROFFST	F_NUM,1		;file number 0..255
+	ROFFST	F_DID3,2	;(GWBASIC) not used by basic interpreter
+				;(GWBASICA) low 16 bits of "dir. id."
+	ROFFST	F_NEXT,2	;thread for linked list, [MEMSIZ]=end
+	ROFFST	F_MODE,1	;file mode:
+	MD_SQI=1D		;sequential input
+	MD_SQO=2D		;sequential output
+	MD_RND=4D		;random
+	MD_APP=8D		;append
+	ROFFST	F_FCB,FCBSIZ	;File Control Block: used to communicate with OS
+	ROFFST	F_CLOC,2	;for seq files: num sectors read/written   (LOCOFS)
+				;for rnd files: last record number + 1
+	ROFFST	F_ORCT,1	;"Original Byte Count"                     (ORNOFS)
+				;for seq input: #bytes in sector when read
+				;for seq output: #bytes in output sector
+				;for random files: bytes per sector
+	ROFFST	F_BREM,1	;number of bytes till end-of-buffer        (NMLOFS)
+	ROFFST	F_CODE,1	;file encoding:
+	FC_ASC=0		;Ascii SAVE, Data files
+	FC_BIN=1		;binary file (BSAVE, binary SAVE)
+	ROFFST	F_BAKC,1	;holds next sequential input when F.FLBS.FL.BKC is true
+	ROFFST	F_DID2,1	;(GWBASIC) not used by basic interpreter
+				;(GWBASICA) middle 8 bits of "dir. id."
+	ROFFST	F_DEV,1		;Device number                             (FL.DSK)
+	ROFFST	F_WID,1		;File width
+	ROFFST	F_NUL4,1	;not used by basic interpreter
+	ROFFST	F_FLGS,1	;flags
+	FL_BKC=200O		;when true, F.BAKC contains next sequential input
+	ROFFST	F_POS,1		;Current column position                   (FL.OPS)
+	ROFFST	FDBSIZ,0	;size of device independent part of FDB
+				;device dependant FDB entries start here
+
+	ROFFST	DATOFS,DATPSC	;Operating System interface buffer
+	ROFFST	FD_SIZ,2	;variable record length for random files
+	ROFFST	FD_PHY,2	;current physical record number
+	ROFFST	FD_LOG,2	;current logical record number
+	ROFFST	F_NUL5,1	;Future use
+	ROFFST	FD_OPS,2	;current output position for sequential I/O
+	ROFFST	FD_DAT,0	;field buffer of random file
+
+; OFFSETS INTO MSDOS FCB
+;
+	FCB_DV=F_FCB+0D		;DRIVE (0=default, 1=A:, 2=B:, ...)
+	FCB_FN=F_FCB+1D		;FILE NAME
+	FCB_FT=F_FCB+9D		;EXTENSION
+	FCB_EX=F_FCB+12D	;FILE EXTENT (identifies block of 128 logical records)
+	FCB_RC=F_FCB+14D	;RECORD SIZE
+	FCB_FS=F_FCB+16D	;FILE SIZE IN BYTES
+	FCB_DT=F_FCB+20D	;Date of last write to file
+	FCB_TM=F_FCB+22D	;Time of last write to file
+	FCB_DW=F_FCB+24D	;Low byte of device information word (DOS 2.x
+				;internal)
+	FCB_SF=F_FCB+24D	;Index into SFT (DOS 3+ internal)
+	FCB_LC=F_FCB+29D	;Last cluster accessed (12-bit) & directory
+				;(12-bit), packed into 24 bits (2.x internal)
+	FCB_DI=F_FCB+29D	;Low 16 bits of sector number containing
+				;directory entry (DOS 3+ internal)
+	FCB_NR=F_FCB+32D	;NEXT RECORD NUMBER
+	FCB_RN=F_FCB+33D	;CP/M 2.x Random Record Number
+
+; Offsets into MSDOS 2+ List of Lists
+;
+	IV_DPB=00H		;Pointer to first Drive Parameter Block
+	IV_SFT=04H		;Pointer to first System File Table
+	IV_CLK=08H		;Pointer to CLOCK$ device header
+	IV_CON=0CH		;Pointer to CON device header
+	IV_NL2=17H		;Actual NUL device header (MSDOS 2.x)
+	IV_NLX=22H		;Actual NUL device header (MSDOS 3+)
+
+; Offsets into an MSDOS 2+ System File Table
+;
+	FT_NXT=00H		;Pointer to next SFT
+	FT_NF=04H		;Number of file entries in this SFT
+	FT_ENT=06H		;Start of entries
+
+; Offsets into MSDOS 2.x System File Table entry
+;
+	F2_NFH=00H		;Number of file handles
+	F2_MOD=01H		;File open mode
+	F2_FTR=02H		;File attribute
+	;Note: each 2.x SFT entry is basically a FCB with a header before it
+	F2_DRV=03H		;Drive
+	F2_FN=04H		;File name in FCB format
+	F2_DT=17H		;File date
+	F2_TM=19H		;File time
+	F2_DTR=1BH		;Device attribute
+	F2_CLU=1CH		;Starting cluster (disk file)
+	F2_LCL=20H		;Last cluster accessed (12-bit) & directory
+				;(12-bit), packed into 24 bits (see
+				;Microsoft's published MSDOS 2 sources)
+	F2SIZ=28H		;End of SFT entry
+
+; Offsets into MSDOS 3+ System File Table entry
+;
+	FX_NFH=00H		;Number of file handles
+	FX_MOD=02H		;File open mode
+	FX_FTR=04H		;File attribute
+	FX_DIW=05H		;Device information word
+		DIW_RM=8000H	;Bit 15: remote file
+		DIW_DV=0080H	;Bit 7: device special
+	FX_DPB=07H		;DOS drive parameter block
+	FX_CLU=0BH		;Starting cluster (disk file)
+	FX_TM=0DH		;File time
+	FX_DT=0FH		;File date
+	FX_FSZ=11H		;File size
+	F3_DIR=1DH		;16-bit number of sector containing directory
+				;entry (DOS 3.x)
+	F3_DEN=1FH		;Offset/index of directory entry within sector
+				;(DOS 3.x)
+	FX_DIR=1BH		;32-bit number of sector containing directory
+				;entry (DOS 4+)
+	F30_FN=21H		;File name in FCB format (DOS 3.0)
+	FX_FN=20H		;File name in FCB format (DOS 3.1+)
+	F30SIZ=38H		;End of SFT entry (DOS 3.0)
+	F3XSIZ=35H		;End of SFT entry (DOS 3.1--3.3x)
+	FXSIZ=3BH		;End of SFT entry (DOS 4+)
+
+; Offsets into MSDOS 2+ character device driver header
+;
+	CDV_NX=00H		;Pointer to next driver
+	CDV_AT=04H		;Device attributes
+	CDV_ES=06H		;Device strategy entry point
+	CDV_EI=08H		;Device interrupt entry point
+	CDV_DN=0AH		;Device name
+	CDVSIZ=12H		;End of device header
+
+        PAGE

@@ -18,7 +18,7 @@ from pathlib import Path
 import pyte
 
 ROOT = Path(__file__).resolve().parents[2]
-VC = ROOT / "build" / "vc"
+VC = Path(os.environ.get("VC_TEST_BINARY", str(ROOT / "build" / "vc")))
 
 KEYS = {
     "enter": b"\r", "esc": b"\x1b", "tab": b"\t", "bs": b"\x7f",

@@ -13,6 +13,11 @@ unsigned bios_rows(void);
 int bios_key_push(uint16_t key);
 int bios_blink_enabled(void);
 
+/* Ctrl-Break is an interrupt, not Ctrl-C text. The terminal latches it;
+ * rt_run consumes the request at a dispatch boundary when IF is set. */
+void bios_request_break(void);
+int bios_take_break(void);
+
 /* Terminal coordinates are zero-based character cells; buttons use the
  * INT 33h left/right/middle bitmask. Returns whether the mouse is shown. */
 void bios_mouse_event(unsigned column, unsigned row, unsigned buttons);

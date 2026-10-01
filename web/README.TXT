@@ -7,6 +7,7 @@ It is not an emulator.
 H: is your playground. These files live only in memory.
 Reload the page to undo every change and start again.
 There is no shell or external editor. The cd command works.
+Type GWBASIC to start BASIC. Try PRINT 2+2, then SYSTEM to return.
 The Linux version manages real files: github.com/evoleinik/vc-linux
 
 Keys to try:
@@ -27,4 +28,9 @@ Keys to try:
   F10         Quit.
 
 HISTORY.TXT tells VC's story. SRC holds its assembly sources.
-GAMES might disappoint you.
+GAMES holds twelve of David Ahl's public-domain BASIC Computer Games.
+Open GAMES, select a .BAS file and press Enter to play.
+Use UPPER CASE for answers such as YES and NO.
+Ctrl+Pause or Ctrl+Shift+B stops a game; SYSTEM returns to VC.
+BEEP, SOUND and PLAY use a square-wave PC speaker after a key press.
+GWBASIC.TXT is GW-BASIC's MIT licence. GAMES has its own licence.

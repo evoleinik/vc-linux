@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 typedef struct Image {
-    const char *name;       /* DOS file name the image loads under: "VC.COM", "VC.OVL" */
+    const char *name;       /* canonical embedded name; only VC.COM/VC.OVL are name-selected */
     int is_exe;             /* 1 = MZ executable, 0 = .COM */
     const uint8_t *bytes;   /* load module exactly as in the file (MZ: after the header), unrelocated */
     uint32_t size;
@@ -24,9 +24,15 @@ typedef struct Image {
      * Returns -1 with no side effects if `off` is not the start of a
      * translated instruction. */
     int (*run)(uint32_t off, uint16_t loadseg);
+    /* Sorted load-module offsets of operand bytes deliberately written by
+     * the program. Only these bytes may differ when matching copied code;
+     * their translations read the live operands. Omitted for immutable VC. */
+    const uint32_t *mutable_offsets;
+    uint32_t nmutable;
 } Image;
 
 extern const Image image_vc_com;
 extern const Image image_vc_ovl;
+extern const Image image_gwbasic;
 
 #endif

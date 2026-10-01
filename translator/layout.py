@@ -36,6 +36,9 @@ class Instruction:
     insn: object
     line: ListingLine
     chunk: Chunk | None = None
+    return_skip: int = 0
+    linked: bool = False
+    mutable_offsets: tuple[int, ...] = ()
 
 
 @dataclass
@@ -47,6 +50,8 @@ class Layout:
     segment_bases: dict[str, int]
     labels: dict[str, int]
     procedures: dict[str, int]
+    linked: bool = False
+    mutable_offsets: tuple[int, ...] = ()
 
 
 _JCC = {
@@ -331,7 +336,7 @@ def _static_successors(record: Instruction, relocations: set[int], frame: int):
     mnemonic = insn.mnemonic.split()[-1]
     if mnemonic not in ("jmp", "ljmp", "ret", "retf", "iret", "iretd"):
         # CALL/INT can return, including INT 20h if its vector was hooked.
-        yield frame + ((record.off + insn.size - frame) & 0xffff)
+        yield frame + ((record.off + insn.size + getattr(record, "return_skip", 0) - frame) & 0xffff)
     if not (insn.group(CS_GRP_JUMP) or insn.group(CS_GRP_CALL) or
             mnemonic in ("loop", "loope", "loopne")):
         return
@@ -353,7 +358,9 @@ def _static_successors(record: Instruction, relocations: set[int], frame: int):
 
 
 def _decode_static_successors(image: LoadedImage, listing: Listing, bases: dict[str, int],
-                              decoder, instructions: list[Instruction]) -> None:
+                              decoder, instructions: list[Instruction], *,
+                              allow_data_overlaps: bool = False,
+                              return_skips: dict[int, int] | None = None) -> None:
     """Close listed code over static successors and the program entry point.
 
     DB bytes may be executable: VC.COM's RESIDENT banner runs at entry, and
@@ -390,21 +397,33 @@ def _decode_static_successors(image: LoadedImage, listing: Listing, bases: dict[
         if off in starts or not 0 <= off < len(image.data):
             continue
         insn = next(decoder.disasm(image.data[off:off + 15], off, count=1), None)
+        row = source_rows[off]
         overlap = owners[off]
         if overlap is None and insn is not None:
             overlap = next((owner for owner in owners[off:off + insn.size]
                             if owner is not None), None)
-        if overlap is not None:
+        # 8080-derived GW-BASIC deliberately executes DB B0..BF/3D as a
+        # MOV/CMP that consumes the following instruction as its immediate,
+        # and emits standalone segment prefixes as DB. Both entry paths
+        # remain ahead-of-time translations with independently tested bytes.
+        data_overlay = (allow_data_overlaps and row is not None and not row.is_instruction
+                        and bases[row.segment] + row.offset == off and insn is not None
+                        and (0xb0 <= image.data[off] <= 0xbf or image.data[off] == 0x3d
+                             or ("SKIP" in row.source.upper() and image.data[off] in (0x04, 0x05, 0x0c, 0x0d, 0x14, 0x15, 0x1c, 0x1d, 0x24, 0x25, 0x2c, 0x2d, 0x34, 0x35, 0x3c))
+                             or image.data[off] in (0x26, 0x2e, 0x36, 0x3e)))
+        if overlap is not None and not data_overlay:
             kind = "listed" if overlap.line.is_instruction else "decoded"
             raise LayoutError(f"{listing.path}: static successor at image 0x{off:x} overlaps a "
                               f"{kind} instruction at image 0x{overlap.off:x}")
         if insn is None:
             raise LayoutError(f"{listing.path}: undecodable reachable bytes at image 0x{off:x}")
-        row = source_rows[off]
         if row is None:
             raise LayoutError(f"{listing.path}: reachable image offset 0x{off:x} is outside every "
                               "listing row; missing source/generated listing row")
         record = Instruction(off, insn, row)
+        if return_skips and insn.mnemonic == "call" and insn.operands[0].type == X86_OP_IMM:
+            frame = frames[row.segment]
+            record.return_skip = return_skips.get(frame + ((insn.operands[0].imm - frame) & 0xffff), 0)
         _verify_relocations(image, record)
         instructions.append(record)
         starts.add(off)

@@ -1,5 +1,6 @@
 import { Terminal } from "./vendor/xterm.mjs";
 import createVC from "./vc.mjs";
+import { createSpeaker } from "./speaker.js";
 
 const container = document.getElementById("terminal");
 const layout = document.querySelector("main");
@@ -13,6 +14,7 @@ let inputOffset = 0;
 let inputBytes = 0;
 let exited = false;
 let terminal;
+const speaker = createSpeaker();
 
 function enqueue(data) {
   if (exited || !data) return;
@@ -72,6 +74,13 @@ function handleKey(event) {
   // The ordinary terminal bytes confuse these Ctrl keys with Esc, Tab,
   // Enter and Backspace. Kitty reports preserve their actual scan codes.
   if (event.type === "keydown" && event.ctrlKey && !event.altKey && !event.metaKey) {
+    if (event.code === "Pause" || (event.shiftKey && event.code === "KeyB")) {
+      // Kitty's Pause key (57362), with Ctrl, reaches BIOS INT 1Bh. Using
+      // the same report for both shortcuts keeps it distinct from Ctrl+B.
+      enqueue("\x1b[57362;5u");
+      event.preventDefault();
+      return false;
+    }
     const code = controlCodes[event.key.toLowerCase()];
     if (code !== undefined) {
       enqueue(`\x1b[${code};${modifiers(event)}u`);
@@ -129,6 +138,7 @@ function fit() {
 }
 
 function onExit() {
+  speaker.silence();
   exited = true;
   input.length = 0;
   inputBytes = inputOffset = inputHead = 0;
@@ -141,6 +151,7 @@ function onExit() {
 }
 
 window.addEventListener("keydown", (event) => {
+  if (!exited) speaker.unlock();
   if (!exited) return;
   event.preventDefault();
   event.stopImmediatePropagation();
@@ -202,6 +213,7 @@ async function start() {
     vcOutput: (bytes) => terminal.write(bytes),
     vcReadInput: readInput,
     vcExit: onExit,
+    vcSpeaker: (frequency) => speaker.setFrequency(frequency),
   });
 }
 

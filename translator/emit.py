@@ -272,6 +272,9 @@ class _InstructionEmitter:
         if op.type == X86_OP_REG:
             return self.reg(op.reg)
         if op.type == X86_OP_IMM:
+            if self.insn.imm_offset in getattr(self.record, "mutable_offsets", ()):
+                read = "rd8" if self.insn.imm_size == 1 else "tr_rd16"
+                return f"{read}(cpu.cs, {_ip(self.off + self.insn.imm_offset)})"
             value = op.imm & (0xff if op.size == 1 else 0xffff)
             if self.insn.imm_offset in self.relocations:
                 return f"(uint16_t)(0x{value:04x} + loadseg)"
@@ -549,7 +552,12 @@ class _InstructionEmitter:
                 segment = int.from_bytes(self.raw[-2:], "little")
                 offset = int.from_bytes(self.raw[-4:-2], "little")
                 seg_expr = f"(uint16_t)(0x{segment:04x} + loadseg)" if len(self.raw) - 2 in self.relocations else f"0x{segment:04x}u"
-                code = [f"uint16_t target_cs = {seg_expr}, target_ip = 0x{offset:04x}u;"]
+                off_expr = f"0x{offset:04x}u"
+                if len(self.raw) - 2 in getattr(self.record, "mutable_offsets", ()):
+                    seg_expr = f"tr_rd16(cpu.cs, {_ip(self.off + len(self.raw) - 2)})"
+                if len(self.raw) - 4 in getattr(self.record, "mutable_offsets", ()):
+                    off_expr = f"tr_rd16(cpu.cs, {_ip(self.off + len(self.raw) - 4)})"
+                code = [f"uint16_t target_cs = {seg_expr}, target_ip = {off_expr};"]
             else:
                 seg, ea = self.address(0)
                 code = [f"uint32_t pointer = tr_far({seg}, {ea});",
@@ -616,6 +624,8 @@ class _InstructionEmitter:
         if op in ("nop", "wait", "fwait", "pause", "lock"):
             return [], False
         if op == "hlt":
+            if getattr(self.record, "linked", False):
+                return [f"cpu.ip = {_ip(self.off + len(self.raw))};", "rt_halted = 1;", "return 0;"], True
             return self.fault("HLT"), True
         raise UnsupportedInstruction(f"unsupported instruction {self.insn.mnemonic} {self.insn.op_str}")
 
@@ -656,7 +666,11 @@ def emit_image(layout, name: str, symbol: str) -> str:
         for record in chunk.instructions:
             asm = f"{record.insn.mnemonic} {record.insn.op_str}" if record.insn is not None else "invalid"
             output.append(f"L_{record.off:x}: {{ /* {asm.replace('*/', '* /')} */")
-            output.extend("    " + line for line in _InstructionEmitter(record, relocations, targets).emit())
+            body = _InstructionEmitter(record, relocations, targets).emit()
+            if getattr(layout, "linked", False):
+                output.append(f"    if (--rt_budget < 0) {{ cpu.ip = {_ip(record.off)}; return 0; }}")
+                body = [line for line in body if "RT_TICK();" not in line]
+            output.extend("    " + line for line in body)
             output.append("}")
         output.append("}\n")
     output.append("static const struct { uint32_t off; int (*fn)(uint32_t, uint16_t); } starts[] = {")
@@ -684,6 +698,10 @@ def emit_image(layout, name: str, symbol: str) -> str:
     if not relocations:
         output.append("    0,")
     output.append("};")
+    if getattr(layout, "linked", False):
+        output.append("static const uint32_t mutable_offsets[] = {")
+        output.append("    " + (", ".join(f"0x{off:x}u" for off in layout.mutable_offsets) or "0u") + ",")
+        output.append("};")
     output.append(f"const Image {symbol} = {{")
     output.extend((f"    .name = {json.dumps(name)}, .is_exe = {int(image.is_exe)},",
                    f"    .bytes = image_bytes, .size = {len(image.data)}u,",
@@ -691,5 +709,8 @@ def emit_image(layout, name: str, symbol: str) -> str:
                    f"    .hdr_cs = {image.hdr_cs}, .hdr_ip = {image.hdr_ip},",
                    f"    .hdr_ss = {image.hdr_ss}, .hdr_sp = {image.hdr_sp},",
                    f"    .min_alloc = {image.min_alloc}, .max_alloc = {image.max_alloc},",
-                   "    .run = run,", "};\n"))
+                   "    .run = run,"))
+    if getattr(layout, "linked", False):
+        output.append(f"    .mutable_offsets = mutable_offsets, .nmutable = {len(layout.mutable_offsets)}u,")
+    output.append("};\n")
     return "\n".join(output)

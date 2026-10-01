@@ -80,6 +80,10 @@ extern int32_t rt_budget;
 void rt_yield(void);
 #define RT_TICK() do { if (--rt_budget < 0) rt_yield(); } while (0)
 
+/* HLT returns to rt_run with IP at its successor. Only the dispatcher may
+ * wait for a hardware event; translated code must never suspend Asyncify. */
+extern int rt_halted;
+
 /* Bytes a running copy of translated code sits away from where it was
  * loaded. The dispatcher sets it while it runs code the program copied to a
  * new address, so every IP the code computes points into the copy. Otherwise

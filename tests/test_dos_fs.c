@@ -1838,6 +1838,138 @@ static void test_calendar(void)
     CHECK(after >= before && after - before < 10, "DOS date/time setters do not change host system clock");
 }
 
+static void fcb_name(uint16_t off, const char *name, uint8_t options, uint8_t status)
+{
+    path_begin((uint16_t)(0x2900 | options), name);
+    cpu.es = DS;
+    cpu.di = off;
+    int handled = invoke();
+    CHECK(handled && cpu.a.h == 0x29 && cpu.a.l == status && !cpu.cf,
+          "FCB parse %s returns AL=%02x without losing AH", name, status);
+}
+
+static void fcb_op(uint8_t function, uint16_t off, uint16_t count, uint8_t status)
+{
+    begin((uint16_t)(function << 8));
+    cpu.d.x = off;
+    cpu.c.x = count;
+    cpu.si = 0x1357;
+    cpu.di = 0x2468;
+    int handled = invoke();
+    CHECK(handled && cpu.a.h == function && cpu.a.l == status && !cpu.cf,
+          "FCB %02x returns AL=%02x, got AX=%04x CF=%u", function, status, cpu.a.x, cpu.cf);
+    CHECK(cpu.si == 0x1357 && cpu.di == 0x2468, "FCB %02x preserves SI and DI", function);
+    if (function != 0x27 && function != 0x28)
+        CHECK(cpu.c.x == count, "FCB %02x preserves CX", function);
+}
+
+static void fcb_random(uint16_t off, uint32_t record)
+{
+    for (unsigned i = 0; i < 4; i++) wr8(DS, (uint16_t)(off + 33 + i), (uint8_t)(record >> (i * 8)));
+}
+
+static void test_fcb_io(void)
+{
+    enum { FCB = 0x4000, COPY = 0x4100 };
+    char payload[301];
+    for (unsigned i = 0; i < 300; i++) payload[i] = (char)('A' + i % 26);
+    payload[300] = 0;
+    host_file("FCBTEST.BAS", payload, 0644);
+    fcb_name(FCB, "fcbtest.bas rest", 0, 0);
+    CHECK(cpu.si == ARG + 11, "FCB parse stops before the command separator");
+    CHECK(rd8(DS, FCB) == 0 && !memcmp(mem + lin(DS, FCB + 1), "FCBTEST BAS", 11),
+          "FCB parse emits padded uppercase 8.3 name and default drive");
+    fcb_op(0x0f, FCB, 0x4321, 0);
+    CHECK(rd8(DS, FCB) == 3 && rd16(DS, FCB + 14) == 128 && get32(DS, FCB + 16) == 300,
+          "FCB open records physical drive, 128-byte records and true file size");
+    set_dta(DATA);
+    fcb_random(FCB, 0);
+    fcb_op(0x21, FCB, 0, 0);
+    CHECK(!memcmp(mem + lin(DS, DATA), payload, 128), "FCB random read starts at its selected record");
+    CHECK(get32(DS, FCB + 33) == 0, "FCB single random read does not advance GW-BASIC's record counter");
+    fcb_random(FCB, 2);
+    memset(mem + lin(DS, DATA), 0xa5, 128);
+    fcb_op(0x21, FCB, 0, 3);
+    CHECK(!memcmp(mem + lin(DS, DATA), payload + 256, 44), "FCB partial read keeps the final 44 bytes");
+    for (unsigned i = 44; i < 128; i++) CHECK(rd8(DS, DATA + i) == 0, "FCB partial read pads byte %u", i);
+    fcb_random(FCB, 3);
+    memset(mem + lin(DS, DATA), 0xa5, 128);
+    fcb_op(0x21, FCB, 0, 1);
+    CHECK(rd8(DS, DATA) == 0xa5, "FCB EOF does not overwrite the DTA");
+    set_dta(0xfff0);
+    fcb_random(FCB, 0);
+    fcb_op(0x21, FCB, 0, 2);
+    CHECK(get32(DS, FCB + 33) == 0, "FCB segment-wrap refusal does not advance record");
+    set_dta(DATA);
+    fcb_op(0x27, FCB, 3, 3);
+    CHECK(cpu.c.x == 3 && get32(DS, FCB + 33) == 3, "FCB random block read advances by actual records, partial included");
+    CHECK(!memcmp(mem + lin(DS, DATA), payload, 300), "FCB random block read returns the complete file");
+    fcb_op(0x27, FCB, 2, 1);
+    CHECK(cpu.c.x == 0, "FCB random block EOF reports zero records");
+    wr16(DS, FCB + 12, 0);
+    wr8(DS, FCB + 32, 0);
+    fcb_op(0x14, FCB, 0, 0);
+    CHECK(rd8(DS, FCB + 32) == 1, "FCB sequential read advances its current record");
+    wr16(DS, FCB + 12, 2);
+    wr8(DS, FCB + 32, 3);
+    fcb_op(0x24, FCB, 0, 0);
+    CHECK(get32(DS, FCB + 33) == 259, "FCB set-random converts 128-record blocks");
+    fcb_op(0x23, FCB, 0, 0);
+    CHECK(get32(DS, FCB + 33) == 3, "FCB size rounds up to logical records");
+    memcpy(mem + lin(DS, COPY), mem + lin(DS, FCB), 37);
+    fcb_op(0x10, COPY, 0, 0);
+    fcb_op(0x10, FCB, 0, 0xff);
+
+    memset(mem + lin(DS, FCB), 0, 44);
+    wr8(DS, FCB, 0xff);
+    fcb_name(FCB + 7, "FCBTEST.BAS", 0, 0);
+    fcb_op(0x0f, FCB, 0, 0);
+    fcb_op(0x10, FCB, 0, 0);
+    fcb_name(FCB, "readonly.bin", 0, 0);
+    fcb_op(0x0f, FCB, 0, 0);
+    fcb_random(FCB, 0);
+    fcb_op(0x21, FCB, 0, 3);
+    fcb_op(0x22, FCB, 0, 1);
+    fcb_op(0x10, FCB, 0, 0);
+
+    fcb_name(FCB, "FCBNEW.DAT", 0, 0);
+    fcb_op(0x16, FCB, 0, 0);
+    wr16(DS, FCB + 14, 8);
+    memcpy(mem + lin(DS, DATA), "abcdefghijklmnop", 16);
+    fcb_op(0x15, FCB, 0, 0);
+    CHECK(get32(DS, FCB + 16) == 8 && rd8(DS, FCB + 32) == 1, "FCB sequential write updates size and record");
+    fcb_random(FCB, 2);
+    fcb_op(0x22, FCB, 0, 0);
+    CHECK(get32(DS, FCB + 16) == 24 && get32(DS, FCB + 33) == 2, "FCB random write extends without advancing random record");
+    fcb_random(FCB, 1);
+    fcb_op(0x28, FCB, 0, 0);
+    CHECK(cpu.c.x == 0 && get32(DS, FCB + 16) == 8, "zero-record FCB block write truncates at random record");
+    fcb_op(0x28, FCB, 2, 0);
+    CHECK(cpu.c.x == 2 && get32(DS, FCB + 33) == 3 && get32(DS, FCB + 16) == 24,
+          "FCB block write transfers and advances two records");
+    fcb_op(0x10, FCB, 0, 0);
+    fcb_op(0x13, FCB, 0, 0);
+    struct stat st;
+    CHECK(host_stat("FCBNEW.DAT", &st) < 0 && errno == ENOENT, "FCB delete removes its literal 8.3 file");
+    fcb_op(0x0f, FCB, 0, 0xff);
+
+    fcb_name(FCB, "H:ab*.b?", 0, 1);
+    CHECK(rd8(DS, FCB) == 8 && !memcmp(mem + lin(DS, FCB + 1), "AB??????B? ", 11),
+          "FCB parser handles drive letters and wildcard filling");
+    fcb_name(FCB, "Z:ABSENT.BAS", 0, 0xff);
+    fcb_name(FCB, "H:KEPT.OLD", 0, 0);
+    fcb_name(FCB, "", 0x0e, 0);
+    CHECK(rd8(DS, FCB) == 8 && !memcmp(mem + lin(DS, FCB + 1), "KEPT    OLD", 11),
+          "FCB parse preservation flags retain absent drive/name/extension fields");
+    fcb_name(FCB, "  ,;fcbtest.bas", 1, 0);
+    CHECK(!memcmp(mem + lin(DS, FCB + 1), "FCBTEST BAS", 11), "FCB parse option skips separators");
+    fcb_name(FCB, "FCBTEST.BAS", 0, 0);
+    fcb_op(0x11, FCB, 0, 0xff);
+    fcb_op(0x12, FCB, 0, 0xff);
+    fcb_op(0x17, FCB, 0, 0xff);
+    begin(0x0d00); ok("DOS reset flushes files");
+}
+
 static void test_errors_bounds_and_dispatch(void)
 {
     path_begin(0x3d00, "missing.txt"); error(2, "record extended last error");
@@ -1902,6 +2034,8 @@ static void test_errors_bounds_and_dispatch(void)
 static void test_function_coverage(void)
 {
     const uint16_t required[] = {
+        0x0d00,0x0f00,0x1000,0x1100,0x1200,0x1300,0x1400,0x1500,0x1600,0x1700,
+        0x2100,0x2200,0x2300,0x2400,0x2700,0x2800,0x2900,
         0x0e00,0x1900,0x1a00,0x2f00,0x2a00,0x2b00,0x2c00,0x2d00,
         0x3600,0x3800,0x3900,0x3a00,0x3b00,0x3c00,0x3d00,0x3e00,
         0x3f00,0x4000,0x4100,0x4200,0x4300,0x4301,
@@ -2473,6 +2607,7 @@ int main(void)
     test_truename_and_shortname();
     test_free_space_and_country();
     test_calendar();
+    test_fcb_io();
     test_errors_bounds_and_dispatch();
     test_empty_file_specs();
     test_reinitialization();

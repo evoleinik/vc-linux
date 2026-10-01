@@ -64,6 +64,8 @@ class InstructionCase:
 @lru_cache(maxsize=1)
 def load_cases() -> tuple[InstructionCase, ...]:
     from translator.layout import build_layout
+    from translator.linked import build_linked_layout
+    from tools.build_gwbasic import modules
 
     # Stock listings omit assembler-generated prologue/epilogue boundaries.
     # Always ask make to check dependencies so direct pytest runs cannot test
@@ -73,16 +75,22 @@ def load_cases() -> tuple[InstructionCase, ...]:
     assert generated.returncode == 0, generated.stdout
     result = []
     seen = set()
-    for name in ("VC.COM", "VC.OVL"):
-        loaded = load_image(ROOT / "build" / name)
-        layout = build_layout(loaded, parse_listing(ROOT / "build" / "gen" / f"{name}.lst"))
+    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE"):
+        if name == "GWBASIC.EXE":
+            directory = ROOT / "build" / "gwbasic"
+            loaded = load_image(directory / name)
+            layout = build_linked_layout(loaded, [directory / (module + ".lst") for module in modules()],
+                                         directory / "GWBASIC.MAP")
+        else:
+            loaded = load_image(ROOT / "build" / name)
+            layout = build_layout(loaded, parse_listing(ROOT / "build" / "gen" / f"{name}.lst"))
         relocations = tuple(loaded.relocations)
         for record in layout.instructions:
             raw = bytes(record.insn.bytes)
             local_relocations = tuple(at - record.off for at in relocations
                                       if record.off <= at < record.off + len(raw))
             # Preserve distinct relocation meanings even if bytes/offset match.
-            key = (raw, record.off, local_relocations)
+            key = (raw, record.off, local_relocations, getattr(record, "mutable_offsets", ()))
             if key in seen:
                 continue
             seen.add(key)
@@ -172,11 +180,13 @@ def _metadata(case: InstructionCase) -> str:
                 divisor_register = REGISTERS[register]
     local_relocations = [at - case.record.off for at in case.relocations
                          if case.record.off <= at < case.record.off + len(raw)]
+    mutable = getattr(case.record, "mutable_offsets", ())
     assert len(raw) <= 16 and len(local_relocations) <= 8
     description = f"{case.image_name}:0x{case.record.off:05x} {insn.mnemonic} {insn.op_str}".strip()
     return (
         "{.run=%s, .description=%s, .offset=%d, .bytes={%s}, .length=%d,\n"
         " .relocation_count=%d, .relocations={%s}, .undefined_flags=0x%04x,\n"
+        " .mutable_count=%d, .mutable_offsets={%s},\n"
         " .flags_kind=%s, .width=%d, .count_from_cl=%d, .immediate_count=%d,\n"
         " .special=%s, .vector=%d, .memory_count=%d, .stack_write_words=%d, .operands={%s},\n"
         " .divisor_register=%d, .divisor_part=%d, .divisor_memory=%d}"
@@ -184,7 +194,8 @@ def _metadata(case: InstructionCase) -> str:
         case.symbol, json.dumps(description), case.record.off,
         ",".join(f"0x{byte:02x}" for byte in raw), len(raw),
         len(local_relocations), ",".join(map(str, local_relocations)) or "0",
-        _undefined_flags(insn), flag_kind, width, count_from_cl, immediate_count,
+        _undefined_flags(insn), len(mutable), ",".join(map(str, mutable)) or "0",
+        flag_kind, width, count_from_cl, immediate_count,
         " | ".join(special) or "0", vector, len(memories), stack_write_words, ",".join(memories) or "{0}",
         divisor_register, divisor_part, divisor_memory,
     )

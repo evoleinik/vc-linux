@@ -1,6 +1,7 @@
 /* vc: Volkov Commander, translated. Sets up the machine, the config directory
  * and the terminal, starts VC.COM as the first DOS process and runs it. */
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,7 @@ static const struct { const char *name, *text; } retired[] = {
     {"VCEDIT.EXT", "*: ${EDITOR:-vi} \"!.!\"\r\n"},
     {"VC.EXT", "zip:\tpkunzip -d !.!\r\narj:\tarj x -v -y !.!\r\nlzh:\tlha x !.!\r\n"
                "asm:\ttasm /w0/m9 !;\r\n\ttlink /t !;\r\n"},
+    {"VC.EXT", ""},
 };
 
 static int holds_retired_default(const char *path, const char *name) {
@@ -60,21 +62,95 @@ static int holds_retired_default(const char *path, const char *name) {
     return 0;
 }
 
-/* Setup files are written once and then belong to the user. The program
- * images are rewritten every run, since they are this binary. */
+static int file_matches(const char *path, const EmbeddedFile *file) {
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size != file->size) {
+        close(fd);
+        return 0;
+    }
+    FILE *in = fdopen(fd, "rb");
+    if (!in) { close(fd); return 0; }
+    uint8_t buf[4096];
+    int matches = 1;
+    for (size_t at = 0; at < file->size;) {
+        size_t n = file->size - at;
+        if (n > sizeof buf) n = sizeof buf;
+        if (fread(buf, 1, n, in) != n || memcmp(buf, file->data + at, n)) {
+            matches = 0;
+            break;
+        }
+        at += n;
+    }
+    if (matches && (fgetc(in) != EOF || ferror(in))) matches = 0;
+    if (fclose(in)) matches = 0;
+    return matches;
+}
+
+/* A concurrent vc, or one whose write fails, must never expose a truncated
+ * installed image. Publish a fully closed temporary from the same directory. */
+static int install_file(const char *path, const EmbeddedFile *file) {
+    struct stat prior;
+    mode_t mode;
+    if (!stat(path, &prior)) mode = prior.st_mode & 0777;
+    else {
+        /* Startup is single-threaded; mirror fopen's new-file permissions. */
+        mode_t mask = umask(0);
+        umask(mask);
+        mode = 0666 & ~mask;
+    }
+    char temporary[4096 + 16];
+    int length = snprintf(temporary, sizeof temporary, "%s.tmp.XXXXXX", path);
+    if (length < 0 || (size_t)length >= sizeof temporary) { errno = ENAMETOOLONG; return -1; }
+    int fd = mkstemp(temporary);
+    if (fd < 0) return -1;
+    int err = 0;
+    FILE *out = fdopen(fd, "wb");
+    if (!out) {
+        err = errno;
+        close(fd);
+    } else {
+        errno = 0;
+        if (fchmod(fd, mode)) err = errno;
+        if (!err && fwrite(file->data, 1, file->size, out) != file->size) err = errno ? errno : EIO;
+        if (fclose(out) && !err) err = errno ? errno : EIO;
+    }
+    if (!err && rename(temporary, path)) err = errno;
+    if (err) {
+        unlink(temporary);
+        errno = err;
+        return -1;
+    }
+    return 0;
+}
+
+/* Setup files are written once and then belong to the user. Program images
+ * are updated to this binary's bytes, leaving matching installations alone. */
 static void install_files(const char *dir) {
     for (int i = 0; i < embedded_file_count; i++) {
         const EmbeddedFile *f = &embedded_files[i];
         char path[4096];
-        snprintf(path, sizeof path, "%s/%s", dir, f->name);
-        int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL");
+#ifdef __EMSCRIPTEN__
+        /* H: is the program drive in the browser. Configuration remains out
+         * of sight under /var/vc/config, as before. */
+        const char *target = !strcmp(f->name, "GWBASIC.EXE") ? "/home/vc" : dir;
+#else
+        const char *target = dir;
+#endif
+        int length = snprintf(path, sizeof path, "%s/%s", target, f->name);
+        if (length < 0 || (size_t)length >= sizeof path) {
+            fputs("vc: configuration file path is too long\n", stderr);
+            exit(1);
+        }
+        int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL") ||
+                      !strcmp(f->name, "GWBASIC.EXE");
         if (!program && access(path, F_OK) == 0 && !holds_retired_default(path, f->name)) continue;
-        FILE *out = fopen(path, "wb");
-        if (!out || fwrite(f->data, 1, f->size, out) != f->size) {
+        if (file_matches(path, f)) continue;
+        if (install_file(path, f)) {
             fprintf(stderr, "vc: cannot write %s: %s\n", path, strerror(errno));
             exit(1);
         }
-        fclose(out);
     }
 }
 

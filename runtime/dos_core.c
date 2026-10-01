@@ -6,10 +6,12 @@
  * List of Lists. VC edits MCB headers directly and walks the chain itself,
  * so this code reads the chain back from memory every time. */
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,6 +35,8 @@ static uint8_t break_flag;
 
 typedef struct {
     uint16_t child;    /* PSP of the running child */
+    const Image *image;
+    RtProcessState *machine;
     Cpu parent;        /* parent registers at its EXEC call */
     uint16_t dta_seg, dta_off;
 } Proc;
@@ -314,6 +318,7 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
     rt_register_image(img, loadseg);
 
     cur_psp = psp;
+    dos_fs_set_process(cur_psp);
     fs_call(0x1A, psp, 0x80);
     memset(&cpu.a, 0, sizeof cpu.a);
     cpu.b.x = cpu.c.x = cpu.d.x = cpu.si = cpu.di = cpu.bp = 0;
@@ -334,14 +339,64 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
     return 0;
 }
 
-static const Image *known_image(const char *dos_path) {
-    const char *b = dos_path;
-    for (const char *p = dos_path; *p; p++)
-        if (*p == '\\' || *p == '/' || *p == ':') b = p + 1;
-    if (!strcasecmp(b, "VC.OVL")) return &image_vc_ovl;
-    if (!strcasecmp(b, "VC.COM")) return &image_vc_com;
+/* Non-built-in EXECs select a translation by the complete original file,
+ * including its MZ header and relocation table: comparing only the load module
+ * would accept a damaged header. VC.COM and VC.OVL bypass this disk check. */
+static const Image *const images[] = {&image_vc_com, &image_vc_ovl, &image_gwbasic};
+
+static const EmbeddedFile *image_file(const Image *img) {
+    for (int i = 0; i < embedded_file_count; i++)
+        if (!strcmp(embedded_files[i].name, img->name)) return &embedded_files[i];
     return NULL;
 }
+
+static int file_error(void) {
+    return errno == ENOENT ? 2 : errno == ENOTDIR || errno == ENAMETOOLONG ? 3 :
+           errno == ENOMEM ? 8 : 5;
+}
+
+static int known_image(const char *host, const Image **out) {
+    *out = NULL;
+    /* An executable must be an ordinary file. Open nonblocking before the
+     * type check so EXEC of a FIFO cannot hang while waiting for a writer. */
+    int fd = open(host, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return file_error();
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); return 5; }
+    FILE *file = fdopen(fd, "rb");
+    if (!file) { int err = file_error(); close(fd); return err; }
+    int possible = 0;
+    for (size_t i = 0; i < sizeof images / sizeof images[0]; i++) {
+        const EmbeddedFile *f = image_file(images[i]);
+        if (f && st.st_size == f->size) possible = 1;
+    }
+    if (!possible) {
+        rt_log("unsupported executable %s: no matching translation", host);
+        fclose(file);
+        return 11;
+    }
+    size_t size = (size_t)st.st_size;
+    uint8_t *bytes = malloc(size ? size : 1);
+    if (!bytes) { fclose(file); return 8; }
+    size_t got = fread(bytes, 1, size, file);
+    int extra = fgetc(file);
+    int err = ferror(file) ? 5 : 11;
+    if (!ferror(file) && got == size && extra == EOF)
+        for (size_t i = 0; i < sizeof images / sizeof images[0]; i++) {
+            const EmbeddedFile *f = image_file(images[i]);
+            if (f && size == f->size && !memcmp(bytes, f->data, size)) {
+                *out = images[i];
+                err = 0;
+                break;
+            }
+        }
+    free(bytes);
+    fclose(file);
+    if (err == 11) rt_log("unsupported executable %s: no matching translation", host);
+    return err;
+}
+
+static int start_child(const Image *img, const char *dos_prog, const uint8_t *tail, uint16_t envseg);
 
 /* ---- running host commands ------------------------------------------------ */
 
@@ -500,6 +555,180 @@ static int internal_cd(const char *cmd) {
     return failed;
 }
 
+/* Host resolution always goes through the DOS drive and alias rules. The
+ * kernel scratch area is only 256 bytes; never let a long PATH corrupt its
+ * neighbouring MCB. */
+static int dos_path_host(const char *path, char *host, size_t cap) {
+    size_t n = strlen(path);
+    if (n >= 256) { errno = ENAMETOOLONG; return -1; }
+    for (size_t i = 0; i <= n; i++) wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), (uint8_t)path[i]);
+    return dos_fs_to_host(DOS_SEG, SCRATCH_OFF, host, cap);
+}
+
+static void environment_value(const char *name, char *out, size_t cap) {
+    out[0] = 0;
+    uint16_t env = rd16(cur_psp, 0x2C);
+    uint32_t start = (uint32_t)env << 4;
+    size_t key = strlen(name);
+    if (!env || start + 32768 >= MEM_SIZE) return;
+    for (size_t at = 0; at < 32768 && mem[start + at];) {
+        const uint8_t *s = mem + start + at;
+        const uint8_t *end = memchr(s, 0, 32768 - at);
+        if (!end) return;
+        size_t n = (size_t)(end - s);
+        if (n > key && s[key] == '=' && !strncasecmp((const char *)s, name, key)) {
+            n -= key + 1;
+            if (n >= cap) n = cap - 1;
+            memcpy(out, s + key + 1, n);
+            out[n] = 0;
+            return;
+        }
+        at += n + 1;
+    }
+}
+
+/* Returns 1 for a regular DOS file, 0 when absent, or a negative DOS error.
+ * DOS programs do not need the host executable permission bit. */
+static int program_candidate(const char *path, char *host, size_t cap) {
+    const char *base = path;
+    for (const char *p = path; *p; p++)
+        if (*p == ':' || *p == '\\' || *p == '/') base = p + 1;
+    /* These names belong to the native VC itself, not command lookup.
+     * Its resident code still loads them through direct DOS EXEC. */
+    if (!strcasecmp(base, "VC.COM") || !strcasecmp(base, "VC.OVL")) return 0;
+    if (dos_path_host(path, host, cap)) {
+        int err = file_error();
+        return err == 2 || err == 3 ? 0 : -err;
+    }
+    struct stat st;
+    if (stat(host, &st)) {
+        int err = file_error();
+        return err == 2 || err == 3 ? 0 : -err;
+    }
+    return S_ISREG(st.st_mode) ? 1 : 0;
+}
+
+/* COMMAND.COM searches the current directory first, then each DOS PATH
+ * entry, choosing .COM before .EXE within each directory. An explicit path
+ * or drive never causes a search in an unrelated PATH directory. */
+static int find_program(const char *word, char *dos, size_t dcap, char *host, size_t hcap) {
+    const char *base = word;
+    int explicit_path = 0;
+    for (const char *p = word; *p; p++)
+        if (*p == ':' || *p == '\\' || *p == '/') { base = p + 1; explicit_path = 1; }
+    const char *dot = strrchr(base, '.');
+    if (dot && strcasecmp(dot, ".COM") && strcasecmp(dot, ".EXE")) return 0;
+    const char *suffix[] = {dot ? "" : ".COM", dot ? NULL : ".EXE", NULL};
+    char path[2048];
+    environment_value("PATH", path, sizeof path);
+    const char *entry = path;
+    size_t dlen = 0;
+    for (;;) {
+        for (int i = 0; suffix[i]; i++) {
+            int sep = dlen && entry[dlen - 1] != '\\' && entry[dlen - 1] != '/' && entry[dlen - 1] != ':';
+            int n = snprintf(dos, dcap, "%.*s%s%s%s", (int)dlen, entry, sep ? "\\" : "", word, suffix[i]);
+            if (n < 0 || (size_t)n >= dcap) continue;
+            int found = program_candidate(dos, host, hcap);
+            if (found) return found;
+        }
+        if (explicit_path || !*entry) return 0;
+        /* The initial iteration is the current directory; later iterations
+         * use a semicolon-delimited PATH component. Empty entries mean cwd. */
+        if (dlen) entry += dlen;
+        if (*entry == ';') entry++;
+        dlen = strcspn(entry, ";");
+        if (!dlen && !*entry) return 0;
+    }
+}
+
+/* Shipped associations of the form "ext: program !.!" are DOS-only. This
+ * is data-driven, not a special interpreter command: removing its EXE must
+ * never send a file name containing shell syntax to /bin/sh. Custom user
+ * association templates retain VC's existing command semantics. */
+static int dos_file_association(const char *word) {
+    size_t wlen = strlen(word);
+    for (int i = 0; i < embedded_file_count; i++) {
+        const EmbeddedFile *f = &embedded_files[i];
+        if (strcmp(f->name, "VC.EXT")) continue;
+        const uint8_t *p = f->data, *end = p + f->size;
+        while (p < end) {
+            const uint8_t *line = p;
+            while (p < end && *p != '\r' && *p != '\n') p++;
+            const uint8_t *eol = p;
+            while (p < end && (*p == '\r' || *p == '\n')) p++;
+            const uint8_t *colon = memchr(line, ':', (size_t)(eol - line));
+            if (!colon) continue;
+            const uint8_t *start = colon + 1;
+            while (start < eol && (*start == ' ' || *start == '\t')) start++;
+            const uint8_t *last = start;
+            while (last < eol && *last != ' ' && *last != '\t') last++;
+            if ((size_t)(last - start) != wlen || strncasecmp((const char *)start, word, wlen)) continue;
+            while (last < eol && (*last == ' ' || *last == '\t')) last++;
+            while (eol > last && (eol[-1] == ' ' || eol[-1] == '\t')) eol--;
+            if (eol - last == 3 && !memcmp(last, "!.!", 3)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int command_error(int err) {
+    rt_log("DOS command error %d", err);
+    const char *msg = err == 2 || err == 3 ? "Program not found\r\n" :
+                      err == 8 ? "Not enough memory\r\n" :
+                      err == 11 ? "Invalid program format\r\n" : "Access denied\r\n";
+    con_write((const uint8_t *)msg, strlen(msg));
+    return err;
+}
+
+static int dos_program_command(const uint8_t *cmd, size_t len) {
+    size_t pos = 0, begin = 0;
+    if (len && cmd[0] == '"') {
+        begin = ++pos;
+        while (pos < len && cmd[pos] != '"') pos++;
+        if (pos == len) return -1;
+    } else {
+        while (pos < len && cmd[pos] != ' ' && cmd[pos] != '\t') pos++;
+    }
+    size_t wlen = pos - begin;
+    if (!wlen || wlen >= 256) return -1;
+    char word[256];
+    memcpy(word, cmd + begin, wlen);
+    word[wlen] = 0;
+    if (begin) pos++;
+    if (pos < len && cmd[pos] != ' ' && cmd[pos] != '\t') return -1;
+    int association = dos_file_association(word);
+    char dos[256], host[4096];
+    int found = find_program(word, dos, sizeof dos, host, sizeof host);
+    /* Typed commands only belong to DOS after a complete byte match.
+     * Shipped association words remain DOS-only even when lookup fails:
+     * their tails can contain file names with shell metacharacters. */
+    if (found < 0) return association ? command_error(-found) : -1;
+    if (!found) return association ? command_error(2) : -1;
+    const Image *img;
+    int err = known_image(host, &img);
+    if (err) return association ? command_error(err) : -1;
+    if (association) {
+        /* A shipped association names its interpreter, not any translation.
+         * A renamed VC image would parse the file tail as commands itself. */
+        size_t stem = strcspn(img->name, ".");
+        if ((wlen != stem && wlen != strlen(img->name)) || strncasecmp(word, img->name, wlen)) {
+            rt_log("unsupported executable %s: wrong translation for %s", host, word);
+            return command_error(11);
+        }
+    }
+    uint8_t tail[128] = {0};
+    size_t n = len - pos;
+    if (n > 126) return command_error(11);
+    tail[0] = (uint8_t)n;
+    memcpy(tail + 1, cmd + pos, n);
+    tail[n + 1] = '\r';
+    /* Preserve DOS tail bytes exactly. Programs own their argument syntax;
+     * GW-BASIC itself inserts the quotes around its startup file name. No
+     * shell sees this tail, including when its association EXE is absent. */
+    err = start_child(img, dos, tail, 0);
+    return err ? command_error(err) : 0;
+}
+
 /* data/VCEDIT.EXT maps every file to `vc-edit !.!`. VC puts the file name in
  * place of !.!, and everything after the word is taken as that one name, so
  * no shell ever parses it: `$(id).txt` stays a file name. */
@@ -531,6 +760,8 @@ static int run_dos_command(const uint8_t *cmd, size_t len) {
         }
         return host_run("exec ${EDITOR:-vi} \"$1\"", "vc-edit", host);
     }
+    int program = dos_program_command(cmd, len);
+    if (program >= 0) return program;
     return host_run(utf8, NULL, NULL);
 }
 
@@ -565,6 +796,32 @@ static int exec_host(const char *host_prog, const uint8_t *tail) {
 
 /* ---- EXEC and terminate --------------------------------------------------- */
 
+static int start_child(const Image *img, const char *dos_prog, const uint8_t *tail, uint16_t envseg) {
+    if (nprocs == (int)(sizeof procs / sizeof procs[0])) return 8;
+    rt_log("load %s: translation %s", dos_prog, img->name);
+    Proc *p = &procs[nprocs];
+    p->machine = rt_save_process_state();
+    if (!p->machine) return 8;
+    p->image = img;
+    p->parent = cpu;
+    get_dta(&p->dta_seg, &p->dta_off);
+    uint16_t ret_ip = rd16(cpu.ss, cpu.sp), ret_cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
+    uint16_t parent_psp = cur_psp;
+    static char envbuf[32768];
+    size_t elen = env_strings(envseg ? envseg : rd16(cur_psp, 0x2C), envbuf, sizeof envbuf);
+    int err = load_image(img, envbuf, elen, tail, dos_prog, parent_psp, ret_cs, ret_ip);
+    if (err) {
+        rt_finish_process_state(p->machine, 0);
+        p->machine = NULL;
+        cpu = p->parent;
+        return err;
+    }
+    p->child = cur_psp;
+    nprocs++;
+    hle_redirect = 1;
+    return 0;
+}
+
 static void do_exec(void) {
     if (cpu.a.l != 0) { fail(1); return; }
     char dos_prog[260];
@@ -582,33 +839,35 @@ static void do_exec(void) {
     shown[n] = 0;
     rt_log("exec %s tail[%u] \"%s\"", dos_prog, tail[0], shown);
 
-    const Image *img = known_image(dos_prog);
-    if (!img) {
-#ifdef __EMSCRIPTEN__
-        /* COMSPEC is a virtual command interpreter in MEMFS: no /bin/sh (or
-         * other host executable) needs to exist to run cd or explain the limit. */
-        last_retcode = (uint16_t)(exec_host(dos_prog, tail) & 0xFF);
-#else
-        char host[4096];
-        if (dos_fs_to_host(cpu.ds, cpu.d.x, host, sizeof host) || access(host, X_OK)) { fail(2); return; }
-        last_retcode = (uint16_t)(exec_host(host, tail) & 0xFF);
-#endif
+    /* COMSPEC alone is an internal bridge to the command parser, not an
+     * unrecognised DOS program handed to a host executable. This is also
+     * present in the browser, where /bin/sh itself does not exist. */
+    char command_path[260];
+    for (size_t i = 0; i <= strlen(dos_prog); i++)
+        command_path[i] = dos_prog[i] == '/' ? '\\' : dos_prog[i];
+    if (!strcasecmp(command_path, "C:\\bin\\sh")) {
+        int status = exec_host("/bin/sh", tail);
+        if (hle_redirect) return; /* the command has loaded a DOS child */
+        last_retcode = (uint16_t)(status & 0xFF);
         cpu.cf = 0;
         return;
     }
-    if (nprocs == (int)(sizeof procs / sizeof procs[0])) { fail(8); return; }
-    Proc *p = &procs[nprocs];
-    p->parent = cpu;
-    get_dta(&p->dta_seg, &p->dta_off);
-    uint16_t ret_ip = rd16(cpu.ss, cpu.sp), ret_cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
-    uint16_t parent_psp = cur_psp;
-    static char envbuf[32768];
-    size_t elen = env_strings(envseg ? envseg : rd16(cur_psp, 0x2C), envbuf, sizeof envbuf);
-    int err = load_image(img, envbuf, elen, tail, dos_prog, parent_psp, ret_cs, ret_ip);
-    if (err) { cpu = p->parent; fail((uint16_t)err); return; }
-    p->child = cur_psp;
-    nprocs++;
-    hle_redirect = 1;
+    /* These two images are vc itself. In particular, VC.COM reloads VC.OVL
+     * after every command, even if another vc replaced its installation or
+     * the config directory no longer exists. Do not consult the disk. */
+    const char *base = command_path;
+    for (const char *p = command_path; *p; p++)
+        if (*p == '\\' || *p == ':') base = p + 1;
+    const Image *img = !strcasecmp(base, "VC.COM") ? &image_vc_com :
+                       !strcasecmp(base, "VC.OVL") ? &image_vc_ovl : NULL;
+    int err = 0;
+    if (!img) {
+        char host[4096];
+        if (dos_fs_to_host(cpu.ds, cpu.d.x, host, sizeof host)) { fail((uint16_t)file_error()); return; }
+        err = known_image(host, &img);
+    }
+    if (!err) err = start_child(img, dos_prog, tail, envseg);
+    if (err) fail((uint16_t)err);
 }
 
 static void terminate(uint8_t code, int tsr, uint16_t keep) {
@@ -619,6 +878,7 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
         uint16_t maxp;
         mem_resize(psp, keep < 6 ? 6 : keep, &maxp);
     } else {
+        dos_fs_close_process(psp);
         mem_free_owned(psp);
     }
     set_vec(0x22, rd16(psp, 0x0C), rd16(psp, 0x0A));
@@ -627,6 +887,8 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
     uint16_t term_ip = rd16(psp, 0x0A), term_cs = rd16(psp, 0x0C);
     if (nprocs > 0 && procs[nprocs - 1].child == psp) {
         Proc *p = &procs[--nprocs];
+        rt_finish_process_state(p->machine, 0);
+        p->machine = NULL;
         cpu = p->parent;
         cur_psp = rd16(psp, 0x16);
         fs_call(0x1A, p->dta_seg, p->dta_off);
@@ -638,12 +900,33 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
     } else {
         cur_psp = rd16(psp, 0x16);
     }
+    dos_fs_set_process(cur_psp);
     cpu.cs = term_cs;
     cpu.ip = term_ip;
 #ifdef __EMSCRIPTEN__
     if (term_cs == STUB_SEG && term_ip == STUB_EXIT) rt_exit_code = code;
 #endif
     hle_redirect = 1;
+}
+
+int dos_abort_untranslated(void) {
+    if (!nprocs) return 0;
+    Proc *p = &procs[nprocs - 1];
+    if (p->child != cur_psp || p->image == &image_vc_com || p->image == &image_vc_ovl)
+        return 0;
+    char message[160];
+    snprintf(message, sizeof message, "\r\nNo translated code at %04X:%04X. %s stopped.\r\n",
+             cpu.cs, cpu.ip, p->image->name);
+    rt_log("No translated code at %04X:%04X. %s stopped.", cpu.cs, cpu.ip, p->image->name);
+    con_write((const uint8_t *)message, strlen(message));
+    term_render(); /* Make the diagnostic visible before VC redraws its panels. */
+    RtProcessState *machine = p->machine;
+    p->machine = NULL;
+    terminate(70, 0, 0);
+    /* terminate also writes DOS exit vectors; restore the full parent IVT
+     * after that, including GW-BASIC's otherwise abandoned timer hooks. */
+    rt_finish_process_state(machine, 1);
+    return 1;
 }
 
 /* ---- List of Lists and DOS data ------------------------------------------- */
@@ -687,6 +970,16 @@ void dos_core_init(void) {
     wr16(0x40, 0x13, 640);                                /* base memory in KB */
 }
 
+/* The PSP entry is a DOS-provided termination thunk, not translated program
+ * code. GW-BASIC's SYSTEM returns here with a far RET as DOS 1.x programs
+ * did. Recognise only this process's intact kernel-created thunk. */
+int dos_run_psp(void) {
+    if (cpu.cs != cur_psp || cpu.ip != 0 || rd8(cur_psp, 0) != 0xCD || rd8(cur_psp, 1) != 0x20)
+        return 0;
+    cpu_int(0x20, 2);
+    return 1;
+}
+
 /* ---- INT 21h -------------------------------------------------------------- */
 
 int dos_core_int21(void) {
@@ -695,6 +988,12 @@ int dos_core_int21(void) {
     switch (cpu.a.h) {
     case 0x00: terminate(0, 0, 0); return 1;
     case 0x25: set_vec(cpu.a.l, cpu.ds, cpu.d.x); return 1;
+    case 0x26:
+        /* DOS 1.x Create PSP, used when GW-BASIC moves its data segment.
+         * Unlike AH=55h this does not change the current process. */
+        memmove(&mem[(uint32_t)cpu.d.x << 4], &mem[(uint32_t)cur_psp << 4], 256);
+        wr16(cpu.d.x, 0x16, cur_psp);
+        return 1;
     case 0x35: cpu.es = vec_seg(cpu.a.l); cpu.b.x = vec_off(cpu.a.l); return 1;
     case 0x30: cpu.a.l = 7; cpu.a.h = 10; cpu.b.h = 0xFF; cpu.b.l = 0; cpu.c.x = 0; return 1;
     case 0x31: terminate(cpu.a.l, 1, cpu.d.x); return 1;
@@ -726,7 +1025,7 @@ int dos_core_int21(void) {
     case 0x4B: do_exec(); return 1;
     case 0x4C: terminate(cpu.a.l, 0, 0); return 1;
     case 0x4D: cpu.a.x = last_retcode; last_retcode = 0; cpu.cf = 0; return 1;
-    case 0x50: cur_psp = cpu.b.x; return 1;
+    case 0x50: cur_psp = cpu.b.x; dos_fs_set_process(cur_psp); return 1;
     case 0x51: case 0x62: cpu.b.x = cur_psp; return 1;
     case 0x52: cpu.es = DOS_SEG; cpu.b.x = LOL_OFF; return 1;
     case 0x55:
@@ -734,6 +1033,7 @@ int dos_core_int21(void) {
         wr16(cpu.d.x, 0x16, cur_psp);
         wr16(cpu.d.x, 0x02, cpu.si);
         cur_psp = cpu.d.x;
+        dos_fs_set_process(cur_psp);
         return 1;
     case 0x58:
         switch (cpu.a.l) {
@@ -785,7 +1085,9 @@ int dos_int_other(uint8_t n) {
         size_t len = line[0] > 126 ? 126 : line[0];
         const uint8_t *cr = memchr(line + 1, '\r', len);
         if (cr) len = (size_t)(cr - (line + 1));
-        last_retcode = (uint16_t)((line[0] >= 126 ? refuse_long_command() : run_dos_command(line + 1, len)) & 0xFF);
+        int status = line[0] >= 126 ? refuse_long_command() : run_dos_command(line + 1, len);
+        if (hle_redirect) return 0;
+        last_retcode = (uint16_t)(status & 0xFF);
         cpu.a.x = 0;
         return 0;
     }
@@ -830,8 +1132,18 @@ void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
     const char *tmp = getenv("TMPDIR");
     uint8_t conv[128];
     if (tmp && tmp[0] == '/' && !utf8_to_dos(tmp, conv, sizeof conv)) snprintf(tmpdos, sizeof tmpdos, "%s", conv);
-    const char *vars[] = {"COMSPEC=C:\\bin\\sh", "PATH=C:\\", "PROMPT=$P$G", NULL};
+    const char *vars[] = {"COMSPEC=C:\\bin\\sh", "PROMPT=$P$G", NULL};
     for (int i = 0; vars[i]; i++) n += (size_t)snprintf(env + n, sizeof env - n, "%s", vars[i]) + 1;
+    char program_dir[128];
+    snprintf(program_dir, sizeof program_dir, "%s", dos_prog);
+    char *slash = strrchr(program_dir, '\\');
+    if (slash) slash[1] = 0;
+    else strcpy(program_dir, "C:\\");
+#ifdef __EMSCRIPTEN__
+    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;%s;C:\\", program_dir) + 1;
+#else
+    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=%s;C:\\", program_dir) + 1;
+#endif
     n += (size_t)snprintf(env + n, sizeof env - n, "TEMP=%s", tmpdos) + 1;
     n += (size_t)snprintf(env + n, sizeof env - n, "TMP=%s", tmpdos) + 1;
 

@@ -36,6 +36,7 @@ static size_t diagnostic_length;
 static jmp_buf fault_return;
 static int unexpected_interrupt;
 static unsigned interrupts_dispatched;
+int rt_halted;
 
 static const int register_ids[OPS_NREG] = {
     UC_X86_REG_AX, UC_X86_REG_BX, UC_X86_REG_CX, UC_X86_REG_DX,
@@ -319,6 +320,10 @@ static void make_starting_state(uint32_t *rng) {
         put_memory(address + at, (uint8_t)value);
         put_memory(address + at + 1, (uint8_t)(value >> 8));
     }
+    /* GW-BASIC patches only proved operand fields, not opcodes. Exercise
+     * different live immediates/far pointers in every random starting state. */
+    for (unsigned i = 0; i < current->mutable_count; ++i)
+        put_memory(address + current->mutable_offsets[i], (uint8_t)random_word(rng));
 }
 
 /* VC's source contains no self-modifying instructions.  Keep random writes out
@@ -387,6 +392,7 @@ static void set_translated_state(void) {
     cpu.ss = starting[OPS_SS]; cpu.ds = starting[OPS_DS];
     cpu.ip = starting[OPS_IP]; flags_set(starting[OPS_FLAGS]);
     rt_budget = INT_MAX;
+    rt_halted = 0;
 }
 
 static void get_translated_state(uint32_t state[OPS_NREG]) {

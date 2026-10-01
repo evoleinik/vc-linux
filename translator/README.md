@@ -11,6 +11,69 @@ writes `build/gen/vc_com.c` and `build/gen/vc_ovl.c`. Run the CLI directly with:
 `make test-translator` runs the instruction differential tests, exhaustive
 PutTime comparison, and focused translator/runtime regression tests.
 
+## Linked GW-BASIC modules
+
+`make gwbasic` builds `build/gwbasic/GWBASIC.EXE`, `GWBASIC.MAP`, and every
+module listing. `tools/build_gwbasic.py` uses the date pinned in `UPSTREAM`
+as `OEMVER`, never the host date; preprocessing comments and tool diagnostic
+timings are normalized too. An independent rebuild test compares the EXE,
+map and every listing byte-for-byte. The vendored MASM-era `GWBASIC.LNK`
+omits the fork's required `OEMCBK` module, so the build adds it before
+`OEMEV`. There are 38 linked modules (MATH1 and MATH2 are already concatenated
+into MATH), not the brief's approximate 39.
+
+The opt-in `--map build/gwbasic/GWBASIC.MAP` CLI accepts all module listings.
+JWlink's `option verbose` supplies the **Module Segments** table: every
+module-local offset is placed at that contribution's actual linked address,
+including paragraph padding and independently placed data contributions.
+The reader requires each module exactly once, checks contribution lengths,
+checks displayed literals and resolves symbolic data fixups against the map
+and module's local symbols. External symbols retain their declared segment:
+GWINIT deliberately declares BEGDSG in CSEG to obtain DSEG's distance from
+the code frame, not the usual data-relative offset zero.
+
+Both existing single-listing images take the original path; regenerated
+`vc_com.c` and `vc_ovl.c` were compared with their before-work copies using
+`cmp`. Identical generated output is not rewritten, preserving object caches.
+
+GW-BASIC's `.SALL` and `.XLIST` suppress bytes even when JWasm is passed
+`-Sa`. The build changes only these listing controls to `.LALL` and `.LIST`.
+This exposes the old `INS86` macros, whose explicit DB/DW rows encode machine
+instructions. Every code-contribution byte must then belong to a source row
+or an explicit ORG reservation; missing generated rows are rejected.
+
+Two additional source idioms matter:
+
+- DB-emitted MOV-immediate and accumulator ALU opcodes deliberately skip the
+  next source instruction by consuming it as an immediate. A DB segment
+  prefix similarly overlaps the following unprefixed source instruction.
+  The linked-only reachable-data closure retains both executable starts;
+  it never linearly sweeps unrelated data.
+- SYNCHR pops its return address into SI, uses CS:CMPSB, and pushes the
+  advanced SI. The full fixed machine-code prefix proves that calls return
+  **after one inline token byte**. That token is data, not an instruction.
+
+Four MOV AX,0 instructions are patched with the relocated data segment:
+OEMCBK's CBKDS/IMDS, OEMEV's ITICDS and OEMSND's IRQ0DS. Two DB-emitted far
+JMPs, CBOISR/IMOISR, receive saved BIOS interrupt vectors. Direct CS-relative
+stores identify these sixteen operand bytes. Their opcodes and boundaries
+remain fixed; emitted MOV/JMP semantics read the proved operand fields from
+guest memory. `Image.mutable_offsets` lets the copied-code matcher ignore
+only those bytes. A store that changes a translated opcode/boundary fails
+translation. No runtime decoder or emulator is introduced.
+
+Linked code yields before an instruction when its budget expires, so the
+dispatcher can deliver hardware interrupts. HLT records the halted state and
+next IP, then returns to that dispatcher; no translated function sleeps.
+The original VC emission is unchanged.
+
+The Unicorn gate now covers every distinct VC and GW-BASIC instruction,
+including data-recovered starts, overlapping skip paths and HLT. It also
+randomizes all proved mutable fields before each comparison; explicit
+mutation tests show that freezing either the DS immediate or a saved ISR
+pointer is detected. Arbitrary user-created code (CALL/USR or POKE changing
+opcodes) remains outside the ahead-of-time translation contract.
+
 ## Necessary JWasm listing normalization
 
 The original `make images` recipes are unchanged. Their listings omit

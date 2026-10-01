@@ -100,6 +100,7 @@ class Listing:
     constants: dict[str, int] = field(default_factory=dict)
     structures: dict[str, Structure] = field(default_factory=dict)
     generated_listing: bool = False
+    external_segments: dict[str, str] = field(default_factory=dict)
 
 
 def strip_comment(source: str) -> str:
@@ -211,13 +212,26 @@ def _metadata(text: str) -> tuple[dict[str, Segment], dict[str, Label], dict[str
     return segments, labels, constants
 
 
-def parse_listing(path: str | Path) -> Listing:
+def parse_listing(path: str | Path, *, linked: bool = False) -> Listing:
     path = Path(path)
     text = path.read_text(encoding="utf-8", errors="replace")
     segments, labels, constants = _metadata(text)
+    external_segments = {}
+    if linked:
+        # GW-BASIC's historical segment class is CODESG, not MASM's newer
+        # conventional CODE. This opt-in leaves the single-image path alone.
+        for match in re.finditer(r"^(\S+).*16 Bit.*'CODESG'", text, re.M):
+            segments[match[1]].is_code = True
+        for match in re.finditer(r"^(\S+).*\bExternal\b", text, re.M):
+            label = labels.pop(match[1], None)
+            if label:
+                external_segments[match[1].strip("`").upper()] = label.segment
     source_text = text.split("Binary Map:", 1)[0]
+    if linked:
+        source_text = source_text.split("\nMacros:", 1)[0]
     default_code = next((s for s in segments if s.upper().endswith("_TEXT")), "_TEXT")
     segment = None
+    segment_stack = []
     active_procs: dict[str, str | None] = {}
     procedures, structures, rows = {}, {}, []
     structure = None
@@ -228,6 +242,9 @@ def parse_listing(path: str | Path) -> Listing:
         if len(raw) < 32:
             continue
         source = raw[32:]
+        if linked:
+            source = source.replace("`", "")
+            source = re.sub(r"\b(D[BWD])(?=[\"'])", r"\1 ", source, flags=re.I)
         if comment_delimiter:
             if comment_delimiter in source:
                 comment_delimiter = None
@@ -280,10 +297,12 @@ def parse_listing(path: str | Path) -> Listing:
             segment = operands.split()[0] if operands else defaults[mnemonic]
             segments.setdefault(segment, Segment(segment, False))
         elif mnemonic == "SEGMENT" and label:
+            if linked:
+                segment_stack.append(segment)
             segment = label
             segments.setdefault(segment, Segment(segment, "'CODE'" in operands.upper()))
         elif mnemonic == "ENDS" and label == segment:
-            segment = None
+            segment = segment_stack.pop() if linked and segment_stack else None
         proc = active_procs.get(segment) if segment else None
         if mnemonic == "PROC" and segment and offset is not None and label:
             uses = re.search(r"\bUSES\s+(.+)", operands, re.I)
@@ -308,6 +327,10 @@ def parse_listing(path: str | Path) -> Listing:
                               and mnemonic not in NON_INSTRUCTIONS and not mnemonic.startswith("."))
         row = ListingLine(lineno, segment, offset, byte_values, len(byte_values), source, proc,
                           is_instruction, mnemonic, operands, fixups, generated=is_generated)
+        if linked and mnemonic == "ENDS":
+            # A nested DSEG ENDS restores CSEG for the following source;
+            # its printed DSEG offset must not truncate a preceding CSEG DB.
+            row.segment = None
         rows.append(row)
         if mnemonic == "ENDP" and segment and label in procedures:
             procedures[label].end = offset
@@ -324,6 +347,7 @@ def parse_listing(path: str | Path) -> Listing:
             row.byte_count = end - row.offset
         next_offsets[row.segment] = row.offset
     listing = Listing(path, rows, segments, procedures, labels, constants, structures, generated)
+    listing.external_segments = external_segments
     for row in rows:
         if row.bytes and not row.is_instruction and row.segment:
             row.initializers = _initializers(row.mnemonic, row.operands, listing)

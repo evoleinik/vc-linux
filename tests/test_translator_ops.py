@@ -6,7 +6,7 @@ Repeat SBB while planting/restoring a carry bug:
     .venv/bin/python -m pytest -q -s tests/test_translator_ops.py -k sbb
 
 Family parameterization only changes reporting/reproduction: the default suite
-walks every bytes/image-offset instruction from both validated listings.
+walks every bytes/image-offset instruction from VC and GW-BASIC's validated listings.
 """
 
 from __future__ import annotations
@@ -98,3 +98,29 @@ def test_oracle_detects_truncated_input_port(monkeypatch, opcode):
         "((uint32_t)saved_dx >> 8) * 0x5du + 0x246bu);",
     )
     assert "port I/O events differ" in failure and "Unicorn IN port=" in failure, failure
+
+
+@pytest.mark.parametrize("opcode,mutable", [
+    (bytes.fromhex("b80000"), (1, 2)),
+    (bytes.fromhex("eaffffffff"), (1, 2, 3, 4)),
+], ids=("patched-ds", "patched-isr"))
+def test_oracle_detects_ignored_patched_operand(monkeypatch, opcode, mutable):
+    decoder = Cs(CS_ARCH_X86, CS_MODE_16)
+    decoder.detail = True
+    instruction = next(decoder.disasm(opcode, 0x1234))
+    record = SimpleNamespace(off=instruction.address, insn=instruction,
+                             mutable_offsets=mutable, linked=True)
+    case = InstructionCase(0, "SELF_MODIFYING_ORACLE_TEST", record, ())
+    production_emitter = ops_build.emit_instruction_function
+
+    def deliberately_ignore_patch(record, relocations, symbol):
+        unpatched = SimpleNamespace(off=record.off, insn=record.insn, linked=True)
+        return production_emitter(unpatched, relocations, symbol)
+
+    # The reference receives random operand bytes in memory, just as the
+    # actual GW-BASIC patch stores supply DS and the previous ISR pointers.
+    monkeypatch.setattr(ops_build, "emit_instruction_function", deliberately_ignore_patch)
+    library = build_library((case,))
+    failure = library.ops_check_instruction(0, STATES_PER_INSTRUCTION)
+    assert failure is not None, "The oracle accepted a deliberately ignored live operand"
+    assert "AX differs" in failure.decode() or "CS differs" in failure.decode(), failure.decode()

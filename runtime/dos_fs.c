@@ -45,6 +45,8 @@ typedef struct {
 typedef struct {
     int fd, device, access;
     unsigned mode, drive;
+    uint32_t fcb_id; /* nonzero only for an FCB open; guards copied/stale FCBs */
+    uint16_t fcb_owner;
     char path[PATH_MAX];
 } DosHandle;
 
@@ -86,6 +88,8 @@ static uint16_t dta_seg, dta_off = 0x80;
 static uint16_t last_error;
 static uint32_t search_generation;
 static unsigned temp_sequence;
+static uint32_t fcb_sequence;
+static uint16_t fcb_process;
 static struct timespec clock_delta;
 static bool initialized;
 
@@ -1142,6 +1146,17 @@ static int close_handle(unsigned n)
     return error;
 }
 
+void dos_fs_set_process(uint16_t psp)
+{
+    fcb_process = psp;
+}
+
+void dos_fs_close_process(uint16_t psp)
+{
+    for (unsigned i = 0; i < DOS_HANDLES; i++)
+        if (handles[i].fcb_id && handles[i].fcb_owner == psp) close_handle(i);
+}
+
 static void forget_birth(const struct stat *st)
 {
     BirthTime **p = &birth_times;
@@ -1242,6 +1257,255 @@ static int open_file(uint16_t off, unsigned mode, unsigned attributes, unsigned 
     error = open_path(path, drive, mode, attributes, action);
     if (!extended) cpu.c.x = saved_cx;
     return error;
+}
+
+/* ---- DOS 1.x file control blocks ----------------------------------------- */
+
+static uint16_t fcb_offset(uint16_t seg, uint16_t off)
+{
+    return rd8(seg, off) == 0xff ? (uint16_t)(off + 7) : off;
+}
+
+static int fcb_path(uint16_t seg, uint16_t off, char *host, bool missing, unsigned *drive)
+{
+    unsigned d = rd8(seg, off);
+    *drive = d ? d - 1 : current_drive;
+    if (!drive_present(*drive)) return 15;
+    char path[16];
+    size_t n = 0;
+    path[n++] = (char)('A' + *drive);
+    path[n++] = ':';
+    for (unsigned part = 0; part < 2; part++) {
+        unsigned width = part ? 3 : 8, begin = part ? 9 : 1;
+        unsigned used = width;
+        while (used && rd8(seg, (uint16_t)(off + begin + used - 1)) == ' ') used--;
+        if (!part && !used) return 2;
+        if (part && used) path[n++] = '.';
+        for (unsigned i = 0; i < used; i++) {
+            uint8_t c = rd8(seg, (uint16_t)(off + begin + i));
+            if (!c || strchr("?*\\/:\"<>|", c)) return 2;
+            path[n++] = (char)c;
+        }
+    }
+    path[n] = 0;
+    return resolve_path(path, host, missing);
+}
+
+static DosHandle *fcb_handle(uint16_t seg, uint16_t off, unsigned *slot)
+{
+    *slot = rd16(seg, (uint16_t)(off + 28));
+    DosHandle *h = get_handle(*slot);
+    return h && h->fcb_id && h->fcb_id == get32(seg, (uint16_t)(off + 24)) &&
+           rd16(seg, (uint16_t)(off + 30)) == 0xfcb1 ? h : NULL;
+}
+
+static void fcb_metadata(uint16_t seg, uint16_t off, const struct stat *st)
+{
+    put32(seg, (uint16_t)(off + 16), st->st_size > UINT32_MAX ? UINT32_MAX : (uint32_t)st->st_size);
+    uint16_t time, date;
+    pack_time(st->st_mtim, &time, &date);
+    wr16(seg, (uint16_t)(off + 20), date);
+    wr16(seg, (uint16_t)(off + 22), time);
+}
+
+static uint8_t fcb_open(uint16_t seg, uint16_t off, bool create)
+{
+    char path[PATH_MAX];
+    unsigned drive;
+    int error = fcb_path(seg, off, path, create, &drive);
+    if (error) return 0xff;
+    /* FCB OPEN has no access-mode argument. Read-only files must still be
+     * readable; an attempted write then reports the FCB write error. */
+    error = open_path(path, drive, 2, 0, create ? 0x12 : 1);
+    if (error == 5 && !create) error = open_path(path, drive, 0, 0, 1);
+    if (error) return 0xff;
+    unsigned slot = cpu.a.x;
+    DosHandle *h = handles + slot;
+    struct stat st;
+    if (fstat(h->fd, &st)) { close_handle(slot); return 0xff; }
+    h->fcb_id = ++fcb_sequence;
+    if (!h->fcb_id) h->fcb_id = ++fcb_sequence;
+    h->fcb_owner = fcb_process;
+    wr8(seg, off, (uint8_t)(drive + 1));
+    wr16(seg, (uint16_t)(off + 12), 0); /* current 128-record block */
+    wr16(seg, (uint16_t)(off + 14), 128);
+    fcb_metadata(seg, off, &st);
+    put32(seg, (uint16_t)(off + 24), h->fcb_id);
+    wr16(seg, (uint16_t)(off + 28), (uint16_t)slot);
+    wr16(seg, (uint16_t)(off + 30), 0xfcb1);
+    wr8(seg, (uint16_t)(off + 32), 0);
+    return 0;
+}
+
+static uint8_t fcb_close(uint16_t seg, uint16_t off)
+{
+    unsigned slot;
+    DosHandle *h = fcb_handle(seg, off, &slot);
+    if (!h) return 0xff;
+    struct stat st;
+    if (!fstat(h->fd, &st)) fcb_metadata(seg, off, &st);
+    zero_mem(seg, (uint16_t)(off + 24), 8);
+    return close_handle(slot) ? 0xff : 0;
+}
+
+static uint32_t fcb_record(uint16_t seg, uint16_t off, bool random, uint16_t size)
+{
+    if (!random) return rd16(seg, (uint16_t)(off + 12)) * 128u + rd8(seg, (uint16_t)(off + 32));
+    uint32_t record = get32(seg, (uint16_t)(off + 33));
+    return size < 64 ? record : record & 0xffffffu;
+}
+
+static void fcb_position(uint16_t seg, uint16_t off, uint32_t record)
+{
+    wr16(seg, (uint16_t)(off + 12), (uint16_t)(record / 128));
+    wr8(seg, (uint16_t)(off + 32), (uint8_t)(record % 128));
+}
+
+/* Sequential and random record I/O share the existing DOS handle table and
+ * DTA. A short final read is zero-padded (AL=3); no bytes at EOF is AL=1.
+ * Single random calls never advance the random-record field: GW-BASIC's
+ * ACCFIL advances it itself. Block calls advance it by completed records. */
+static uint8_t fcb_transfer(uint16_t seg, uint16_t off, uint8_t function, uint16_t *count)
+{
+    bool write = function == 0x15 || function == 0x22 || function == 0x28;
+    bool random = function >= 0x21, block = function >= 0x27;
+    unsigned slot;
+    DosHandle *h = fcb_handle(seg, off, &slot);
+    if (!h || h->device) { *count = 0; return 0xff; }
+    uint16_t size = rd16(seg, (uint16_t)(off + 14));
+    if (!size) { *count = 0; return 0xff; }
+    uint32_t record = fcb_record(seg, off, random, size);
+    uint32_t requested = block ? *count : 1;
+    uint64_t pos = (uint64_t)record * size;
+    if (write && h->access == 0) { *count = 0; return 1; }
+    if (!requested) {
+        *count = 0;
+        if (write && ftruncate(h->fd, (off_t)pos)) return 1;
+        struct stat st;
+        if (!fstat(h->fd, &st)) fcb_metadata(seg, off, &st);
+        return 0;
+    }
+    if (requested * size > 0x10000u - dta_off) { *count = 0; return 2; }
+    uint8_t *buffer = malloc(size);
+    if (!buffer) { *count = 0; return 0xff; }
+    uint32_t done = 0;
+    uint8_t status = 0;
+    while (done < requested) {
+        uint16_t dma = (uint16_t)(dta_off + done * size);
+        if (write)
+            for (unsigned i = 0; i < size; i++) buffer[i] = rd8(dta_seg, (uint16_t)(dma + i));
+        ssize_t n;
+        do {
+            n = write ? pwrite(h->fd, buffer, size, (off_t)pos) : pread(h->fd, buffer, size, (off_t)pos);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0 || (write && n != size)) { status = 1; break; }
+        if (!n) { status = 1; break; }
+        if (!write) {
+            memset(buffer + n, 0, size - (size_t)n);
+            for (unsigned i = 0; i < size; i++) wr8(dta_seg, (uint16_t)(dma + i), buffer[i]);
+        }
+        done++;
+        pos += size;
+        if (n < size) { status = 3; break; }
+    }
+    free(buffer);
+    uint32_t next = record + (block || !random ? done : 0);
+    fcb_position(seg, off, next);
+    if (block) put32(seg, (uint16_t)(off + 33), next);
+    *count = (uint16_t)done;
+    if (write) {
+        struct stat st;
+        if (!fstat(h->fd, &st)) fcb_metadata(seg, off, &st);
+    }
+    return status;
+}
+
+static bool fcb_separator(uint8_t c)
+{
+    return c == ' ' || c == '\t' || c == ':' || c == ';' || c == ',' || c == '=' || c == '+';
+}
+
+static bool fcb_end(uint8_t c)
+{
+    return c <= ' ' || strchr("\"/\\[]:;=,+<>|", c) != NULL;
+}
+
+static uint8_t fcb_parse(void)
+{
+    uint16_t si = cpu.si, off = cpu.di;
+    uint8_t options = cpu.a.l, status = 0;
+    unsigned scanned = 0;
+    if (options & 1)
+        while (scanned < 65536 && fcb_separator(rd8(cpu.ds, si))) { si++; scanned++; }
+    uint8_t c = rd8(cpu.ds, si);
+    if (c && rd8(cpu.ds, (uint16_t)(si + 1)) == ':') {
+        unsigned drive = (unsigned)(cp866_upper(c) - 'A');
+        if (!drive_present(drive)) { cpu.si = si; return 0xff; }
+        wr8(cpu.es, off, (uint8_t)(drive + 1));
+        si += 2;
+    } else if (!(options & 2)) wr8(cpu.es, off, 0);
+    if (!(options & 8))
+        for (unsigned i = 0; i < 3; i++) wr8(cpu.es, (uint16_t)(off + 9 + i), ' ');
+    for (unsigned part = 0; part < 2; part++) {
+        unsigned width = part ? 3 : 8, field = part ? 9 : 1, used = 0;
+        c = rd8(cpu.ds, si);
+        bool present = !fcb_end(c) && c != '.';
+        if (present || part || !(options & 4))
+            for (unsigned i = 0; i < width; i++) wr8(cpu.es, (uint16_t)(off + field + i), ' ');
+        while (scanned++ < 65536 && !fcb_end(c) && c != '.') {
+            if (c == '*' || c == '?') status = 1;
+            if (c == '*')
+                while (used < width) wr8(cpu.es, (uint16_t)(off + field + used++), '?');
+            else if (used < width)
+                wr8(cpu.es, (uint16_t)(off + field + used++), cp866_upper(c));
+            si++;
+            c = rd8(cpu.ds, si);
+        }
+        if (part || c != '.') break;
+        si++;
+    }
+    wr16(cpu.es, (uint16_t)(off + 12), 0);
+    wr16(cpu.es, (uint16_t)(off + 14), 0);
+    cpu.si = si;
+    return scanned >= 65536 ? 0xff : status;
+}
+
+static void fcb_call(uint8_t function)
+{
+    Cpu saved = cpu;
+    uint16_t seg = cpu.ds, off = fcb_offset(seg, cpu.d.x), count = cpu.c.x;
+    uint8_t status = 0xff;
+    if (function == 0x29) {
+        status = fcb_parse();
+        saved.si = cpu.si;
+    } else if (function == 0x0f || function == 0x16) status = fcb_open(seg, off, function == 0x16);
+    else if (function == 0x10) status = fcb_close(seg, off);
+    else if (function == 0x14 || function == 0x15 || function == 0x21 || function == 0x22 ||
+             function == 0x27 || function == 0x28) {
+        status = fcb_transfer(seg, off, function, &count);
+        if (function >= 0x27) saved.c.x = count;
+    } else if (function == 0x24) {
+        put32(seg, (uint16_t)(off + 33), fcb_record(seg, off, false, 0));
+        status = 0;
+    } else if (function == 0x23 || function == 0x13) {
+        char path[PATH_MAX];
+        unsigned drive;
+        if (!fcb_path(seg, off, path, false, &drive)) {
+            struct stat st;
+            if (!file_stat(path, &st) && S_ISREG(st.st_mode)) {
+                if (function == 0x23) {
+                    uint16_t size = rd16(seg, (uint16_t)(off + 14));
+                    if (size) { put32(seg, (uint16_t)(off + 33), (uint32_t)(((uint64_t)st.st_size + size - 1) / size)); status = 0; }
+                } else if ((st.st_mode & S_IWUSR) && !inode_is_open(&st) && !unlink(path)) {
+                    forget_birth(&st);
+                    status = 0;
+                }
+            }
+        }
+    }
+    cpu = saved;
+    cpu.a.l = status;
+    cpu.cf = 0; /* FCB errors are AL statuses, not CF/AX DOS 2.x errors. */
 }
 
 static int read_file(void)
@@ -1817,6 +2081,7 @@ void dos_fs_init(void)
     strcpy(drives[current_drive].cwd, cwd);
     dta_seg = cpu.ds; dta_off = 0x80;
     last_error = 0; temp_sequence = 0;
+    fcb_process = 0;
     clock_delta = (struct timespec){0, 0};
     initialized = true;
 }
@@ -1825,6 +2090,9 @@ static bool owns_function(uint16_t ax)
 {
     if (ax == 0x7303 || (ax >> 8) == 0x71) return true;
     switch (ax >> 8) {
+    case 0x0d: case 0x0f: case 0x10: case 0x11: case 0x12: case 0x13:
+    case 0x14: case 0x15: case 0x16: case 0x17: case 0x21: case 0x22:
+    case 0x23: case 0x24: case 0x27: case 0x28: case 0x29: return true;
     case 0x0e: case 0x19: case 0x1a: case 0x2a: case 0x2b: case 0x2c: case 0x2d:
     case 0x2f: case 0x36: case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c:
     case 0x3d: case 0x3e: case 0x3f: case 0x40: case 0x41: case 0x42: case 0x43:
@@ -1888,6 +2156,15 @@ int dos_fs_int21(void)
         }
     } else if (function == 0x7303) error = disk_space(true);
     else switch (function >> 8) {
+    case 0x0d:
+        for (unsigned i = 0; i < DOS_HANDLES; i++)
+            if (handles[i].fd >= 0 && handles[i].access != 0) fsync(handles[i].fd);
+        break;
+    case 0x0f: case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
+    case 0x16: case 0x17: case 0x21: case 0x22: case 0x23: case 0x24: case 0x27:
+    case 0x28: case 0x29:
+        fcb_call((uint8_t)(function >> 8));
+        return 1;
     case 0x0e:
         if (!drive_present(cpu.d.l)) error = 15;
         else { current_drive = cpu.d.l; cpu.a.l = DOS_DRIVES; }

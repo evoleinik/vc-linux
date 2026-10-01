@@ -14,6 +14,10 @@
 /* ---- DOS file system: runtime/dos_fs.c ---------------------------------- */
 
 void dos_fs_init(void);
+/* Keep FCB opens associated with their DOS owner so an erroring child cannot
+ * leak descriptors into its parent. Ordinary inherited handles are untouched. */
+void dos_fs_set_process(uint16_t psp);
+void dos_fs_close_process(uint16_t psp);
 /* INT 21h functions for files, directories, drives, handles, date and time,
  * country info and IOCTL, both classic and the 71xxh long-file-name family.
  * Returns 1 if it handled the function in cpu.a.h (or cpu.a.x), 0 if the

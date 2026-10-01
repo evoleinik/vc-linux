@@ -14,7 +14,8 @@ comes out is native x86-64 code. No emulator runs at run time. You manage real L
 the real VC: the same keys, colours, dialogs and quirks.
 
 **Try it in your browser: [evoleinik.github.io/vc-linux](https://evoleinik.github.io/vc-linux/).**
-The same translated code, compiled to WebAssembly. It starts at once.
+The same translated code, compiled to WebAssembly. It starts at once, with GW-BASIC and twelve
+classic BASIC games on its `H:` drive.
 
 ## Why not DOSBox, mc or far2l?
 
@@ -57,11 +58,23 @@ goes to `~/.cache/vc-linux/vc.log`.
 | Ctrl-H | Show or hide dotfiles | dotfiles carry the DOS hidden attribute |
 | Ctrl-\\ | Go to the root of the drive | |
 | Alt-letter | Speed search | takes a `*` wildcard |
-| Command line | Runs in `/bin/sh` | `cd` moves VC's panel like `COMMAND.COM` did; `cd ~` works |
+| Command line | Translated DOS programs, else `/bin/sh` | Searches the current DOS directory and DOS `PATH` for `.COM`/`.EXE`; `vc` runs native VC; `cd ~` works |
+| Enter on `.BAS` | GW-BASIC | `SYSTEM` returns to VC; Ctrl-Pause or Ctrl-Shift-B stops BASIC |
 | Mouse | Click to move the cursor | SGR mouse reporting |
 
 Drives: `C:` is `/` and `H:` is your home directory. Names are shown in code page 866, so Cyrillic
 displays correctly.
+
+Type `gwbasic` to run the original 1983 interpreter, translated ahead of time just like VC.
+Try `PRINT 2+2`, then `SYSTEM`. The installed `GWBASIC.EXE` is a real DOS file: EXEC reads it
+and selects a translation by its complete bytes, not its name. Renamed copies work. Direct DOS
+EXEC rejects changed or untranslated executables; typed commands fall back to the Linux shell.
+The shipped association's `gwbasic` command never falls back, so a BASIC file name cannot become
+shell syntax when the interpreter is missing or changed. VC.COM and VC.OVL are internal parts
+of VC: they always use their built-in translations, independently of the installed files.
+Linux installs the interpreter in the config directory; bring your own `.bas` files. Linux sound
+stays silent. A `CALL` or `USR` into code without a translation stops that BASIC session with a
+short message and returns to VC.
 
 In a plain terminal, Ctrl-[ sends the same byte as Esc. Ctrl-I sends the same byte as Tab, and
 Ctrl-M the same as Enter. VC gives each of them a different job, so vc asks the terminal to report
@@ -71,15 +84,18 @@ WezTerm does too once `enable_kitty_keyboard` is on. xterm does it through modif
 ## In your browser
 
 The same translated C also compiles to WebAssembly with Emscripten. The page opens VC at once on a
-small in-memory `H:` drive holding a README, VC's history and its own assembly sources. xterm.js
+small in-memory `H:` drive holding a README, VC's history, its own assembly sources, GW-BASIC,
+and twelve of David Ahl's public-domain BASIC Computer Games. xterm.js
 shows the screen in the IBM VGA font. The page reports keys in full, so Ctrl-[, Ctrl-I and Ctrl-M
 work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload. There is no shell
-and no editor, so only `cd` runs from the command line.
+and no editor, but `cd` and translated DOS programs run from the command line. Open `GAMES` and
+press Enter on a `.BAS` file to play. `BEEP`, `SOUND` and `PLAY` use a Web Audio square wave after
+the first key press. Use Ctrl-Pause or Ctrl-Shift-B to stop a game, then `SYSTEM` to return to VC.
 
 To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
 
     make web          # build/web/: index.html, vc.mjs, vc.wasm
-    make test-web     # runs it under node and checks start-up, F3, Ctrl-[ and quit
+    make test-web     # Node checks VC, GW-BASIC, arithmetic, speaker and SYSTEM
 
 Serve `build/web/` over HTTP to open it. The design is in `docs/plans/2026-10-01-browser-build.md`.
 
@@ -130,12 +146,15 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 
 | Suite | What it proves |
 |---|---|
-| `test-translator` | All 43,000 distinct instructions in both programs match the unicorn CPU emulator from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
-| `test-fs` | The DOS file layer, register by register: about 4,100 checks against a temporary tree. |
+| `test-translator` | All 63,680 distinct instructions in VC and GW-BASIC match Unicorn from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
+| `test-fs` | The DOS file layer, including GW-BASIC's DOS 1.x FCB calls: over 4,300 checks against a temporary tree. |
+| `test-exec` | Byte-identical EXEC, DOS search order, command tails, safe missing associations and child FCB cleanup. |
+| `test-machine` | Timer interrupts, IF, HLT, Ctrl-Break, PIT speaker frequencies and declared mutable operands. |
+| `test-process` | Child fault recovery, parent interrupt/device state, and fatal no-translation faults in VC itself. |
 | `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,600 checks. |
 | `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
-| `test-web` | The WebAssembly build under node: start-up, F3, the no-shell message, Ctrl-[ and quit. Needs Emscripten, so CI runs it in its own job. |
-| `test-e2e` | `build/vc` in a pseudo-terminal: the terminal shows exactly what is in video memory, and view, copy, rename, delete, F4, the mouse, shell commands and VC's own Ctrl keys work. |
+| `test-web` | The WebAssembly build under Node: VC, GW-BASIC, arithmetic, BEEP/SOUND/PLAY hooks, SYSTEM and quit. Needs Emscripten. |
+| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real GW-BASIC launches, identity/injection checks, Ctrl-Break and every shipped game's first prompt. |
 
 Every finding from the three code reviews was fixed with a test that failed on the old code first.
 
@@ -185,6 +204,13 @@ Volkov Commander is by Vsevolod V. Volkov, who released the sources under the BS
 license in 2026 (`asm/LICENSE.TXT`). Danila Sukharev preserved them and made them build with
 JWasm in [ddanila/vc](https://github.com/ddanila/vc). JWasm is by Andreas Grech and others, under
 the Sybase Open Watcom Public License (`tools/jwasm/README.md`).
+
+GW-BASIC is Microsoft's MIT-licensed 1983 source with the OEM work from TK Chia's fork
+(`third_party/gwbasic`). Its pinned version is in `UPSTREAM`. David Ahl placed his works in the
+public domain in 2022; the game listings are vendored from `coding-horror/basic-computer-games`.
+Build-time conversion changes DOS names and line endings; Star Trek additionally gets spaces
+around compact `TO`/`STEP` keywords for this interpreter's tokenizer. Vendored listings stay
+unchanged. The first-prompt gate is not a claim that every later branch of a game was tested.
 
 The translator, runtime and tests are BSD 2-Clause (`LICENSE`). They were built with Claude Code
 and OpenAI Codex.

@@ -24,6 +24,7 @@ enum {
 static int blink_enabled;
 static int console_scan_pending;
 static uint8_t console_scan;
+static int break_pending;
 
 typedef struct {
     int show;
@@ -127,6 +128,8 @@ void bios_init(void)
     memset(mem + 0x400 + KEY_START, 0, KEY_END - KEY_START);
     console_scan_pending = 0;
     console_scan = 0;
+    break_pending = 0;
+    mem[0x471] = 0;
     mouse_reset();
     /* The runtime owns the timer at 046Ch: it is deliberately untouched. */
 }
@@ -173,6 +176,26 @@ int bios_key_push(uint16_t key)
     bda_set_word(tail, key);
     bda_set_word(0x1c, (uint16_t)next);
     return 1;
+}
+
+void bios_request_break(void)
+{
+    /* IBM's keyboard ISR empties the queue and inserts a null word. That
+     * also releases a blocking INT 16h so rt_run can enter the guest's 1Bh
+     * handler on its own stack, never recursively through a C BIOS call. */
+    unsigned start, end;
+    key_bounds(&start, &end);
+    bda_set_word(0x1c, bda_word(0x1a));
+    (void)bios_key_push(0);
+    mem[0x471] |= 0x80;
+    break_pending = 1;
+}
+
+int bios_take_break(void)
+{
+    int pending = break_pending;
+    break_pending = 0;
+    return pending;
 }
 
 static int legacy_key(uint16_t *key)

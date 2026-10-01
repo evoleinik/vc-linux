@@ -11,6 +11,7 @@
 #define STUB_SEG      0xF000u
 #define STUB_CASEMAP  0x0100u   /* far-callable country case-map routine */
 #define STUB_EXIT     0x0110u   /* terminate address of the first process */
+#define STUB_INT8_RETURN 0x0120u /* IRET after the BIOS's INT 1Ch call */
 #define STUB_END      0x0400u
 
 /* Set by a handler that has already moved CS:IP (and maybe SS:SP) somewhere
@@ -24,10 +25,25 @@ void rt_log(const char *fmt, ...);
 void rt_update_clock(void);
 void rt_register_image(const Image *img, uint16_t loadseg);
 void rt_run(void);
+/* Effective PIT channel-2 frequency, or zero when its gate/speaker is off.
+ * Linux stays silent; the browser forwards changes to Module.vcSpeaker. */
+double rt_speaker_hz(void);
+
+/* Preserve the parent's interrupt vectors and PIT/PIC/speaker state while
+ * a DOS child runs. Normal exits discard this snapshot; a forced exit must
+ * restore it because the child cannot execute its own cleanup routines. */
+typedef struct RtProcessState RtProcessState;
+RtProcessState *rt_save_process_state(void);
+void rt_finish_process_state(RtProcessState *state, int restore);
 
 /* dos_core.c */
 void dos_core_init(void);
 int dos_core_int21(void);
+/* Execute only the exact kernel-installed entry thunks in the current PSP. */
+int dos_run_psp(void);
+/* Stop a non-VC child after an untranslated transfer. Return 0 for VC itself,
+ * including its overlay child, so the dispatcher keeps its fatal diagnostic. */
+int dos_abort_untranslated(void);
 /* Handle a software interrupt other than 10h, 16h, 21h and 33h.
  * Returns 1 if the stub should return with a full IRET, 0 for RETF 2. */
 int dos_int_other(uint8_t n);

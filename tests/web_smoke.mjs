@@ -18,11 +18,15 @@ let pending = new Uint8Array();
 let exitCode;
 let exitCalls = 0;
 let stage = '1 startup';
+const speakerEvents = [];
+const faultMessage = 'No translated code at 0000:0000. GWBASIC.EXE stopped.';
+let sawFaultMessage = false;
 
 function observe() {
   if (vc) {
     try {
       screen = vc.FS.readFile(screenPath, { encoding: 'utf8' });
+      if (screen.includes(faultMessage)) sawFaultMessage = true;
     } catch (error) {
       if (error.code !== 'ENOENT' && error.errno !== 44) throw error;
     }
@@ -96,6 +100,10 @@ try {
       exitCalls++;
       observe();
     },
+    vcSpeaker(hz) {
+      speakerEvents.push(hz);
+      observe();
+    },
     print: (text) => console.log(`[VC stdout] ${text}`),
     printErr: (text) => console.error(`[VC stderr] ${text}`),
   });
@@ -105,6 +113,9 @@ try {
   assert.equal(vc.FS.cwd(), '/home/vc');
   assert.ok(!screen.includes('.config') && !screen.includes('.cache'),
     'VC keeps its settings and log off the H: demo drive');
+  assert.ok(vc.FS.stat('/home/vc/GWBASIC.EXE').size > 50000,
+    'GW-BASIC is an actual MZ file on H:');
+  assert.ok(!vc.FS.analyzePath('/home/vc/GAMES/NOTHING.TXT').exists);
   console.log('PASS 1: startup shows 10Quit and README on H:');
 
   stage = '2 F3 viewer';
@@ -140,7 +151,72 @@ try {
   await until('an empty command line', (text) =>
     commandLine(text).trimEnd() === 'H:\\>');
 
-  stage = '5 quit and exit hook';
+  stage = '5 GW-BASIC banner';
+  send('gwbasic\r');
+  await until('GW-BASIC banner and Ok from its own code', (text) =>
+    text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+  console.log('PASS 5: DOS PATH/EXEC starts H:\\GWBASIC.EXE and shows Ok');
+
+  stage = '6 BASIC arithmetic';
+  send('PRINT 2+2\r');
+  await until('PRINT 2+2 to print 4', (text) => /^\s*4\s*$/m.test(text));
+  console.log('PASS 6: GW-BASIC PRINT 2+2 prints 4');
+
+  async function sound(command, frequencies, label) {
+    speakerEvents.length = 0;
+    send(`${command}\r`);
+    await until(`${label} through the speaker hook`, () => {
+      const audible = speakerEvents.filter((hz) => hz > 0);
+      return frequencies.every((expected) => audible.some((hz) => Math.abs(hz - expected) < 2))
+        && speakerEvents.at(-1) === 0;
+    });
+    assert.ok(speakerEvents.every((hz) => Number.isFinite(hz) && hz >= 0), 'valid speaker frequency');
+  }
+  stage = '7 BASIC BEEP';
+  await sound('BEEP', [800], 'BEEP (PIT divisor 1491)');
+  console.log('PASS 7: BEEP reaches the speaker hook at ~800 Hz and stops');
+  stage = '8 BASIC SOUND';
+  await sound('SOUND 440,18', [440], 'SOUND 440,18');
+  console.log('PASS 8: SOUND 440,18 reaches the speaker hook at ~440 Hz');
+  stage = '9 BASIC PLAY';
+  // This 1983 fork defaults to OCTAVE=4, and divides NOTTAB by 2^(6-4).
+  // The resulting PIT divisors are 1140, 1015, 905 (not modern middle C).
+  await sound('PLAY "CDE"', [1047, 1175, 1319], 'PLAY CDE');
+  console.log('PASS 9: PLAY CDE reaches the speaker hook at ~1047/1175/1319 Hz');
+
+  stage = '10 BASIC SYSTEM';
+  send('SYSTEM\r');
+  await until('VC panels after SYSTEM', isPanel);
+  console.log('PASS 10: SYSTEM returns to redrawn VC panels');
+
+  stage = '11 untranslated BASIC call';
+  send('gwbasic\r');
+  await until('GW-BASIC ready before an untranslated CALL', (text) =>
+    text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+  speakerEvents.length = 0;
+  for (const command of ['OUT &H43,&HB6', 'OUT &H42,0', 'OUT &H42,4', 'OUT &H61,3']) {
+    send(`${command}\r`);
+    await until(`Ok after ${command}`, (text) => {
+      const at = text.lastIndexOf(command);
+      return at >= 0 && /^Ok\s*$/m.test(text.slice(at));
+    });
+  }
+  await until('the child leaving its speaker on', () => speakerEvents.at(-1) > 0);
+  // CALL takes an address variable in this GW-BASIC source version.
+  send('DEF SEG=0: A=0: CALL A\r');
+  await until('the child-only no-translation message', () => sawFaultMessage);
+  await until('VC panels after stopping only GW-BASIC', isPanel);
+  assert.equal(exitCalls, 0, 'an untranslated child must not exit VC');
+  assert.equal(speakerEvents.at(-1), 0, 'aborting a child stops its speaker');
+  send('gwbasic\r');
+  await until('GW-BASIC can run again after an untranslated CALL', (text) =>
+    text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+  await sound('SOUND 440,1', [440], 'sound after child recovery');
+  send('SYSTEM\r');
+  await until('VC panels after the recovered child exits', isPanel);
+  console.log('PASS 11: untranslated CALL stops only GW-BASIC; VC and a second BASIC still work');
+
+  stage = '12 quit and exit hook';
   send('\x1b[21~');
   await until('the quit confirmation', (text) =>
     text.includes('Do you want to quit the Volkov Commander?') && text.includes('Yes'));
@@ -148,8 +224,8 @@ try {
   await until('the JavaScript exit hook', () => exitCalls > 0);
   assert.equal(exitCalls, 1, 'the exit hook fires exactly once');
   assert.equal(exitCode, 0, 'VC exits successfully');
-  console.log('PASS 5: F10, Enter quits and fires the exit hook');
-  console.log('web smoke: all 5 checks passed');
+  console.log('PASS 12: F10, Enter quits and fires the exit hook');
+  console.log('web smoke: all 12 checks passed');
   process.exit(0);
 } catch (error) {
   let log = '';
@@ -157,5 +233,6 @@ try {
     log = vc.FS.readFile('/var/vc/cache/vc-linux/vc.log', { encoding: 'utf8' });
   } catch { /* A startup failure may precede the log. */ }
   console.error(`FAIL [${stage}]: ${error.stack || error}\n${screen}\n--- VC log ---\n${log}`);
+  console.error(`Speaker events in current stage: ${JSON.stringify(speakerEvents)}`);
   process.exit(1);
 }
