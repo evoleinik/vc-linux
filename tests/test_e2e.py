@@ -318,6 +318,23 @@ def test_config_dir_with_cyrillic_name(work, tmp_path):
         s.close()
 
 
+def test_home_is_drive_h(tmp_path):
+    home = tmp_path / "home"
+    (home / "projects" / "demo").mkdir(parents=True)
+    (home / "projects" / "demo" / "readme.txt").write_text("in home\n")
+    s = VcSession(home / "projects" / "demo", home)
+    try:
+        s.wait_for("10Quit", timeout=15)
+        s.wait_for("H:\\projects\\demo>", timeout=5)   # started under $HOME: drive H:
+        assert "readme.txt" in s.text()
+        s.send(b"cd /", "enter")
+        s.wait_for("C:\\>", timeout=5)                     # / is drive C:
+        s.send(b"cd ~", "enter")
+        s.wait_for("H:\\>", timeout=5)                     # ~ is the root of H:
+    finally:
+        s.close()
+
+
 def test_refuses_to_run_without_a_terminal(work):
     import subprocess
     r = subprocess.run([str(VC)], cwd=work, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)

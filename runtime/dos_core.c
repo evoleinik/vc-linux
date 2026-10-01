@@ -442,8 +442,22 @@ static int internal_cd(const char *cmd) {
     else if (word[0] == '~' && (!word[1] || word[1] == '/'))
         snprintf(path, sizeof path, "%s%s", home ? home : "", word + 1);
     else snprintf(path, sizeof path, "%s", word);
+    /* An absolute path inside $HOME goes to drive H:, anything else on / to C:. */
+    char onh[2048];
+    const char *dospath = path;
+    if (path[0] == '/' && home && home[0] == '/') {
+        char *home_real = realpath(home, NULL), *path_real = realpath(path, NULL);
+        const char *p = path_real ? path_real : path;
+        size_t hn = home_real ? strlen(home_real) : 0;
+        if (hn > 1 && !strncmp(p, home_real, hn) && (p[hn] == '/' || !p[hn])) {
+            snprintf(onh, sizeof onh, "H:%s", p[hn] ? p + hn : "/");
+            dospath = onh;
+        }
+        free(home_real);
+        free(path_real);
+    }
     uint8_t dos[256]; /* the scratch area holds 256 bytes */
-    int failed = utf8_to_dos(path, dos, sizeof dos) != 0;
+    int failed = utf8_to_dos(dospath, dos, sizeof dos) != 0;
     if (!failed) {
         for (size_t i = 0; i < sizeof dos; i++) {
             wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), dos[i]);
@@ -455,6 +469,11 @@ static int internal_cd(const char *cmd) {
         cpu.d.x = SCRATCH_OFF;
         dos_fs_int21();
         failed = cpu.cf;
+        if (!failed && dos[1] == ':') { /* like a Linux cd: go there, drive and all */
+            cpu.a.h = 0x0E;
+            cpu.d.l = (uint8_t)(cp866_upper(dos[0]) - 'A');
+            dos_fs_int21();
+        }
         cpu = save;
     }
     if (failed) {
@@ -614,8 +633,8 @@ static void init_dos_data(void) {
     wr16(DOS_SEG, LOL_OFF + 0x18, DOS_SEG);
     wr16(DOS_SEG, LOL_OFF + 0x1A, 0xFFFF);
     wr16(DOS_SEG, LOL_OFF + 0x1C, 0xFFFF);
-    wr8(DOS_SEG, LOL_OFF + 0x20, 3);
-    wr8(DOS_SEG, LOL_OFF + 0x21, 3);
+    wr8(DOS_SEG, LOL_OFF + 0x20, 8);
+    wr8(DOS_SEG, LOL_OFF + 0x21, 8); /* LASTDRIVE=H */
     /* NUL device header, end of the device chain */
     uint16_t nul = LOL_OFF + 0x22;
     wr16(DOS_SEG, nul, 0xFFFF);
@@ -623,12 +642,12 @@ static void init_dos_data(void) {
     wr16(DOS_SEG, (uint16_t)(nul + 4), 0x8004);
     memcpy(&mem[a + nul + 10], "NUL     ", 8);
     /* CDS: A: and B: invalid, C: a physical drive at C:\ */
-    for (int d = 0; d < 3; d++) {
+    for (int d = 0; d < 8; d++) {
         uint16_t e = (uint16_t)(CDS_OFF + d * 0x58);
         wr8(DOS_SEG, e, (uint8_t)('A' + d));
         wr8(DOS_SEG, (uint16_t)(e + 1), ':');
         wr8(DOS_SEG, (uint16_t)(e + 2), '\\');
-        wr16(DOS_SEG, (uint16_t)(e + 0x43), d == 2 ? 0x4000 : 0);
+        wr16(DOS_SEG, (uint16_t)(e + 0x43), 0); /* valid drives are marked in dos_start */
         wr16(DOS_SEG, (uint16_t)(e + 0x4F), 2);
     }
     mcb_set(FIRST_MCB, 'Z', 0, (uint16_t)(MEM_TOP - FIRST_MCB - 1));
@@ -757,7 +776,20 @@ int dos_int_other(uint8_t n) {
 
 /* ---- the first process ---------------------------------------------------- */
 
+/* Mark each drive the file layer serves as a physical drive in the CDS, which
+ * programs walk to list drives. */
+static void mark_valid_drives(void) {
+    for (int d = 0; d < 8; d++) {
+        char root[4] = {(char)('A' + d), ':', '\\', 0};
+        for (int i = 0; i < 4; i++) wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), (uint8_t)root[i]);
+        char host[4096];
+        int valid = dos_fs_to_host(DOS_SEG, SCRATCH_OFF, host, sizeof host) == 0;
+        wr16(DOS_SEG, (uint16_t)(CDS_OFF + d * 0x58 + 0x43), valid ? 0x4000 : 0);
+    }
+}
+
 void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
+    mark_valid_drives();
     uint8_t dos_prog[128];
     if (utf8_to_dos(host_prog, dos_prog, sizeof dos_prog))
         rt_fault("%s: path too long for DOS or not representable in code page 866", host_prog);
