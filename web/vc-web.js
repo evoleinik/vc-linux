@@ -1,6 +1,7 @@
 import { Terminal } from "./vendor/xterm.mjs";
-import createVC from "./vc.mjs";
-import { createSpeaker } from "./speaker.js";
+// __V__ is replaced per build, so a cached page never mixes two builds.
+import createVC from "./vc.mjs?v=__V__";
+import { createSpeaker } from "./speaker.js?v=__V__";
 
 const container = document.getElementById("terminal");
 const layout = document.querySelector("main");
@@ -210,6 +211,7 @@ async function start() {
     });
   });
   await createVC({
+    locateFile: (path, prefix) => `${prefix}${path}?v=__V__`,
     vcOutput: (bytes) => terminal.write(bytes),
     vcReadInput: readInput,
     vcExit: onExit,
@@ -219,7 +221,7 @@ async function start() {
 
 start().catch((error) => {
   console.error(error);
-  exitMessage.textContent = "VC could not start. Reload to try again.";
+  exitMessage.textContent = `VC could not start (${error?.message || error}). Reload to try again.`;
   exitMessage.hidden = false;
   document.documentElement.dataset.vcState = "failed";
   fit();

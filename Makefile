@@ -192,9 +192,18 @@ $(WEB_OUT)/%: web/%
 	@mkdir -p $(dir $@)
 	cp $< $@
 
+# The page and its loader name every file with this build's hash, so a browser holding cached files
+# from an older build never mixes the two. GitHub Pages caches each file for 10 minutes.
+WEB_VERSIONED := $(WEB_OUT)/index.html $(WEB_OUT)/vc-web.js
+$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm web/index.html web/vc-web.js web/speaker.js
+	@mkdir -p $(dir $@)
+	v=$$(cat $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm web/index.html web/vc-web.js web/speaker.js | sha256sum | cut -c1-12); \
+	  sed "s/__V__/$$v/g" $< > $@
+
 web: $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm $(WEB_COPIES)
 
 test-web: web
+	$(NODE) tests/web_assets.mjs $(WEB_OUT)
 	$(NODE) tests/test_web_speaker.mjs
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs
 

@@ -7,8 +7,8 @@
   <meta name="description" content="Volkov Commander, translated from 8086 assembly to WebAssembly. Not an emulator.">
   <title>Volkov Commander: not an emulator</title>
   <link rel="preload" href="./vendor/WebPlus_IBM_VGA_8x16.woff" as="font" type="font/woff" crossorigin>
-  <link rel="preload" href="./vc.wasm" as="fetch" type="application/wasm" crossorigin>
-  <link rel="modulepreload" href="./vc.mjs">
+  <link rel="preload" href="./vc.wasm?v=__V__" as="fetch" type="application/wasm" crossorigin>
+  <link rel="modulepreload" href="./vc.mjs?v=__V__">
   <link rel="stylesheet" href="./vendor/xterm.css">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230000aa'/%3E%3Ctext x='8' y='12' font-family='monospace' font-size='9' font-weight='bold' fill='%2355ffff' text-anchor='middle'%3EVC%3C/text%3E%3C/svg%3E">
   <style>
@@ -51,6 +51,6 @@
       <p class="font-credit">IBM VGA font: <a href="https://int10h.org/oldschool-pc-fonts/">VileR, int10h.org</a> · <a href="./vendor/LICENSE-font.txt">CC BY-SA 4.0</a></p>
     </footer>
   </main>
-  <script type="module" src="./vc-web.js"></script>
+  <script type="module" src="./vc-web.js?v=__V__"></script>
 </body>
 </html>
