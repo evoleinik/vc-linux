@@ -127,7 +127,7 @@ clean:
 # ---- the browser toy -------------------------------------------------------
 # Needs Emscripten on PATH (emsdk_env.sh). Native targets never call emcc.
 EMCC    ?= emcc
-NODE    ?= node
+NODE    ?= $(or $(EMSDK_NODE),node)  # emsdk_env.sh sets it; its PATH holds a node/ directory
 WEB_OPT ?= -O2
 WEB_OUT ?= $(B)/web
 WEB_WORK := $(WEB_OUT)-work
