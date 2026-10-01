@@ -1844,11 +1844,11 @@ static int country_info(void)
     if (country != 0 && country != 1) return 2;
     uint16_t seg = cpu.ds, off = cpu.d.x;
     zero_mem(seg, off, 32);
-    wr16(seg, off, 2);
+    wr16(seg, off, 1); /* date order D.M.Y, chosen by the owner on 2026-10-01 */
     wr8(seg, (uint16_t)(off + 2), '$');
     wr8(seg, (uint16_t)(off + 7), ',');
     wr8(seg, (uint16_t)(off + 9), '.');
-    wr8(seg, (uint16_t)(off + 11), '-');
+    wr8(seg, (uint16_t)(off + 11), '.');
     wr8(seg, (uint16_t)(off + 13), ':');
     wr8(seg, (uint16_t)(off + 16), 2);
     wr8(seg, (uint16_t)(off + 17), 1);

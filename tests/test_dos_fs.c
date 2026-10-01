@@ -1778,10 +1778,10 @@ static void test_free_space_and_country(void)
     begin(0x3800); cpu.d.x = OUT;
     for (unsigned i = 0; i < 34; ++i) wr8(DS, OUT + (uint16_t)i, 0xa5);
     if (ok("country information")) {
-        CHECK(rd16(DS, OUT) == 2, "country date order is Y-M-D");
+        CHECK(rd16(DS, OUT) == 1, "country date order is D.M.Y");
         CHECK(rd8(DS, OUT + 2) == '$' && rd8(DS, OUT + 3) == 0, "country currency is dollar");
         CHECK(rd8(DS, OUT + 7) == ',' && rd8(DS, OUT + 9) == '.', "country thousands and decimal separators");
-        CHECK(rd8(DS, OUT + 11) == '-' && rd8(DS, OUT + 13) == ':', "country date and time separators");
+        CHECK(rd8(DS, OUT + 11) == '.' && rd8(DS, OUT + 13) == ':', "country date and time separators");
         CHECK(rd8(DS, OUT + 17) == 1, "country uses24-hour time");
         CHECK(get32(DS, OUT + 18) == UINT32_C(0xf0000100), "country CaseMap points at F000:0100");
         CHECK(rd8(DS, OUT + 32) == 0xa5 && rd8(DS, OUT + 33) == 0xa5, "CNTRY writes exactly32 bytes");
