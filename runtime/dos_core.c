@@ -345,17 +345,32 @@ static const Image *known_image(const char *dos_path) {
 
 /* ---- running host commands ------------------------------------------------ */
 
+#ifndef __EMSCRIPTEN__
 static int host_cwd(char *out, size_t cap) {
     wr8(DOS_SEG, SCRATCH_OFF, '.');
     wr8(DOS_SEG, SCRATCH_OFF + 1, 0);
     return dos_fs_to_host(DOS_SEG, SCRATCH_OFF, out, cap);
 }
+#endif
 
 /* Run `script` with /bin/sh in the DOS current directory, the terminal handed
  * back while it runs. Values that come from file names are never pasted into
  * the script: they go in as positional arguments ($0, $1), which the shell
  * does not parse. */
 static int host_run(const char *script, const char *arg0, const char *arg1) {
+#ifdef __EMSCRIPTEN__
+    (void)script;
+    (void)arg1;
+    const char *message = arg0 && !strcmp(arg0, "vc-edit") ?
+        "No editor in the browser. F3 views the file. The Linux version opens $EDITOR.\r\n" :
+        "No shell in the browser, only cd works here. The Linux version runs "
+        "commands: github.com/evoleinik/vc-linux\r\n";
+    /* VC has switched to its user screen. Writing through CON preserves the
+     * message there; a host stdout write would not update its video memory. */
+    con_write((const uint8_t *)message, strlen(message));
+    term_render();
+    return 127;
+#else
     char cwd[4096];
     if (host_cwd(cwd, sizeof cwd)) strcpy(cwd, "/");
     rt_log("run: %s%s%s (in %s)", script, arg1 ? " -- " : "", arg1 ? arg1 : "", cwd);
@@ -383,6 +398,7 @@ static int host_run(const char *script, const char *arg0, const char *arg1) {
     sigaction(SIGQUIT, &oquit, NULL);
     term_resume();
     return status;
+#endif
 }
 
 /* UTF-8 path to a NUL-terminated DOS path in code page 866, `/` becoming `\`.
@@ -568,9 +584,15 @@ static void do_exec(void) {
 
     const Image *img = known_image(dos_prog);
     if (!img) {
+#ifdef __EMSCRIPTEN__
+        /* COMSPEC is a virtual command interpreter in MEMFS: no /bin/sh (or
+         * other host executable) needs to exist to run cd or explain the limit. */
+        last_retcode = (uint16_t)(exec_host(dos_prog, tail) & 0xFF);
+#else
         char host[4096];
         if (dos_fs_to_host(cpu.ds, cpu.d.x, host, sizeof host) || access(host, X_OK)) { fail(2); return; }
         last_retcode = (uint16_t)(exec_host(host, tail) & 0xFF);
+#endif
         cpu.cf = 0;
         return;
     }
@@ -618,6 +640,9 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
     }
     cpu.cs = term_cs;
     cpu.ip = term_ip;
+#ifdef __EMSCRIPTEN__
+    if (term_cs == STUB_SEG && term_ip == STUB_EXIT) rt_exit_code = code;
+#endif
     hle_redirect = 1;
 }
 

@@ -10,6 +10,7 @@ Linux. Read `README.md` for what it is and `docs/plans/2026-09-30-native-port.md
     make test               # every suite, about 5 minutes
     make test-fs test-term test-ini   # the fast ones, seconds
     .venv/bin/python -m pytest -q tests/test_e2e.py   # VC in a pty, about a minute
+    make web test-web       # the browser build; needs emcc on PATH
 
 Use `.venv/bin/python`, never a global pip.
 
@@ -43,6 +44,11 @@ the runtime and the DOS/BIOS layer. Change them deliberately, never in passing.
 - **Ctrl-[, Ctrl-I and Ctrl-M share bytes with Esc, Tab and Enter.** VC tells them apart by scan
   code, so they work only through the kitty protocol or modifyOtherKeys. A raw 08h is Ctrl-H
   unless the tty's VERASE says Backspace sends 08h.
+
+- **Under Emscripten, `rt_yield` must never sleep.** Translated code calls it, and the calls into
+  translated code are indirect, which Asyncify skips. Only the dispatcher's direct chain
+  (`rt_run → stub → do_int → handler → term_idle`) may pause. A wasm that grows more than about
+  10% means Asyncify rewrote translated code.
 
 ## Debugging
 

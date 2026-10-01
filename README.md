@@ -13,6 +13,9 @@ machine, then reimplements the DOS and BIOS services it calls on top of Linux. T
 comes out is native x86-64 code. No emulator runs at run time. You manage real Linux files with
 the real VC: the same keys, colours, dialogs and quirks.
 
+**Try it in your browser: [evoleinik.github.io/vc-linux](https://evoleinik.github.io/vc-linux/).**
+The same translated code, compiled to WebAssembly. It starts at once.
+
 ## Why not DOSBox, mc or far2l?
 
 | | Runs the original VC code | Works on your real files | Native, no emulator |
@@ -65,6 +68,21 @@ Ctrl-M the same as Enter. VC gives each of them a different job, so vc asks the 
 keys in full. kitty, foot, Ghostty, Alacritty and iTerm2 do it through the kitty keyboard protocol.
 WezTerm does too once `enable_kitty_keyboard` is on. xterm does it through modifyOtherKeys.
 
+## In your browser
+
+The same translated C also compiles to WebAssembly with Emscripten. The page opens VC at once on a
+small in-memory `H:` drive holding a README, VC's history and its own assembly sources. xterm.js
+shows the screen in the IBM VGA font. The page reports keys in full, so Ctrl-[, Ctrl-I and Ctrl-M
+work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload. There is no shell
+and no editor, so only `cd` runs from the command line.
+
+To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
+
+    make web          # build/web/: index.html, vc.mjs, vc.wasm
+    make test-web     # runs it under node and checks start-up, F3, Ctrl-[ and quit
+
+Serve `build/web/` over HTTP to open it. The design is in `docs/plans/2026-10-01-browser-build.md`.
+
 ## Why shouldn't I use it?
 
 - **It is VC 4.99.09, an alpha from 2000.** Its own editor is switched off in the source. Some
@@ -116,6 +134,7 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 | `test-fs` | The DOS file layer, register by register: about 4,100 checks against a temporary tree. |
 | `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,600 checks. |
 | `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
+| `test-web` | The WebAssembly build under node: start-up, F3, the no-shell message, Ctrl-[ and quit. Needs Emscripten, so CI runs it in its own job. |
 | `test-e2e` | `build/vc` in a pseudo-terminal: the terminal shows exactly what is in video memory, and view, copy, rename, delete, F4, the mouse, shell commands and VC's own Ctrl keys work. |
 
 Every finding from the three code reviews was fixed with a test that failed on the old code first.
@@ -133,6 +152,8 @@ Every finding from the three code reviews was fixed with a test that failed on t
 - `translator/` Python: JWasm listing plus linked image to C.
 - `runtime/` C: machine state, dispatcher, loader, DOS and BIOS services, terminal.
 - `data/` default `VC.INI` (written by VC itself), `VCEDIT.EXT`, `VC.HLP`.
+- `web/` the browser page, its H: README, and vendored xterm.js and IBM VGA font with their
+  licences.
 - `tools/` JWasm, `vcini.py` (edit VC.INI safely), `snapshot.py` (screen to HTML),
   `social_preview.py`.
 - `tests/` all suites. `tests/spike_puttime/` is the first proof that translation works.

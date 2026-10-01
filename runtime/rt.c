@@ -80,7 +80,9 @@ _Noreturn void rt_fault(const char *fmt, ...) {
 
 /* ---- clock and yielding -------------------------------------------------- */
 
+#ifndef __EMSCRIPTEN__
 static struct timespec last_idle;
+#endif
 static time_t midnight, next_midnight; /* local midnight, in epoch seconds */
 
 /* The BIOS tick counter at 0040:006C, 18.2 ticks a second since midnight.
@@ -102,19 +104,27 @@ void rt_update_clock(void) {
     wr16(0x40, 0x6E, (uint16_t)(ticks >> 16));
 }
 
+#ifndef __EMSCRIPTEN__
 static long ms_since(const struct timespec *t) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - t->tv_sec) * 1000 + (now.tv_nsec - t->tv_nsec) / 1000000;
 }
+#endif
 
 void rt_yield(void) {
     rt_budget = 20000;
     rt_update_clock();
+#ifndef __EMSCRIPTEN__
     if (ms_since(&last_idle) >= 40) {
         term_idle(0);
         clock_gettime(CLOCK_MONOTONIC, &last_idle);
     }
+#endif
+    /* Under Emscripten RT_TICK reaches here from translated functions behind
+     * Image.run. Never sleep on that indirect stack: ASYNCIFY_IGNORE_INDIRECT
+     * leaves it uninstrumented. Only the dispatcher's direct interrupt path
+     * may reach term_idle and suspend execution. */
 }
 
 /* ---- ports --------------------------------------------------------------- */
@@ -339,7 +349,9 @@ static void stub(uint16_t off) {
 
 /* kill -USR1 <pid> logs the registers and the last dispatched addresses. */
 static volatile sig_atomic_t dump_requested;
+#ifndef __EMSCRIPTEN__
 static void on_usr1(int sig) { (void)sig; dump_requested = 1; }
+#endif
 static uint32_t recent[256];
 static unsigned recent_at;
 
@@ -360,7 +372,9 @@ static void dump_recent(void) {
 }
 
 void rt_run(void) {
+#ifndef __EMSCRIPTEN__
     signal(SIGUSR1, on_usr1);
+#endif
     while (!rt_exited) {
         uint32_t L = lin(cpu.cs, cpu.ip);
         recent[recent_at++ & 255] = L;

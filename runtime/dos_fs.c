@@ -548,11 +548,18 @@ static struct timespec birth_time(const char *path, int fd, const struct stat *s
 {
     for (BirthTime *b = birth_times; b; b = b->next)
         if (b->dev == st->st_dev && b->ino == st->st_ino) return b->time;
+#ifndef __EMSCRIPTEN__
     struct statx sx;
     int ok = fd >= 0 ? statx(fd, "", AT_EMPTY_PATH, STATX_BTIME, &sx) :
                       statx(AT_FDCWD, path, 0, STATX_BTIME, &sx);
     if (!ok && (sx.stx_mask & STATX_BTIME))
         return (struct timespec){(time_t)sx.stx_btime.tv_sec, (long)sx.stx_btime.tv_nsec};
+#else
+    /* MEMFS exposes no statx birth time. Preserve explicit DOS overrides
+     * above, otherwise use the same ctime fallback as a Linux FS without it. */
+    (void)path;
+    (void)fd;
+#endif
     return st->st_ctim;
 }
 
@@ -1616,7 +1623,16 @@ static int rename_file(void)
     }
     /* Unlike POSIX rename(), DOS must never overwrite an existing name.
      * Linux's atomic NOREPLACE also closes the destination-existence race. */
+#ifdef __EMSCRIPTEN__
+    /* MEMFS has no competing process, so this check and rename are atomic
+     * with respect to VC. lstat also refuses a dangling destination symlink. */
+    struct stat target_st;
+    if (lstat(target, &target_st) == 0) return 80;
+    if (errno != ENOENT) return dos_errno(errno);
+    if (rename(old, target) < 0) return dos_errno(errno);
+#else
     if (renameat2(AT_FDCWD, old, AT_FDCWD, target, RENAME_NOREPLACE) < 0) return dos_errno(errno);
+#endif
     for (unsigned i = 0; i < DOS_DRIVES; ++i) {
         if (!drive_present(i)) continue;
         rebase_path(drives[i].cwd, old, target);

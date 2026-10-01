@@ -21,6 +21,33 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+/* Only these byte-oriented hooks cross into the page. xterm parses writes
+ * asynchronously, so the output callback must own its copy of wasm memory. */
+EM_JS(void, browser_write, (const char *data, size_t n), {
+    if (Module['vcOutput']) Module['vcOutput'](HEAPU8.slice(data, data + n));
+});
+
+EM_JS(int, browser_read, (uint8_t *data, size_t capacity), {
+    if (!Module['vcReadInput']) return 0;
+    var bytes = Module['vcReadInput'](capacity);
+    if (!bytes || !bytes.length) return 0;
+    if (bytes.length > capacity) throw new Error('VC input exceeds capacity');
+    HEAPU8.set(bytes, data);
+    return bytes.length;
+});
+
+static uint64_t last_browser_yield;
+
+static void browser_output(const char *data, size_t n, void *opaque)
+{
+    (void)opaque;
+    browser_write(data, n);
+}
+#endif
+
 enum { SCREEN = 0xb8000, MAX_CELLS = 0x4000, ESC_DELAY = 30 };
 enum { MOD_SHIFT = 1, MOD_ALT = 2, MOD_CTRL = 4, MOD_CAPS = 64,
        MOD_NUM = 128 };
@@ -484,10 +511,17 @@ void term_init(void)
         atexit(term_shutdown);
         exit_registered = 1;
     }
+#ifdef __EMSCRIPTEN__
+    term_set_output(browser_output, NULL);
+    term_set_truecolor(1);
+    term_reset_input();
+    emit_string("\033[?7l\033=\033[?25l");
+#else
     const char *color = getenv("COLORTERM");
     term_set_truecolor(color && (!strcasecmp(color, "truecolor") ||
                                 !strcasecmp(color, "24bit")));
     acquire_terminal();
+#endif
 }
 
 void term_suspend(void)
@@ -1182,6 +1216,12 @@ void term_flush_input(void)
     /* DOS flush discards characters, not physical modifier state. Consume
      * the reports already queued in the tty so a flushed release cannot leave
      * Shift/Ctrl/Alt stuck. The caller then empties the resulting BIOS words. */
+#ifdef __EMSCRIPTEN__
+    uint8_t bytes[4096];
+    int n;
+    while ((n = browser_read(bytes, sizeof(bytes))) > 0)
+        term_feed_input(bytes, (size_t)n, monotonic_ms());
+#else
     int queued = 0;
     if (active && ioctl(STDIN_FILENO, FIONREAD, &queued) == 0) {
         while (queued > 0) {
@@ -1199,6 +1239,7 @@ void term_flush_input(void)
     } else if (active) {
         tcflush(STDIN_FILENO, TCIFLUSH);
     }
+#endif
     input_used = 0;
 }
 
@@ -1217,6 +1258,9 @@ void term_idle(int timeout_ms)
     uint64_t deadline = monotonic_ms() + (unsigned)timeout_ms;
     term_render();
     feed_ring();
+#ifdef __EMSCRIPTEN__
+    int yielded = 0;
+#endif
     for (;;) {
         uint64_t now = monotonic_ms();
         term_expire_input(now);
@@ -1231,6 +1275,42 @@ void term_idle(int timeout_ms)
             if (wait_ms > esc_wait)
                 wait_ms = esc_wait;
         }
+#ifdef __EMSCRIPTEN__
+        uint8_t bytes[4096];
+        int n = browser_read(bytes, sizeof(bytes));
+        if (n > 0) {
+            term_feed_input(bytes, (size_t)n, monotonic_ms());
+            term_render();
+            if (!input_used || timeout_ms == 0)
+                return;
+        }
+        now = monotonic_ms();
+        term_expire_input(now);
+        term_render();
+        if (rd16(0x40, 0x1a) != rd16(0x40, 0x1c))
+            return;
+        if (timeout_ms == 0) {
+            /* VC polls between directory entries while doing real work.
+             * Yield at most once per frame, then poll the newly delivered
+             * events once more. Never put this sleep in RT_TICK/rt_yield:
+             * Asyncify deliberately ignores the indirect Image.run calls. */
+            if (!yielded && now - last_browser_yield >= 16) {
+                last_browser_yield = now;
+                emscripten_sleep(0);
+                yielded = 1;
+                continue;
+            }
+            return;
+        }
+        if (now >= deadline)
+            return;
+        if ((uint64_t)wait_ms > deadline - now)
+            wait_ms = (int)(deadline - now);
+        if (wait_ms > 10)
+            wait_ms = 10;
+        last_browser_yield = now;
+        emscripten_sleep(wait_ms);
+#else
         struct pollfd descriptor = {STDIN_FILENO, POLLIN, 0};
         int no_input = input_eof || (initialized && !active);
         int ready = poll(no_input ? NULL : &descriptor, no_input ? 0 : 1, wait_ms);
@@ -1255,5 +1335,6 @@ void term_idle(int timeout_ms)
         if (monotonic_ms() >= deadline ||
             rd16(0x40, 0x1a) != rd16(0x40, 0x1c))
             return;
+#endif
     }
 }

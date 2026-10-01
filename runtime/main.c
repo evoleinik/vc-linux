@@ -11,12 +11,21 @@
 #include "hle.h"
 #include "rt.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include "term.h"
+
+EM_JS(void, browser_exit, (int status), {
+    if (Module['vcExit']) Module['vcExit'](status);
+});
+#else
 static void usage(void) {
     fputs("usage: vc [DIRECTORY]\n"
           "Volkov Commander 4.99.09, translated from 8086 assembly to native code.\n"
           "Settings live in $XDG_CONFIG_HOME/vc-linux (default ~/.config/vc-linux).\n"
           "A log is written to $VC_LOG (default ~/.cache/vc-linux/vc.log).\n", stdout);
 }
+#endif
 
 static int mkdirs(char *path) {
     for (char *p = path + 1; *p; p++) {
@@ -70,6 +79,20 @@ static void install_files(const char *dir) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __EMSCRIPTEN__
+    (void)argc;
+    (void)argv;
+    /* Settings and the log live outside H:, so the demo drive shows only
+     * the demo files. */
+    char cache[] = "/var/vc/cache";
+    if (setenv("HOME", "/home/vc", 1) ||
+        setenv("XDG_CONFIG_HOME", "/var/vc/config", 1) ||
+        setenv("XDG_CACHE_HOME", cache, 1) ||
+        mkdirs(cache) || chdir("/home/vc")) {
+        fprintf(stderr, "vc: cannot prepare browser home: %s\n", strerror(errno));
+        return 1;
+    }
+#else
     if (argc > 2 || (argc == 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")))) {
         usage();
         return argc > 2 ? 2 : 0;
@@ -85,6 +108,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "vc: %s: %s\n", argv[1], strerror(errno));
         return 1;
     }
+#endif
 
     char dir[4096];
     const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
@@ -104,6 +128,12 @@ int main(int argc, char **argv) {
     dos_fs_init();
     term_init();
     atexit(term_shutdown);
+#ifdef __EMSCRIPTEN__
+    /* The browser supplies kitty key reports itself. Feed the query reply
+     * after term_init has reset the parser so modifier events stay enabled. */
+    static const uint8_t kitty_reply[] = "\033[?0u";
+    term_feed_input(kitty_reply, sizeof kitty_reply - 1, 0);
+#endif
     rt_log("start: %s", host_prog);
     /* Base-memory mode: no swap file, no EMS or XMS to find. The TSR manager
      * guards against DOS programs that stay resident, which cannot happen here. */
@@ -111,5 +141,8 @@ int main(int argc, char **argv) {
     dos_start(host_prog, (const uint8_t *)tail, (int)sizeof tail - 1);
     rt_run();
     term_shutdown();
+#ifdef __EMSCRIPTEN__
+    browser_exit(rt_exit_code);
+#endif
     return rt_exit_code;
 }

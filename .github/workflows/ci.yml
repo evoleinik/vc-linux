@@ -19,6 +19,36 @@ jobs:
       - run: make
       - run: make test
 
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - uses: mymindstorm/setup-emsdk@v16
+        with:
+          version: 4.0.2
+      - run: make web
+      - run: make test-web
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: build/web
+
+  # The browser build, served by GitHub Pages
+  pages:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, web]
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v5
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test

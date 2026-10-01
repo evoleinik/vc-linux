@@ -3,6 +3,8 @@
 #   make gen      translate both images to C (build/gen/)
 #   make          build the native binary build/vc
 #   make test     run every test suite
+#   make web      build the self-contained browser toy in build/web/
+#   make test-web run its Node/MEMFS smoke test
 
 JWASM   := tools/jwasm/jwasm
 JFLAGS  := -q -Zg -Zne -DOFFICIAL
@@ -121,3 +123,40 @@ clean:
 	rm -rf $(B)
 
 .PHONY: test-e2e
+
+# ---- the browser toy -------------------------------------------------------
+# Needs Emscripten on PATH (emsdk_env.sh). Native targets never call emcc.
+EMCC    ?= emcc
+NODE    ?= node
+WEB_OPT ?= -O2
+WEB_OUT ?= $(B)/web
+WEB_WORK := $(WEB_OUT)-work
+WEB_DEMO := $(WEB_WORK)/demo
+WEB_FLAGS := $(WEB_OPT) -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 \
+             -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,node -sFORCE_FILESYSTEM \
+             -sEXPORTED_RUNTIME_METHODS='["FS","ENV"]'
+WEB_DEMO_INPUT := web/README.TXT README.md asm/VC.ASM asm/VCOVL.ASM asm/LICENSE.TXT tools/web_demo.py
+WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT HISTORY.TXT SRC/VC.ASM SRC/VCOVL.ASM SRC/LICENSE.TXT GAMES/NOTHING.TXT)
+WEB_ASSETS := web/index.html web/vc-web.js $(wildcard web/vendor/*)
+WEB_COPIES := $(patsubst web/%,$(WEB_OUT)/%,$(WEB_ASSETS))
+
+# Grouped targets keep both the demo preparation and the single emcc link safe
+# under make -j.
+$(WEB_DEMO_FILES) &: $(WEB_DEMO_INPUT)
+	$(PY) tools/web_demo.py $(WEB_DEMO)
+
+$(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm &: $(RT_SRC) $(wildcard runtime/*.h) $(GEN_SRC) $(WEB_DEMO_FILES) Makefile
+	@mkdir -p $(WEB_OUT)
+	$(EMCC) $(WEB_FLAGS) \
+	  -std=gnu11 -Iruntime $(RT_SRC) $(GEN_SRC) --embed-file $(WEB_DEMO)@/home/vc -o $(WEB_OUT)/vc.mjs
+
+$(WEB_OUT)/%: web/%
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+web: $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm $(WEB_COPIES)
+
+test-web: web
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs
+
+.PHONY: web test-web
