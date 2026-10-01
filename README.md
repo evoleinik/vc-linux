@@ -1,88 +1,130 @@
 # vc-linux
 
-Volkov Commander 4.99.09, the DOS file manager, running natively on Linux. Its original 8086
-assembly is translated to C by machine. The DOS and BIOS services it calls are reimplemented in C
-on top of Linux. No emulator runs at run time.
+**Volkov Commander, the DOS file manager, running natively on Linux.**
 
-![VC on Linux: panels on / and asm/, with the Copy dialog open](docs/screenshot.png)
+![Volkov Commander on Linux: two panels, the Copy dialog open](docs/screenshot.png)
 
-Design and decisions: `docs/plans/2026-09-30-native-port.md`.
+Volkov Commander was the fast, tiny Norton Commander clone that half of the 1990s ran on DOS. Its
+author released the source under BSD-2 in 2026. This project turns that 8086 assembly into C by
+machine, then reimplements the DOS and BIOS services it calls on top of Linux. The binary that
+comes out is native x86-64 code. No emulator runs at run time. You manage real Linux files with
+the real VC: the same keys, colours, dialogs and quirks.
 
-## Run it
+## Why not DOSBox, mc or far2l?
 
+| | Runs the original VC code | Works on your real files | Native, no emulator |
+|---|---|---|---|
+| DOSBox, dosemu2, js-dos | yes | no: a fake drive, 8.3 names | no |
+| Midnight Commander, far2l | no: different programs | yes | yes |
+| **vc-linux** | **yes: translated instruction by instruction** | **yes, long and Cyrillic names** | **yes** |
+
+## Quick start
+
+    git clone https://github.com/evoleinik/vc-linux && cd vc-linux
     uv sync && make
-    build/vc [DIRECTORY]
+    build/vc
 
-It needs a terminal of at least 80x25. For the exact VGA colours, set `COLORTERM=truecolor`.
-Settings live in `~/.config/vc-linux/` and a log goes to `~/.cache/vc-linux/vc.log`.
+You need Linux on x86-64, gcc, make and [uv](https://docs.astral.sh/uv/), plus a terminal of at
+least 80×25. Set `COLORTERM=truecolor` for the exact VGA palette.
 
-What works: both panels on real files with long and Cyrillic names, view (F3), edit (F4, opens
-`$EDITOR`), copy (F5), rename and move (F6), make directory (F7), delete (F8), menus and dialogs,
-the mouse, and commands typed on VC's command line. Those run in `/bin/sh` with the terminal
-handed back, and `cd` changes VC's directory the way `COMMAND.COM` did.
+`build/vc [DIRECTORY]` opens in that directory. Settings live in `~/.config/vc-linux/` and a log
+goes to `~/.cache/vc-linux/vc.log`.
 
-VC 4.99.09's own editor is switched off in its source, so F4 uses `VCEDIT.EXT`, which maps every
-file to the internal `vc-edit` command. That command hands the file name to `$EDITOR` as a single
-argument, never through a shell.
+## What works
 
-**Careful with your own `VC.EXT` or `VCEDIT.EXT` entries.** VC pastes the file name in place of
-`!.!` and the line runs through `/bin/sh`, so a file named `$(rm -rf ~).zip` would run that
-command. The shipped `VC.EXT` is empty for that reason.
+| Key | Action | Notes |
+|---|---|---|
+| F3 | View | VC's own viewer |
+| F4 | Edit | opens `$EDITOR` (VC 4.99.09's own editor is disabled in its source) |
+| F5, F6 | Copy, rename or move | long and Cyrillic names kept |
+| F7, F8 | Make directory, delete | F8 on a symlink removes only the link |
+| Alt-F10 | Directory tree | scans the whole drive, so use it on `H:` |
+| Ins, Grey + − * | Select files | grey keys need application keypad mode, which vc turns on |
+| Command line | Runs in `/bin/sh` | `cd` moves VC's panel like `COMMAND.COM` did; `cd ~` works |
+| Mouse | Click to move the cursor | SGR mouse reporting |
 
-Drive `C:` is `/`. Names are shown in code page 866.
+Drives: `C:` is `/` and `H:` is your home directory. Names are shown in code page 866, so Cyrillic
+displays correctly.
 
-## Build and test
+## Why shouldn't I use it?
 
-    uv sync            # Python tools: capstone, unicorn, pytest, pyte
-    make images        # assemble VC.COM and VC.OVL from asm/ with JWasm
-    make gen           # translate both to C in build/gen/
-    make               # build build/vc
-    make test          # every suite below
-
-| Suite | What it proves |
-|---|---|
-| `make test-translator` | All 43,137 distinct instructions match unicorn from 32 random states each. `PutTime` matches the original on all 131,072 inputs. |
-| `make test-fs` | The DOS file layer, register by register, against a temporary tree. |
-| `make test-term` | Key parsing, the screen renderer, BIOS video, keyboard and mouse. |
-| `make test-ini` | The shipped `VC.INI` passes VC's checksum and suits Linux. |
-| `make test-e2e` | `build/vc` in a pseudo-terminal: the terminal shows exactly what is in video memory, and view, mkdir, copy, rename, delete and shell commands work on disk. |
+- **It is VC 4.99.09, an alpha from 2000.** Its own editor is switched off in the source. Some
+  menus point at DOS things that do not exist here, such as EMS memory and archivers.
+- **DOS limits stay.** A command line holds 126 bytes, and vc refuses a longer one rather than run
+  a truncated command. Characters with no code page 866 form, the characters DOS forbids in names
+  (`\ / : * ? " < > |`) and trailing spaces or dots cannot be spelled in DOS. Those names show as
+  `name■~1A2B.txt`, with a stable suffix that always reaches the right file.
+- **The screen is 80×25.** It does not resize with your terminal.
+- **Ctrl-O shows VC's own screen.** It does not show what your last shell command printed.
+- **Holding Shift, Ctrl or Alt changes the key bar** only on terminals that speak the kitty
+  keyboard protocol.
+- **Only Linux on x86-64 is tested.**
 
 ## How it works
 
-- `translator/` reads the JWasm listing for instruction boundaries. It decodes the linked bytes
-  with capstone and emits one C statement group per instruction, flags included.
-- `runtime/rt.c` is the dispatcher. Translated code runs until a transfer it cannot follow
-  statically. The dispatcher then finds the image at CS:IP, or a C interrupt handler stub.
-  Code VC copied elsewhere is matched by its bytes.
-- `runtime/dos_core.c` holds the MCB chain, PSPs, EXEC and terminate. VC's own tricks run as
-  written: splitting its MCB, popping its return address, running `VC.OVL` as a child.
-- `runtime/dos_fs.c` maps INT 21h file calls, including the 71xxh long-name family, to Linux.
-- `runtime/bios.c` and `runtime/term.c` handle video memory to ANSI output, and terminal input
-  to the BIOS keyboard buffer and mouse.
+```mermaid
+flowchart LR
+  ASM[VC.ASM, VCOVL.ASM] -->|JWasm| IMG[VC.COM, VC.OVL + listings]
+  IMG -->|translator: listing + capstone| GEN[C, one function per procedure]
+  GEN --> BIN[build/vc]
+  RT[runtime: memory, dispatcher, MCBs, PSPs, EXEC] --> BIN
+  FS[DOS file layer on Linux] --> BIN
+  TERM[BIOS video, keyboard, mouse on a terminal] --> BIN
+```
 
-## Layout
+- **The translator** (`translator/`) reads instruction boundaries from the assembler listing and
+  decodes the linked bytes with capstone. It emits C for each instruction, flags included. It
+  also decodes bytes the CPU runs that the listing calls data. VC starts by executing the text
+  `RESIDENT`.
+- **The runtime** (`runtime/rt.c`, `runtime/dos_core.c`) keeps the machine faithful: a 1 MB
+  memory array, a real stack, a real interrupt vector table, MCB chain and PSPs. VC's tricks run
+  as written. It runs VC.OVL as a child process, splits its own memory block, and copies its
+  resident code elsewhere. The dispatcher finds that copied code by its bytes.
+- **The DOS file layer** (`runtime/dos_fs.c`) maps INT 21h file calls, including the 71xxh
+  long-name family, to Linux.
+- **The BIOS layer** (`runtime/bios.c`, `runtime/term.c`) draws video memory to the terminal as
+  ANSI output, and feeds terminal input into the BIOS keyboard buffer.
 
-- `asm/` VC 4.99.09 sources, BSD-2 by Vsevolod V. Volkov, from the ddanila/vc build branch.
-- `translator/` Python: JWasm listing + linked image to C.
-- `runtime/` C: machine state, dispatcher, loader, DOS and BIOS services, terminal.
-- `data/` default `VC.INI` (written by VC itself), `VC.EXT`, `VC.HLP`.
-- `tools/` JWasm, `embed.py`, `vcini.py` (edit VC.INI safely), `snapshot.py` (screen to HTML).
-- `tests/` all suites. `tests/spike_puttime/` is the first proof.
+The full design and every decision are in `docs/plans/2026-09-30-native-port.md`.
+
+## Tests
+
+    make test
+
+| Suite | What it proves |
+|---|---|
+| `test-translator` | All 43,000 distinct instructions in both programs match the unicorn CPU emulator from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
+| `test-fs` | The DOS file layer, register by register: about 3,500 checks against a temporary tree. |
+| `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,500 checks. |
+| `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
+| `test-e2e` | `build/vc` in a pseudo-terminal: the terminal shows exactly what is in video memory, and view, copy, rename, delete, F4, the mouse and shell commands work on disk. |
+
+Every finding from the three code reviews was fixed with a test that failed on the old code first.
 
 ## Debugging
 
 - `VC_TRACE=1 build/vc` logs every INT 21h call with its string argument and result.
 - `kill -USR1 <pid>` logs the registers and the last 256 addresses the dispatcher ran.
 - `VC_SCREEN_DUMP=file` writes video memory as text after every render.
-- A fatal error prints the registers, stack and code bytes, and exits 70.
 
-## Notes for AI agents
+## Layout
 
-- `runtime/cpu.h`, `runtime/image.h` and `runtime/hle.h` are the contracts between the translator,
-  the runtime and the DOS/BIOS layer. Change them deliberately, never in passing.
-- Never trust a translation without the unicorn gate.
-- DOS paths are limited to about 126 characters on a command line. Tests use short temporary
-  paths for that reason.
-- Change `data/VC.INI` with `tools/vcini.py` or by saving from VC (Shift-F9). A bad checksum makes
-  VC ignore the whole file.
-- Use `.venv/bin/python`, never a global pip.
+- `asm/` VC 4.99.09 sources by Vsevolod V. Volkov, BSD-2, from the
+  [ddanila/vc](https://github.com/ddanila/vc) build branch.
+- `translator/` Python: JWasm listing plus linked image to C.
+- `runtime/` C: machine state, dispatcher, loader, DOS and BIOS services, terminal.
+- `data/` default `VC.INI` (written by VC itself), `VCEDIT.EXT`, `VC.HLP`.
+- `tools/` JWasm, `vcini.py` (edit VC.INI safely), `snapshot.py` (screen to HTML),
+  `social_preview.py`.
+- `tests/` all suites. `tests/spike_puttime/` is the first proof that translation works.
+- `docs/` the plan and the work briefs that built this.
+
+## Credits and license
+
+Volkov Commander is by Vsevolod V. Volkov, who released the sources under the BSD 2-Clause
+license in 2026 (`asm/LICENSE.TXT`). Danila Sukharev preserved them and made them build with
+JWasm in [ddanila/vc](https://github.com/ddanila/vc). JWasm is by Andreas Grech and others, under
+the Sybase Open Watcom Public License (`tools/jwasm/README.md`).
+
+The translator, runtime and tests are BSD 2-Clause (`LICENSE`). They were built with Claude Code
+and OpenAI Codex.

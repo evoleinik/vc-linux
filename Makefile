@@ -104,6 +104,11 @@ $(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h runtime/rt.h
 $(B)/vc: $(RT_SRC) $(wildcard runtime/*.h) $(B)/obj/vc_com.o $(B)/obj/vc_ovl.o $(B)/obj/files.o
 	$(CC) $(CFLAGS) -std=gnu11 -Iruntime -o $@ $(RT_SRC) $(B)/obj/vc_com.o $(B)/obj/vc_ovl.o $(B)/obj/files.o
 
+# The release binary: static and stripped, so it runs on any x86-64 Linux.
+$(B)/vc-static: $(RT_SRC) $(wildcard runtime/*.h) $(B)/obj/vc_com.o $(B)/obj/vc_ovl.o $(B)/obj/files.o
+	$(CC) -O2 -static -std=gnu11 -Iruntime -o $@ $(RT_SRC) $(B)/obj/vc_com.o $(B)/obj/vc_ovl.o $(B)/obj/files.o
+	strip $@
+
 test-e2e: $(B)/vc
 	$(PY) -m pytest -q tests/test_e2e.py
 
