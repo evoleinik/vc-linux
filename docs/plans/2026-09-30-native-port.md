@@ -156,9 +156,11 @@ tree scan 76 times slower. Every path lookup also listed its whole directory.
 
 ## Questions for Eugene
 
-1. **Drives.** `C:` maps to `/`. Should `H:` map to your home directory as well?
-2. **Date and time format.** The panels default to `YYYY-MM-DD` and 24-hour time. Would you
-   rather follow your locale or keep VC's US default?
-3. **Code page.** 866 shows Cyrillic file names. 437 matches the look of English DOS. Which one?
-4. **Publishing.** Should this go to a private GitHub repo now, or a public fork of ddanila/vc once
-   it runs?
+1. **Drives.** Answer (2026-10-01): add `H:` for the home directory. `C:` stays `/`.
+2. **Date and time format.** Answer: `DD.MM.YY`, 24-hour.
+3. **Code page.** Answer: 866.
+4. **Publishing.** Answer: a public repo, github.com/evoleinik/vc-linux.
+
+## Decision — 2026-10-01
+
+Translation stays the approach, and it shipped. Defaults follow the answers above.
