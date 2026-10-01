@@ -7,6 +7,7 @@ import { readFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isMainThread, parentPort, Worker } from 'node:worker_threads';
+import { fakeBBS, fixtureReplies } from './fake_bbs.mjs';
 
 function exitAfterOutput(code) {
   // Worker and main-thread stdout can both be asynchronous when CI captures
@@ -41,6 +42,7 @@ const modulePath = moduleArgument
 const fetchFailure = process.argv.includes('--fetch-failure');
 const fetchTimeout = process.argv.includes('--fetch-timeout');
 const memoryLimit = process.argv.includes('--memory-limit');
+const kermitOnly = process.argv.includes('--kermit-only');
 const programDeadlines = [];
 const realSetTimeout = globalThis.setTimeout;
 if (fetchTimeout) {
@@ -56,6 +58,10 @@ if (fetchTimeout) {
   };
 }
 const moduleURL = pathToFileURL(modulePath);
+const modemSource = readFileSync(resolve(dirname(modulePath), 'modem.js'), 'utf8');
+const { createModemTransport } = await import(`data:text/javascript,${encodeURIComponent(modemSource)}`);
+const bbs = fakeBBS();
+const modem = createModemTransport({ WebSocketClass: bbs.WebSocketClass });
 const loader = readFileSync(resolve(dirname(modulePath), 'vc-web.js'), 'utf8');
 const buildHash = loader.match(/locateFile:[^\n]*\?v=([0-9a-f]+)/)?.[1];
 assert.ok(buildHash, 'the built page must supply a versioned wasm URL resolver');
@@ -85,18 +91,20 @@ let sourceKeyReducer;
 let sourceInitialInput;
 const sourceFetches = [];
 const originalSources = new Map();
-const programModules = ['gwbasic.wasm', 'bootlogo.wasm', 'rogue.wasm', 'vz.wasm'];
+const programModules = ['gwbasic.wasm', 'bootlogo.wasm', 'rogue.wasm', 'vz.wasm', 'kermit.wasm'];
 const programFiles = new Map(readdirSync(dirname(modulePath)).flatMap((name) => {
-  const match = name.match(/^(gwbasic|bootlogo|rogue|vz)\.([0-9a-f]{12})\.wasm$/);
+  const match = name.match(/^(gwbasic|bootlogo|rogue|vz|kermit)\.([0-9a-f]{12})\.wasm$/);
   return match ? [[`${match[1]}.wasm`, name]] : [];
 }));
-assert.equal(programFiles.size, 4, 'all side modules have immutable build-hash filenames');
+assert.equal(programFiles.size, 5, 'all side modules have immutable build-hash filenames');
 const moduleFetches = [];
 const expectedFetches = [];
 let heldDownload = null;
 const speakerEvents = [];
 const faultMessage = 'No translated code at 0000:0000. GWBASIC.EXE stopped.';
 let sawFaultMessage = false;
+let sawBBSBanner = false;
+let sawModemConnect = false;
 let graphics = null;
 let graphicsFrames = 0;
 let textTransitions = 0;
@@ -131,6 +139,8 @@ function observe() {
     try {
       screen = vc.FS.readFile(screenPath, { encoding: 'utf8' });
       if (screen.includes(faultMessage)) sawFaultMessage = true;
+      if (screen.includes('ENiGMA') && screen.includes('BBS version')) sawBBSBanner = true;
+      if (screen.includes('CONNECT 14400')) sawModemConnect = true;
     } catch (error) {
       if (error.code !== 'ENOENT' && error.errno !== 44) throw error;
     }
@@ -508,7 +518,7 @@ async function quitRogue() {
 async function selectFile(name) {
   // The status row, not the listing (where every name is always visible),
   // identifies the active selection. Advance only after the last key landed.
-  for (let step = 0; step < 24; step++) {
+  for (let step = 0; step < 40; step++) {
     const previous = selected(screen);
     if (previous.includes(name)) return;
     send('\x1b[B');
@@ -525,6 +535,58 @@ async function quitVC() {
   await until('the JavaScript exit hook', () => exitCalls > 0);
   assert.equal(exitCalls, 1, 'the exit hook fires exactly once');
   assert.equal(exitCode, 0, 'VC exits successfully');
+}
+
+async function checkKermit() {
+  stage = 'Kermit BBS.TAK association and lazy module';
+  assert.equal(bbs.calls.length, 0, 'no WebSocket opens before a Hayes dial');
+  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/KERMIT.EXE')),
+    readFileSync(new URL('../build/kermit/KERMIT.EXE', import.meta.url)),
+    'H: contains the complete source-built DOS executable, not a placeholder');
+  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/BBS.TAK')),
+    readFileSync(new URL('../data/BBS.TAK', import.meta.url)), 'the shipped TAKE file is installed');
+  send('\x1b[H');
+  await until('home selection before BBS.TAK', text => /\.\.|BBS|GAMES/.test(selected(text)));
+  await selectFile('BBS.TAK');
+  expectedFetches.push('kermit.wasm');
+  send('\r');
+  await releaseProgramFetch('kermit.wasm');
+  await until('Kermit renders the captured ENiGMA / BBS version banner', () => sawBBSBanner);
+  assert.equal(bbs.calls.length, 1, 'ATDT opened exactly one WebSocket');
+  const call = bbs.calls[0];
+  assert.deepEqual(Uint8Array.from(call.replies), fixtureReplies,
+    'the shared C modem answers the captured telnet negotiation exactly');
+  await until('the fake BBS finishes its fixture replay', text => text.includes('TEST BBS READY'));
+  console.log('PASS Kermit dial: Enter on BBS.TAK lazy-loads Kermit and renders ENiGMA / BBS version');
+
+  stage = 'Kermit bidirectional terminal data';
+  send('hello-bbs\r');
+  await until('typed text reaches the fake BBS and its echo reaches Kermit', text =>
+    call.text.includes('hello-bbs\r') && text.includes('BBS ECHO: hello-bbs'));
+  console.log('PASS Kermit data: typed text traverses UART, modem and binary WebSocket in both directions');
+
+  stage = 'Kermit guarded Hayes escape and hangup';
+  // These waits are part of the Hayes protocol, not guesses about UI state.
+  await new Promise(done => realSetTimeout(done, 1100));
+  send('+++');
+  await until('the one-second post-escape guard gives OK', text => /\bOK\b/.test(text));
+  send('ATH\r');
+  await until('ATH prints NO CARRIER and closes the transport', text =>
+    text.includes('NO CARRIER') && call.closed);
+  assert.ok(!call.text.includes('+++') && !call.text.includes('ATH'),
+    'escape and hangup commands must not leak to the BBS');
+  console.log('PASS Kermit hangup: guarded +++, ATH, NO CARRIER and WebSocket close');
+
+  stage = 'Kermit EXIT restores VC panels';
+  send('\x1d');
+  await until('Kermit offers its single-character escape commands', text => text.includes('Command>'));
+  send('C');
+  await until('Ctrl-] then C returns to the Kermit command prompt', text => text.includes('MS-Kermit>'));
+  send('EXIT\r');
+  await until('EXIT returns to VC with both panels redrawn', isPanel);
+  assert.equal(exitCalls, 0, 'Kermit exits only its DOS child');
+  assertFetches();
+  console.log('PASS Kermit exit: Ctrl-] C, EXIT restores VC panels');
 }
 
 async function checkFetchFailures() {
@@ -797,7 +859,7 @@ try {
     wasmBinary,
     // Match main's declared minimum, but prohibit all growth. The pressure
     // and fragmentation scenarios then consume real allocations in this cap.
-    ...(memoryLimit ? { wasmMemory: new WebAssembly.Memory({ initial: 768, maximum: 768 }) } : {}),
+    ...(memoryLimit ? { wasmMemory: new WebAssembly.Memory({ initial: 1024, maximum: 1024 }) } : {}),
     instantiateWasm(imports, receiveInstance) {
       const compiled = new WebAssembly.Module(wasmBinary);
       const instance = new WebAssembly.Instance(compiled, imports);
@@ -806,6 +868,7 @@ try {
     },
     locateFile: (name) => new URL(`${name}?v=${buildHash}`, moduleURL).href,
     vcFetchProgram: fetchFailure || fetchTimeout ? undefined : fetchProgramBytes,
+    vcModem: modem,
     ...(fetchTimeout ? { vcProgramFetchTimeoutMs: 100 } : {}),
     preRun: [(module) => {
       vc = module;
@@ -858,6 +921,14 @@ try {
     'GW-BASIC is an actual MZ file on H:');
   assert.ok(!vc.FS.analyzePath('/home/vc/GAMES/NOTHING.TXT').exists);
   console.log('PASS 1: startup shows 10Quit and README on H:');
+
+  if (kermitOnly) {
+    await checkKermit();
+    await quitVC();
+    console.log('web Kermit smoke: dial, captured ANSI, duplex typing, guarded hangup and VC return passed');
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
 
   if (fetchFailure || fetchTimeout || memoryLimit) {
     if (fetchFailure) await checkFetchFailures();
@@ -1374,8 +1445,11 @@ try {
   send('Y');
   await until('VC panels after the second VZ child', isPanel);
   assertFetches();
-  assert.deepEqual(expectedFetches, programModules, 'all four programs fetched exactly once');
+  assert.deepEqual(expectedFetches, programModules.slice(0, 4), 'the first four programs fetched exactly once');
   console.log('PASS 25: typed vz NEW.TXT creates and saves a real H: file');
+
+  await checkKermit();
+  assert.deepEqual(expectedFetches, programModules, 'all five programs fetched exactly once');
 
   stage = '25b cached BASIC after loading every side module';
   send('gwbasic\r');
@@ -1391,7 +1465,7 @@ try {
   const peak = wasmExports.sbrk(0);
   console.log(`PASS memory: peak ${peak} bytes; INITIAL_MEMORY ${startupHeapBytes} bytes; headroom ${startupHeapBytes - peak} bytes; heap ${startupHeapBytes} -> ${vc.HEAPU8.byteLength}`);
   assert.equal(vc.HEAPU8.byteLength, startupHeapBytes,
-    'INITIAL_MEMORY must cover loading all four programs without heap growth');
+    'INITIAL_MEMORY must cover loading all five programs without heap growth');
   // The measured peak depends on load order: emmalloc asks sbrk for a whole
   // new block when no free block fits. Bound every order: each load's guard
   // may take a fresh 2N + 64 KiB above the startup heap top.

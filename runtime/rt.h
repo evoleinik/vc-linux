@@ -62,5 +62,8 @@ void dos_start(const char *host_prog, const uint8_t *tail, int tail_len);
 typedef struct { const char *name; const uint8_t *data; uint32_t size; } EmbeddedFile;
 extern const EmbeddedFile embedded_files[];
 extern const int embedded_file_count;
+/* Reuse the main images' immutable load bytes to materialize their complete
+ * browser files before installation. Native builds already embed each file. */
+void embedded_files_init(void);
 
 #endif

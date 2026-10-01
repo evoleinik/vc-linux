@@ -110,6 +110,7 @@ function harness(layoutFunction, screenMetric = size => ({ width: 40 * size, hei
     pageText: () => ({}), initialInput: () => ({}),
     reduceInput: state => ({ state, bytes: '' }),
     createSpeaker: () => ({ unlock() {} }),
+    createModemTransport: () => ({ close() {} }),
     terminalDouble: terminal,
     toggleDouble: () => { toggles++; return Promise.resolve(); },
     screenLayout: layoutFunction,

@@ -66,7 +66,7 @@ people log in (a handle and password, or GitHub), and what saved state means.
 
 ## Decision — 2026-10-01
 
-- **Client:** MS-DOS Kermit, translated, on H:. A virtual Hayes modem on COM1 bridges `ATDT` to a
+- **Client:** MS-DOS Kermit, translated, on the browser's H:. A virtual Hayes modem on COM1 bridges `ATDT` to a
   WebSocket in the page, or TCP on Linux, at `bbs.notanemulator.com`.
 - **Server:** ENiGMA½ on `axis` behind Traefik with TLS: accounts, boards, private mail, who's
   online, paging and chat. Eugene is the sysop.
@@ -85,3 +85,30 @@ people log in (a handle and password, or GitHub), and what saved state means.
 - The sysop account `eugene` (user 1) was registered before anything was exposed, since the first
   account to apply becomes the sysop.
 - Still to build: MS-DOS Kermit translated, and the virtual modem bridging `ATDT` to that WebSocket.
+
+## Linux dialing — 2026-10-02
+
+The translated client is now available. Start Linux VC with
+`VC_MODEM_555_1992=host:port build/vc`, using a reachable telnet endpoint; Linux has
+no default endpoint. From any directory, type `kermit take bbs.tak, stay` on VC's
+command line. Kermit's own `TAKE` searches the current directory and then DOS `PATH`,
+and `STAY` keeps its prompt open after leaving the terminal. No Kermit source change
+or init-file workaround is needed.
+
+`BBS.TAK` and `KERMIT.TXT` install beside `KERMIT.EXE` and the other files in
+`$XDG_CONFIG_HOME/vc-linux` (default `~/.config/vc-linux`). Existing config scripts
+and guides are preserved. VC does not create, update, move or delete copies directly
+in the real home directory, including legacy copies. The browser still dials by
+pressing Enter on `H:\BBS.TAK`; its H: is a temporary demo drive.
+
+## Outcome — 2026-10-02
+
+- MS-DOS Kermit 3.15 is vendored unedited in `third_party/mskermit/`, assembled with JWasm in
+  MASM 5.1 mode with `no_network`, and translated like VC. The source came from the Wayback
+  Machine copy of Columbia's archive, because Columbia's own server answers 403.
+- The machine has an 8250 UART on COM1 with IRQ 4, INT 14h, and a Hayes modem. `ATDT 555-1992`
+  opens the BBS. The modem speaks telnet itself, since ENiGMA sends telnet over its WebSocket too.
+- Browser: Enter on `H:\BBS.TAK` dials `wss://axis.tail85247.ts.net:8443/`. Linux: type
+  `kermit take bbs.tak, stay` with `VC_MODEM_555_1992=host:port` set. Linux never writes into
+  `$HOME`.
+- Checked live on 2026-10-02: both builds reached the BBS login screen.

@@ -12,6 +12,7 @@
 
 #include "bios.h"
 #include "hle.h"
+#include "modem.h"
 #include "rt.h"
 
 #ifdef __EMSCRIPTEN__
@@ -145,6 +146,33 @@ static double speaker_last_hz;
 static uint64_t timer_next_ns;
 static unsigned timer_pending;
 static int timer_in_service;
+/* The master 8259 is edge triggered. Kermit EOIs before draining RBR, so
+ * treating UART's still-high output as another request would recurse into
+ * the same byte. Masked edges are retained until IF and OCW1 allow delivery. */
+static uint8_t serial_line, serial_pending, serial_in_service, pic_read_isr;
+
+static void serial_edge(void) {
+    int asserted = modem_irq_pending();
+    if (asserted && !serial_line) serial_pending = 1;
+    serial_line = (uint8_t)asserted;
+}
+
+static void serial_poll(uint64_t now) {
+    modem_tick(now);
+    serial_edge();
+}
+
+static void pic_eoi(uint8_t command) {
+    if ((command & 0x60) == 0x60) {
+        /* OCW2 specific EOI, used by Kermit's IRQ 4 handler. */
+        if ((command & 7) == 0) timer_in_service = 0;
+        if ((command & 7) == 4) serial_in_service = 0;
+    } else if (command & 0x20) {
+        /* Non-specific EOI clears only the highest-priority active IRQ. */
+        if (timer_in_service) timer_in_service = 0;
+        else serial_in_service = 0;
+    }
+}
 
 static uint64_t timer_period_ns(void) {
     unsigned divisor = pit[0].reload ? pit[0].reload : 65536u;
@@ -177,6 +205,7 @@ struct RtProcessState {
     uint8_t speaker_control, pic_mask;
     unsigned timer_pending;
     int timer_in_service;
+    uint8_t pic_read_isr;
 };
 
 RtProcessState *rt_save_process_state(const Image *parent) {
@@ -190,6 +219,7 @@ RtProcessState *rt_save_process_state(const Image *parent) {
     state->pic_mask = pic_mask;
     state->timer_pending = timer_pending;
     state->timer_in_service = timer_in_service;
+    state->pic_read_isr = pic_read_isr;
     return state;
 }
 
@@ -202,6 +232,11 @@ void rt_finish_process_state(RtProcessState *state, int restore) {
         pic_mask = state->pic_mask;
         timer_pending = state->timer_pending;
         timer_in_service = state->timer_in_service;
+        pic_read_isr = state->pic_read_isr;
+        /* A forcibly stopped serial child cannot restore its IRQ handler or
+         * drop DTR itself. Disconnect it before returning to VC's vectors. */
+        modem_reset();
+        serial_line = serial_pending = serial_in_service = 0;
         /* Do not replay the child's elapsed time, abandoned IRQ or Break
          * into its parent. Keep the parent's programmed timer frequency. */
         timer_next_ns = monotonic_ns() + timer_period_ns();
@@ -245,7 +280,15 @@ static uint8_t pit_read(unsigned channel) {
 }
 
 uint8_t port_in8(uint16_t port) {
+    if (port >= 0x3f8 && port <= 0x3ff) {
+        serial_poll(monotonic_ns());
+        uint8_t value = modem_port_in(port);
+        serial_edge();
+        return value;
+    }
     switch (port) {
+    case 0x20: return pic_read_isr ? (timer_in_service ? 1 : 0) | (serial_in_service ? 16 : 0)
+                                 : (timer_pending ? 1 : 0) | (serial_pending ? 16 : 0);
     case 0x21: return pic_mask;
     case 0x40: case 0x41: case 0x42: return pit_read(port - 0x40);
     case 0x61: return speaker_control;
@@ -261,7 +304,13 @@ uint8_t port_in8(uint16_t port) {
 }
 uint16_t port_in16(uint16_t port) { return port_in8(port) | (uint16_t)(port_in8((uint16_t)(port + 1)) << 8); }
 void port_out8(uint16_t port, uint8_t v) {
-    if (port >= 0x40 && port <= 0x42) pit_write(port - 0x40, v);
+    if (port >= 0x3f8 && port <= 0x3ff) {
+        /* Port polling may spin inside translated code. Advance the UART
+         * without sleeping or delivering interrupts on that indirect stack. */
+        serial_poll(monotonic_ns());
+        modem_port_out(port, v);
+        serial_edge();
+    } else if (port >= 0x40 && port <= 0x42) pit_write(port - 0x40, v);
     else if (port == 0x43) {
         unsigned channel = v >> 6, access = (v >> 4) & 3;
         if (channel < 3) {
@@ -278,7 +327,11 @@ void port_out8(uint16_t port, uint8_t v) {
     } else if (port == 0x61) {
         speaker_control = v;
         speaker_update();
-    } else if (port == 0x20 && (v & 0x20)) timer_in_service = 0; /* IRQ 0 EOI */
+    } else if (port == 0x20) {
+        if ((v & 0x18) == 0x08) {
+            if (v & 2) pic_read_isr = v & 1; /* OCW3 read IRR/ISR selection. */
+        } else pic_eoi(v);
+    }
     else if (port == 0x21) pic_mask = v;
     else if (port == 0x3D4) crtc_index = v;
     else if (port == 0x3D5) crtc_regs[crtc_index & 31] = v;
@@ -755,7 +808,13 @@ static int do_int(uint8_t n) {
         cpu_int(0x1c, STUB_INT8_RETURN);
         hle_redirect = 1;
         return 1;
+    case 0x0c: pic_eoi(0x64); return 1; /* BIOS stray IRQ 4. */
     case 0x10: bios_int10(); return 0;
+    case 0x14:
+        serial_poll(monotonic_ns());
+        cpu.a.x = modem_bios(cpu.a.h, cpu.a.l, cpu.d.x);
+        serial_edge();
+        return 0;
     case 0x16: bios_int16(); return 0;
     case 0x17: cpu.a.h = 0x01; return 0; /* No printer: timeout, not ready. */
     case 0x33: bios_int33(); return 0;
@@ -891,6 +950,7 @@ static void dispatch_events(void) {
         last_poll = now;
     }
     timer_poll(now);
+    serial_poll(now);
     if (!cpu.ifl) return;
     if (bios_take_break()) {
         rt_halted = 0;
@@ -900,6 +960,11 @@ static void dispatch_events(void) {
         timer_in_service = 1;
         rt_halted = 0;
         cpu_int(0x08, cpu.ip);
+    } else if (serial_pending && !serial_in_service && !timer_in_service && !(pic_mask & 16)) {
+        serial_pending = 0;
+        serial_in_service = 1;
+        rt_halted = 0;
+        cpu_int(0x0c, cpu.ip);
     } else if (rt_halted && rd16(0x40, 0x1a) != rd16(0x40, 0x1c)) {
         rt_halted = 0; /* BIOS keyboard service has already queued the key. */
     }

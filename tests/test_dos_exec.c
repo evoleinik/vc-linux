@@ -22,7 +22,8 @@ static const uint8_t basic_file[] = {'M', 'Z', 2, 0, 0, 0, 0, 0, 0x90, 0xCB};
 static const uint8_t logo_file[] = {0xB8, 0x04, 0x00, 0xCD, 0x10, 0xCD, 0x20};
 static const uint8_t rogue_file[] = {'M', 'Z', 3, 0, 0, 0, 0, 0, 0xB8, 0x00, 0x4C, 0xCD, 0x21};
 static const uint8_t vz_file[] = {0xB8, 0x00, 0x4C, 0xCD, 0x21};
-static const uint8_t association[] = "bas: gwbasic !.!\r\n";
+static const uint8_t kermit_file[] = {'M', 'Z', 4, 0, 0, 0, 0, 0, 0x90, 0x90, 0xCB};
+static const uint8_t association[] = "bas: gwbasic !.!\r\ntak: kermit stay, take !.!\r\n";
 const Image image_vc_com = {.name = "VC.COM", .bytes = vc_file, .size = sizeof vc_file};
 const Image image_vc_ovl = {
     .name = "VC.OVL", .is_exe = 1, .bytes = ovl_file + 8, .size = sizeof ovl_file - 8,
@@ -38,6 +39,10 @@ const Image image_rogue = {
     .hdr_sp = 0x200, .min_alloc = 0x20, .max_alloc = 0x30,
 };
 const Image image_vz = {.name = "VZ.COM", .bytes = vz_file, .size = sizeof vz_file};
+const Image image_kermit = {
+    .name = "KERMIT.EXE", .is_exe = 1, .bytes = kermit_file + 8, .size = sizeof kermit_file - 8,
+    .hdr_sp = 0x100, .min_alloc = 0x10, .max_alloc = 0x20,
+};
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file}, {"VC.EXT", association, sizeof association - 1},
@@ -45,6 +50,7 @@ const EmbeddedFile embedded_files[] = {
     {"BOOTLOGO.COM", logo_file, sizeof logo_file},
     {"ROGUE.EXE", rogue_file, sizeof rogue_file},
     {"VZ.COM", vz_file, sizeof vz_file},
+    {"KERMIT.EXE", kermit_file, sizeof kermit_file},
 };
 const int embedded_file_count = sizeof embedded_files / sizeof embedded_files[0];
 int hle_redirect, rt_exited, rt_exit_code;
@@ -808,6 +814,51 @@ static void test_association(void) {
     }
 }
 
+static void test_kermit_association(void) {
+    const char *names[] = {"safe;touch PWNED;.tak", "safe,run touch PWNED,.tak"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+      host_file(names[i], (const uint8_t *)"exit\r\n", 6);
+      for (int quick = 0; quick < 2; quick++) {
+        char line[128], expected[128];
+        snprintf(line, sizeof line, "kermit stay, take %s", names[i]);
+        host_file("KERMIT.EXE", kermit_file, sizeof kermit_file);
+        fresh_machine();
+        guest_string(0x3100, names[i]);
+        cpu.a.x = 0x6000; cpu.si = 0x3100; cpu.di = 0x3200;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        snprintf(expected, sizeof expected, " stay, take %s", (const char *)(mem + lin(parent_psp, 0x3200)));
+        CHECK(!strchr(expected + 12, ',') && !strchr(expected, ';'));
+        command(line, quick);
+        CHECK(registered == &image_kermit && !host_runs);
+        child_tail(expected);
+        end_child();
+        CHECK(unlink("KERMIT.EXE") == 0);
+        fresh_machine();
+        command(line, quick);
+        CHECK(!hle_redirect && !registered && !host_runs);
+        CHECK(strstr(output, "Program not found"));
+        CHECK(access("PWNED", F_OK) != 0);
+        /* A different supported DOS program cannot receive the TAKE tail. */
+        host_file("KERMIT.EXE", vc_file, sizeof vc_file);
+        fresh_machine();
+        command(line, quick);
+        CHECK(!hle_redirect && !registered && !host_runs);
+        CHECK(strstr(output, "Invalid program format"));
+        CHECK(access("PWNED", F_OK) != 0);
+      }
+    }
+    /* Some legal DOS short-name punctuation is Kermit syntax, not a
+     * filename. Refuse it without launching an interpreter or a shell. */
+    host_file("x{y}.tak", (const uint8_t *)"exit\r\n", 6);
+    host_file("KERMIT.EXE", kermit_file, sizeof kermit_file);
+    for (int quick = 0; quick < 2; quick++) {
+        fresh_machine();
+        command("kermit stay, take x{y}.tak", quick);
+        CHECK(!hle_redirect && !registered && !host_runs);
+        CHECK(strstr(output, "Invalid program format"));
+    }
+}
+
 static void test_psp_services(void) {
     fresh_machine();
     uint16_t copy = (uint16_t)(parent_psp + 0x100);
@@ -949,6 +1000,7 @@ int main(int argc, char **argv) {
         {"vz-directories", test_vz_child_keeps_directory_paths},
         {"search", test_search},
         {"association", test_association},
+        {"kermit-association", test_kermit_association},
         {"psp", test_psp_services},
         {"fcb", test_child_fcb_lifetime},
         {"resident-fcb", test_resident_fcb_lifetime},

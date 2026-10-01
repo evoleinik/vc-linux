@@ -64,6 +64,7 @@ assert.notEqual(encoded.toString('utf8'), russian, 'the DOS README must not cont
 const app = readFileSync(new URL('../web/vc-web.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
 for (const language of ['ru-RU', 'uk-UA', 'en-US', 'de-DE', undefined]) {
+  let modemCloses = 0;
   const nodes = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) =>
     [id, { textContent: '', hidden: true, addEventListener() {} }]));
   const document = {
@@ -85,6 +86,7 @@ for (const language of ['ru-RU', 'uk-UA', 'en-US', 'de-DE', undefined]) {
     TextEncoder,
     initialInput: () => ({}),
     createSpeaker: () => ({ silence() {} }),
+    createModemTransport: () => ({ close() { modemCloses++; } }),
     console,
   });
   const text = pageText(language);
@@ -97,6 +99,7 @@ for (const language of ['ru-RU', 'uk-UA', 'en-US', 'de-DE', undefined]) {
   assert.equal(nodes.get('exit-message').textContent, text.quit, 'the actual exit hook is translated');
   assert.equal(nodes.get('exit-message').hidden, false);
   assert.equal(document.documentElement.dataset.vcState, 'quit');
+  assert.equal(modemCloses, 1, 'the page closes any modem call when VC exits');
 }
 assert.match(app, /^import \{ pageText \} from ["']\.\/vc-language\.js\?v=/m,
   'the page imports the language module with a build hash');

@@ -10,6 +10,8 @@
 #include <unistd.h>
 
 #include "hle.h"
+#include "modem.h"
+#include "modem_transport.h"
 #include "rt.h"
 
 #ifdef __EMSCRIPTEN__
@@ -47,6 +49,7 @@ static const struct { const char *name, *text; } retired[] = {
     {"VC.EXT", "zip:\tpkunzip -d !.!\r\narj:\tarj x -v -y !.!\r\nlzh:\tlha x !.!\r\n"
                "asm:\ttasm /w0/m9 !;\r\n\ttlink /t !;\r\n"},
     {"VC.EXT", ""},
+    {"VC.EXT", "bas: gwbasic !.!\r\n"},
 };
 
 static int holds_retired_default(const char *path, const char *name) {
@@ -174,6 +177,8 @@ static void install_files(const char *dir) {
         const char *target = rogue_asset ? "/home/vc/GAMES" :
             !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
             !strcmp(f->name, "VZ.COM") || !strcmp(f->name, "VZLIC.TXT") ||
+            !strcmp(f->name, "KERMIT.EXE") || !strcmp(f->name, "KERMIT.TXT") ||
+            !strcmp(f->name, "KERMLIC.TXT") || !strcmp(f->name, "BBS.TAK") ||
             (ext && !strcmp(ext, ".DEF"))
             ? "/home/vc" : dir;
 #else
@@ -186,7 +191,8 @@ static void install_files(const char *dir) {
         }
         int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL") ||
                       !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
-                      !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "VZ.COM");
+                      !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "VZ.COM") ||
+                      !strcmp(f->name, "KERMIT.EXE");
         struct stat existing;
         if (!program && !lstat(path, &existing) &&
             (!S_ISREG(existing.st_mode) ||
@@ -260,6 +266,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "vc: cannot create %s: %s\n", dir, strerror(errno));
         return 1;
     }
+    embedded_files_init();
     install_files(dir);
 
     char host_prog[4200];
@@ -270,6 +277,8 @@ int main(int argc, char **argv) {
     rt_register_supplement(&image_gwbasic, run_gwbasic_graphics);
 #endif
     bios_init();
+    modem_init(modem_transport_ops());
+    atexit(modem_reset);
     dos_fs_init();
     term_init();
     atexit(term_shutdown);
@@ -285,6 +294,7 @@ int main(int argc, char **argv) {
     static const char tail[] = " /std /notsr";
     dos_start(host_prog, (const uint8_t *)tail, (int)sizeof tail - 1);
     rt_run();
+    modem_reset();
     term_shutdown();
 #ifdef __EMSCRIPTEN__
     browser_exit(rt_exit_code);

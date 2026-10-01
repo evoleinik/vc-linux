@@ -1,0 +1,11 @@
+; Dial the notanemulator BBS through COM1's virtual Hayes modem.
+set port com1
+set speed 57600
+set terminal type ansi-bbs
+set flow-control none
+set carrier off
+set input echo on
+output ATDT555-1992\13
+input 30 CONNECT
+if failure stop
+connect

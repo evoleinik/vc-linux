@@ -1,0 +1,34 @@
+Dial a BBS with MS-DOS Kermit 3.15
+
+On Linux, type this on VC's command line from any directory:
+  kermit take bbs.tak, stay
+In the browser, select H:\BBS.TAK and press Enter.
+Both use STAY to keep Kermit's prompt open when you leave its terminal.
+The script selects COM1, 57600 baud and Kermit's ANSI-BBS terminal,
+dials ATDT555-1992, waits for CONNECT 14400, then opens the terminal.
+The virtual modem paces the BBS data at about 14400 bits per second.
+
+In the terminal, type normally. Ctrl-] followed by C (not Ctrl-C)
+returns to the MS-Kermit> command prompt without hanging up.
+CONNECT resumes the terminal. HANGUP drops DTR and hangs up.
+
+To hang up using Hayes commands inside the terminal, stop typing for
+at least one second, type +++, and wait at least one more second for OK.
+Then type ATH and press Enter. NO CARRIER confirms the hangup.
+Use Ctrl-] then C to return to Kermit's prompt; EXIT (or QUIT) returns
+to VC. ATO after +++ resumes an existing call without redialling.
+
+In a browser, 555-1992 connects to the configured secure WebSocket BBS.
+On Linux, start VC with: VC_MODEM_555_1992=host:port build/vc
+Replace host:port with a reachable telnet BBS. Nothing is configured by
+default: an unset endpoint or unknown number gives NO ANSWER.
+The TCP endpoint speaks telnet. The modem handles telnet negotiation;
+Kermit only sees terminal data. A dropped connection gives NO CARRIER.
+
+Linux installs BBS.TAK, this guide, and KERMIT.EXE with the other files
+in $XDG_CONFIG_HOME/vc-linux (default ~/.config/vc-linux), on DOS PATH.
+TAKE searches the current directory and then DOS PATH; no Kermit source
+change or special init file is needed. Existing config scripts and guides
+are preserved. VC does not create, update, move or delete copies directly
+in your real home directory; copies from earlier versions stay untouched.
+Browser files on H: are temporary and vanish on reload.

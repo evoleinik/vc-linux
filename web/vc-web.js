@@ -2,6 +2,7 @@ import { Terminal } from "./vendor/xterm.mjs?v=__V__";
 // __V__ is replaced per build, so a cached page never mixes two builds.
 import createVC from "./vc.mjs?v=__V__";
 import { createSpeaker } from "./speaker.js?v=__V__";
+import { createModemTransport } from "./modem.js?v=__V__";
 import { createGraphics } from "./graphics.js?v=__V__";
 import { initialInput, reduceInput, bindKeypad } from "./vc-keypad.js?v=__V__";
 import { pageText } from "./vc-language.js?v=__V__";
@@ -30,6 +31,7 @@ let inputBytes = 0;
 let exited = false;
 let terminal;
 const speaker = createSpeaker();
+const modem = createModemTransport();
 let graphics;
 let vc, sourcePanel, sourceLoad, sourceSnapshot, sourceResolved;
 let sourceWasOpen = false, sourceScroll;
@@ -263,6 +265,7 @@ function fit(reuseClosed = false) {
 }
 
 function onExit() {
+  modem.close();
   sourcePanel?.close();
   sourceButton.disabled = true;
   speaker.silence();
@@ -286,6 +289,7 @@ window.addEventListener("keydown", (event) => {
   window.location.reload();
 }, { capture: true });
 window.addEventListener("blur", releaseModifiers);
+window.addEventListener("pagehide", () => modem.close());
 container.addEventListener("focusout", releaseModifiers);
 container.addEventListener("pointerdown", () => terminal?.focus());
 document.addEventListener("visibilitychange", () => {
@@ -366,6 +370,7 @@ async function start() {
     vcReadInput: readInput,
     vcExit: onExit,
     vcSpeaker: (frequency) => speaker.setFrequency(frequency),
+    vcModem: modem,
     vcGraphics: (frame) => graphics.draw(frame),
     vcSourceSnapshot: snapshot => { sourceSnapshot = snapshot; },
     vcSourceResolved: address => { sourceResolved = address; },

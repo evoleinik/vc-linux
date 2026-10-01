@@ -26,6 +26,7 @@ static WebImage images[WEB_IMAGE_COUNT] = {
     [WEB_BOOTLOGO] = {"BOOTLOGO.COM", WEB_MODULE_BOOTLOGO, "image_bootlogo", NULL},
     [WEB_ROGUE] = {"ROGUE.EXE", WEB_MODULE_ROGUE, "image_rogue", NULL},
     [WEB_VZ] = {"VZ.COM", WEB_MODULE_VZ, "image_vz", NULL},
+    [WEB_KERMIT] = {"KERMIT.EXE", WEB_MODULE_KERMIT, "image_kermit", NULL},
 };
 
 EM_ASYNC_JS(int, fetch_program, (const char *name, const char *path), {

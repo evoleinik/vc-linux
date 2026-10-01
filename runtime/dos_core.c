@@ -353,7 +353,8 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
 #define IMAGE_COUNT WEB_IMAGE_COUNT
 #else
 static const Image *const images[] = {
-    &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue, &image_vz
+    &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue, &image_vz,
+    &image_kermit
 };
 #define IMAGE_COUNT (sizeof images / sizeof images[0])
 #endif
@@ -700,7 +701,7 @@ static int find_program(const char *word, char *dos, size_t dcap, char *host, si
     }
 }
 
-/* Shipped associations of the form "ext: program !.!" are DOS-only. This
+/* Shipped associations of the form "ext: program [literal args] !.!" are DOS-only. This
  * is data-driven, not a special interpreter command: removing its EXE must
  * never send a file name containing shell syntax to /bin/sh. Custom user
  * association templates retain VC's existing command semantics. */
@@ -724,6 +725,12 @@ static int dos_file_association(const char *word) {
             if ((size_t)(last - start) != wlen || strncasecmp((const char *)start, word, wlen)) continue;
             while (last < eol && (*last == ' ' || *last == '\t')) last++;
             while (eol > last && (eol[-1] == ' ' || eol[-1] == '\t')) eol--;
+            /* Permit fixed words such as Kermit's TAKE, but never turn a
+             * template containing shell operators into a trusted command. */
+            while (eol - last > 3 &&
+                   ((*last >= 'A' && *last <= 'Z') || (*last >= 'a' && *last <= 'z') ||
+                    (*last >= '0' && *last <= '9') || *last == '-' || *last == ',' ||
+                    *last == ' ' || *last == '\t')) last++;
             if (eol - last == 3 && !memcmp(last, "!.!", 3)) return 1;
         }
     }
@@ -756,6 +763,39 @@ static int vz_short_directory(char out[128]) {
     /* An overlong AH=60 result is also an unsafe VZ current directory. */
     if (err == 3 || (!err && strlen(out) + 13 >= 64)) return VZ_LONG_DIRECTORY;
     return err;
+}
+
+/* Kermit's DOS command line is itself a command language: unbraced commas
+ * start commands, and STAY is needed to suppress its automatic EXIT. For
+ * the shipped association, everything after this fixed prefix is ONE file.
+ * Hand Kermit a pinned absolute 8.3 spelling, just as we do for VZ. Other
+ * typed Kermit commands retain Kermit's own grammar. */
+static int kermit_take_tail(const Image *img, uint8_t tail[128], DosPathLease **lease) {
+    static const char prefix[] = " stay, take ";
+    const size_t plen = sizeof prefix - 1;
+    if (strcmp(img->name, "KERMIT.EXE") || tail[0] <= plen ||
+        strncasecmp((const char *)tail + 1, prefix, plen)) return 0;
+    char file[128], original_host[4096];
+    size_t n = tail[0] - plen;
+    memcpy(file, tail + 1 + plen, n);
+    file[n] = 0;
+    if (dos_path_host(file, original_host, sizeof original_host)) return file_error();
+    int err = short_dos_path(file, file);
+    if (err) return err;
+    /* DOS permits braces and other punctuation in 8.3 names. Kermit may
+     * expand those even inside a filename; refuse them rather than guess
+     * at quoting, including punctuation retained in ancestor aliases. */
+    for (const uint8_t *p = (const uint8_t *)file; *p; p++)
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+              (*p >= '0' && *p <= '9') || *p >= 128 || strchr(":\\._~-", *p))) return 11;
+    n = strlen(file);
+    if (plen + n > 126) return 11;
+    err = dos_fs_pin_path(file, original_host, lease);
+    if (err) return err;
+    tail[0] = (uint8_t)(plen + n);
+    memcpy(tail + 1 + plen, file, n);
+    tail[plen + n + 1] = '\r';
+    return 0;
 }
 
 static int dos_program_command(const uint8_t *cmd, size_t len) {
@@ -805,10 +845,14 @@ static int dos_program_command(const uint8_t *cmd, size_t len) {
     tail[0] = (uint8_t)n;
     memcpy(tail + 1, cmd + pos, n);
     tail[n + 1] = '\r';
-    /* Programs own their argument syntax; GW-BASIC itself inserts quotes.
-     * VZ alone needs its filename paths bounded and shortened at launch.
-     * No shell sees a DOS tail, including when its association EXE is absent. */
+    DosPathLease *lease = NULL;
+    err = kermit_take_tail(img, tail, &lease);
+    if (err) return command_error(err);
+    /* Programs otherwise own their argument syntax; GW-BASIC itself
+     * inserts quotes. No shell sees a shipped association's DOS tail. */
     err = start_child(img, dos, tail, 0);
+    if (err) dos_fs_release_path(lease);
+    else if (lease) dos_fs_bind_path(lease, cur_psp);
     return err ? command_error(err) : 0;
 }
 

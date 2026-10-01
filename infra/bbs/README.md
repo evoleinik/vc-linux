@@ -12,6 +12,25 @@ through a virtual modem. Design: `docs/plans/2026-10-01-bbs-experience.md`.
 
 The image is pinned by digest in `enigma.yaml`. Funnel on axis also serves n8n on 443; leave it.
 
+## Dial from Linux
+
+Start VC with `VC_MODEM_555_1992=host:port build/vc`, replacing `host:port` with a
+reachable telnet endpoint (for this server, `axis`'s tailnet address and port `30888`).
+There is no default Linux endpoint. On VC's command line, from any directory, type:
+
+    kermit take bbs.tak, stay
+
+Kermit's own `TAKE` searches the current directory and then DOS `PATH`; `STAY` keeps
+the Kermit prompt available after leaving its terminal. No Kermit source changes or
+init-file workaround are needed. `BBS.TAK` and `KERMIT.TXT` install beside `KERMIT.EXE`
+in `$XDG_CONFIG_HOME/vc-linux` (default `~/.config/vc-linux`), preserving existing
+config scripts and guides. No copies are created, updated, moved or deleted directly
+in the real home directory; legacy copies remain untouched.
+
+Ctrl-] then C returns to `MS-Kermit>`; `HANGUP`, then `EXIT`, returns to VC.
+The browser workflow is unchanged: press Enter on `H:\BBS.TAK` to use the public
+WebSocket above. Its `H:` is a temporary demo drive, not the Linux home directory.
+
 ## First-time setup, as done on 2026-10-01
 
 1. `kubectl apply -f enigma.yaml`, then scale `deploy/enigma` to 0.

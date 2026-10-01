@@ -35,11 +35,10 @@ class VcSession:
     def __init__(self, cwd: Path, home: Path, cols: int = 80, rows: int = 25, extra_env: dict | None = None):
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
-        self.log = home / "vc.log"
         env = {
             "HOME": str(home),
             "XDG_CONFIG_HOME": str(home / ".config"),
-            "VC_LOG": str(self.log),
+            "VC_LOG": str(home / "vc.log"),
             "VC_SCREEN_DUMP": str(home / "screen.txt"),
             "VC_FRAME_DUMP": str(home / "frame.pgm"),
             "TERM": "xterm-256color",
@@ -50,14 +49,15 @@ class VcSession:
             if passthrough in os.environ:
                 env[passthrough] = os.environ[passthrough]
         env.update(extra_env or {})
+        self.log = Path(env["VC_LOG"])
+        self.dump = Path(env["VC_SCREEN_DUMP"])
+        self.frame_dump = Path(env["VC_FRAME_DUMP"])
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(cwd)
             os.execve(str(VC), [str(VC)], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.exit_status: int | None = None
-        self.dump = home / "screen.txt"
-        self.frame_dump = home / "frame.pgm"
 
     def pump(self, timeout: float = 0.05) -> None:
         while True:

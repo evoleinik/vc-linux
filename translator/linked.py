@@ -49,6 +49,11 @@ def parse_map(path: str | Path) -> LinkMap:
     table = text.split("|   Module Segments   |", 1)[1]
     module = None
     for line in table.splitlines():
+        # JWlink wraps a long source pathname onto its own line.
+        wrapped = re.fullmatch(r"(\S+\.ASM)", line.strip(), re.I)
+        if wrapped:
+            module = Path(wrapped[1]).stem.upper()
+            continue
         m = re.fullmatch(r"(?:(\S+\.ASM)\s+)?\s*(\S+)\s+(\S+)\s+([\da-fA-F]{4}):([\da-fA-F]{4})\s+([\da-fA-F]+)", line, re.I)
         if not m:
             continue
@@ -107,6 +112,9 @@ def _values(listing: Listing, link: LinkMap, *, flat: bool = False):
 
 def _expression(expression: str, values, segvalues, location: int) -> int:
     expr = expression.replace("`", "")
+    expr = re.sub(r"\b([\w$?@]+)\.([\w$?@]+)\b",
+                  lambda m: f"({m[1]}+{m[2]})" if m[0].upper() not in values
+                  and m[1].upper() in values and m[2].upper() in values else m[0], expr)
     expr = re.sub(r"\b(?:CSEG|DSEG|CS|DS):", "", expr, flags=re.I)
     expr = re.sub(r"\b([\w@?$]+):", lambda match: "" if match[1].upper() in segvalues else match[0], expr)
     expr = re.sub(r"\b([0-9]+)[dD]\b", r"\1", expr)
@@ -138,7 +146,8 @@ def _verify_module(image: LoadedImage, listing: Listing, link: LinkMap):
     # Plain assembler constants are already fully represented by the byte
     # column and can change within a macro expansion (NUM=NUM-1). Only
     # relocatable symbols need link-time reevaluation.
-    symbols = set(link.symbols) | {name.strip("`").upper() for name in listing.labels} | set(link.segments)
+    symbols = (set(link.symbols) | {name.strip("`").upper() for name in listing.labels}
+               | set(link.segments) | {group for _, _, _, group in link.segments.values() if group != "AUTO"})
     owners = {}
     for row in listing.lines:
         if row.bytes and row.segment is not None:
@@ -152,17 +161,25 @@ def _verify_module(image: LoadedImage, listing: Listing, link: LinkMap):
         expected = list(row.bytes)
         for initial in row.initializers:
             expression = initial.expression.replace("`", "")
+            expression = re.sub(r"\b(?:SIZE|TYPE)\s+([\w$?@]+)",
+                                lambda m: str(listing.structures[m[1].upper()].size)
+                                if m[1].upper() in listing.structures else m[0], expression, flags=re.I)
             if _is_uninitialized(expression):
                 end = len(expected) if "DUP" in expression.upper() else initial.offset + initial.width
                 expected[initial.offset:end] = [None] * max(0, min(end, len(expected)) - initial.offset)
                 continue
             names = re.findall(r"[$?@A-Za-z_][\w$?@]*", expression)
+            if re.fullmatch(r"\s*(?:LENGTH|LENGTHOF|SIZE|SIZEOF|TYPE)\s+[$?@A-Za-z_][\w$?@]*\s*",
+                            expression, re.I):
+                # These are assembly-time type/extent constants, not linked
+                # addresses; their exact listed bytes remain authoritative.
+                continue
             if not any(name.upper() in symbols for name in names):
                 continue
             try:
                 location = (off - link.segments[row.segment][0] if image.is_exe else off + origin) + initial.offset
                 repeat = re.fullmatch(r"(.+)\s+DUP\s*\(([^()]*)\)", expression, re.I)
-                if repeat and not image.is_exe:
+                if repeat:
                     count = _expression(repeat[1], values, segvalues, location)
                     value = _expression(repeat[2], values, segvalues, location)
                     if count < 0 or initial.offset + count * initial.width != row.byte_count:
@@ -171,6 +188,11 @@ def _verify_module(image: LoadedImage, listing: Listing, link: LinkMap):
                         expected[i] = (value >> (8 * ((i - initial.offset) % initial.width))) & 255
                     continue
                 value = _expression(expression, values, segvalues, location)
+                if (initial.width == 4 and off + initial.offset + 2 in image.relocations
+                        and expression.strip().upper() in segvalues):
+                    # DD label is a 16:16 pointer, unlike DD OFFSET label.
+                    # The MZ relocation independently proves its segment word.
+                    value = (value & 0xffff) | (segvalues[expression.strip().upper()] << 16)
             except (KeyError, SyntaxError, TypeError, ValueError) as exc:
                 raise LayoutError(f"{listing.path}:{row.lineno}: cannot resolve linked data {expression!r}: {exc}") from exc
             for i in range(initial.width):
@@ -224,17 +246,40 @@ def build_linked_layout(image: LoadedImage, listings, map_path: str | Path) -> L
                 or any(address + size > 0x10000 for address, size, _, _ in link.segments.values())):
             raise LayoutError(f"{link.path}: require one flat COM group with entry at PSP:0100h")
     parsed = [parse_listing(path, linked=True, flat=not image.is_exe) for path in listings]
+    # CASEMAP:ALL preserves the source spelling in JWasm's listing table,
+    # but uppercases OMF names. Resolve only unambiguous map counterparts.
+    for listing in parsed:
+        aliases = {}
+        for name in listing.segments:
+            matches = [key for key in link.segments if key.upper() == name.upper()]
+            aliases[name] = name if name in link.segments else matches[0] if len(matches) == 1 else name
+        if any(name != mapped for name, mapped in aliases.items()):
+            if len(set(aliases.values())) != len(aliases):
+                raise LayoutError(f"{listing.path}: ambiguous segment case in link map")
+            listing.segments = {aliases[name]: replace(seg, name=aliases[name])
+                                for name, seg in listing.segments.items()}
+            for row in listing.lines:
+                if row.segment:
+                    row.segment = aliases[row.segment]
+            for label in listing.labels.values():
+                label.segment = aliases[label.segment]
+            for procedure in listing.procedures.values():
+                procedure.segment = aliases[procedure.segment]
+            listing.external_segments = {name: aliases[seg] for name, seg in listing.external_segments.items()}
     modules = [listing.path.stem.upper() for listing in parsed]
     expected_modules = {module for module, _ in link.contributions}
     if len(set(modules)) != len(modules) or set(modules) != expected_modules:
         raise LayoutError(f"{link.path}: listings must cover each module exactly once; "
                           f"missing {sorted(expected_modules - set(modules))}, extra {sorted(set(modules) - expected_modules)}")
-    segments = {name: Segment(name, not image.is_exe or kind in ("CODE", "CODESG"), size,
+    segments = {name: Segment(name, not image.is_exe or kind in ("CODE", "CODESG", "KCODE"), size,
                               None if group == "AUTO" else group, size)
                 for name, (address, size, kind, group) in link.segments.items()}
     bases = {name: address - origin for name, (address, _, _, _) in link.segments.items()}
     merged = Listing(link.path, [], segments, {}, {})
     normalized = []
+    public_procedures = {name.upper(): procedure for source in parsed
+                         for name, procedure in source.procedures.items()
+                         if name.upper() in link.symbols}
     for listing in parsed:
         module = listing.path.stem.upper()
         for name, segment in listing.segments.items():
@@ -249,7 +294,12 @@ def build_linked_layout(image: LoadedImage, listings, map_path: str | Path) -> L
             return replace(row, offset=piece.address - origin - bases[row.segment] + row.offset,
                            procedure=f"{module}::{row.procedure}" if row.procedure else None)
         merged.lines.extend(placed(row) for row in listing.lines)
-        normalized.extend(placed(row) for row in _normalized_rows(listing))
+        # A far procedure declared EXTRN can also be in the same linked
+        # segment; prove JWasm's PUSH CS / near CALL using its real definition.
+        declared = {name: public_procedures[name] for name in listing.external_segments
+                    if name in public_procedures}
+        normalizing = replace(listing, procedures={**declared, **listing.procedures})
+        normalized.extend(placed(row) for row in _normalized_rows(normalizing))
         for name, label in listing.labels.items():
             piece = link.contributions[(module, label.segment)]
             merged.labels[f"{module}::{name}"] = replace(label, offset=piece.address - origin - bases[label.segment] + label.offset)

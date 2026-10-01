@@ -1,6 +1,6 @@
 """Assemble the small, offline H: drive for the WebAssembly build.
 
-Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE
+Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE KERMIT_EXE
 The original assembly lives only in asm/; this copies it at build time.
 """
 from pathlib import Path
@@ -13,10 +13,11 @@ from vz_defaults import installed_definition
 
 
 ROOT = Path(__file__).resolve().parent.parent
-# Brief 20's combined Rogue/PDCurses and VZ drive measured 577,179 bytes
-# across 37 files. The CP866 Russian guide adds 1,512 bytes; the complete
-# payload stays below the finite 600 KB packaging budget introduced for Rogue.
-LIMIT = 600_000
+# Keep the previous programs within their 600 KB raw-drive budget. Kermit
+# adds one real DOS executable; the whole drive has a separate finite cap.
+# First-load HTTP gzip remains independently limited to 1.3 MB by web_size.
+LEGACY_LIMIT = 600_000
+LIMIT = 1_000_000
 
 
 def history_text(readme: str) -> bytes:
@@ -37,7 +38,7 @@ def history_text(readme: str) -> bytes:
 
 
 def main() -> None:
-    if len(sys.argv) != 7:
+    if len(sys.argv) != 8:
         raise SystemExit(__doc__)
     destination = Path(sys.argv[1])
     files = {
@@ -54,6 +55,10 @@ def main() -> None:
         "VZ.COM": Path(sys.argv[6]).read_bytes(),
         "VZ.DEF": installed_definition(),
         "VZLIC.TXT": (ROOT / "third_party/vzeditor/LICENSE").read_bytes(),
+        "KERMIT.EXE": Path(sys.argv[7]).read_bytes(),
+        "BBS.TAK": (ROOT / "data/BBS.TAK").read_bytes(),
+        "KERMIT.TXT": (ROOT / "data/KERMIT.TXT").read_bytes(),
+        "KERMLIC.TXT": (ROOT / "third_party/mskermit/LICENSE").read_bytes(),
         "GAMES/SPIRAL.BAS": (ROOT / "web/GAMES/SPIRAL.BAS").read_text(encoding="ascii").replace("\n", "\r\n").encode("ascii"),
         "GAMES/ROGUE.EXE": Path(sys.argv[5]).read_bytes(),
         "GAMES/ROGUELIC.TXT": (ROOT / "third_party/rogue/LICENSE.TXT").read_bytes(),
@@ -68,6 +73,9 @@ def main() -> None:
         files[f"SRC/{name}"] = (ROOT / "asm" / name).read_bytes()
 
     total = sum(map(len, files.values()))
+    legacy = total - sum(len(files[name]) for name in ("KERMIT.EXE", "BBS.TAK", "KERMIT.TXT", "KERMLIC.TXT"))
+    if legacy >= LEGACY_LIMIT:
+        raise SystemExit(f"Pre-Kermit demo is {legacy:,} bytes; it must stay below {LEGACY_LIMIT:,}")
     if total >= LIMIT:
         raise SystemExit(f"Web demo is {total:,} bytes; it must be below {LIMIT:,}")
     # Do not accidentally embed stale files from an earlier version of the demo.

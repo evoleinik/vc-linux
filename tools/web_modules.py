@@ -1,7 +1,7 @@
 """Publish immutable lazy-module names and the exact names compiled into VC.
 
 Usage: .venv/bin/python tools/web_modules.py WORK_DIRECTORY PUBLISH_DIRECTORY
-The four unversioned inputs stay in WORK_DIRECTORY, outside the deployed site.
+The unversioned inputs stay in WORK_DIRECTORY, outside the deployed site.
 """
 from hashlib import sha256
 import os
@@ -11,8 +11,8 @@ import sys
 import tempfile
 
 
-PROGRAMS = ("gwbasic", "bootlogo", "rogue", "vz")
-GENERATED_NAME = re.compile(r"(?:gwbasic|bootlogo|rogue|vz)(?:\.[0-9a-f]{12})?\.wasm")
+PROGRAMS = ("gwbasic", "bootlogo", "rogue", "vz", "kermit")
+GENERATED_NAME = re.compile(r"(?:gwbasic|bootlogo|rogue|vz|kermit)(?:\.[0-9a-f]{12})?\.wasm")
 
 
 def update(path: Path, data: bytes) -> None:
@@ -53,7 +53,7 @@ def publish(work: Path, destination: Path) -> str:
     update(work / "web_program_names.h", header.encode("ascii"))
 
     # Replacing the site must make old side URLs 404, even after an incremental
-    # local build. Retire ONLY our four recognized generated names, and keep
+    # local build. Retire ONLY our recognized generated names, and keep
     # their bytes outside the publish directory for recovery if needed.
     for path in sorted(destination.iterdir()):
         if path.name in names.values() or not GENERATED_NAME.fullmatch(path.name):
@@ -77,7 +77,7 @@ def main() -> None:
     if len(sys.argv) != 3:
         raise SystemExit(__doc__)
     version = publish(Path(sys.argv[1]), Path(sys.argv[2]))
-    print(f"web modules: published four immutable side names ({version})")
+    print(f"web modules: published {len(PROGRAMS)} immutable side names ({version})")
 
 
 if __name__ == "__main__":

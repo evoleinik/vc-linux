@@ -6,8 +6,8 @@ Repeat SBB while planting/restoring a carry bug:
     .venv/bin/python -m pytest -q -s tests/test_translator_ops.py -k sbb
 
 Family parameterization only changes reporting/reproduction: the default suite
-walks every bytes/image-offset instruction from VC, GW-BASIC, bootLogo, Rogue
-and VZ's validated listing/map front ends (including Rogue's complete CRT).
+walks every bytes/image-offset instruction from VC, GW-BASIC, bootLogo, Rogue,
+VZ and Kermit's validated listing/map front ends (including Rogue's complete CRT).
 """
 
 from __future__ import annotations

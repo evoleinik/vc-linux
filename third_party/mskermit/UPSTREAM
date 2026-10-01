@@ -1,0 +1,40 @@
+MS-DOS Kermit 3.15, Joe R. Doupnik and Columbia University.
+
+Source version string: 15 Sept 1997 (mssdef.h, verdef).
+All 32 source archive members dated 1998-05-28 11:05 (ZIP local timestamps).
+Release archive's MSK315.EXE dated 1997-09-15 18:11; MSK315.DOC dated
+1997-09-17 12:44 (ZIP local timestamps).
+Imported unedited on 2026-10-02 from the user's local tools cache.
+
+Original archive directory:
+https://www.columbia.edu/kermit/ftp/archives/
+
+The cache copies were obtained from the Wayback Machine copy of that
+directory because Columbia's server refuses direct downloads. The supplied
+cache does not identify the Wayback snapshot timestamp; none is invented here.
+No network download was made during this import.
+
+msk315src.zip SHA-256:
+1d897b06f1a6fa6a14bac401c20cc1b12b04e9f330ff4dc45f8d826d2aa60e72
+msk315.zip (original binary release, not used as our build) SHA-256:
+435aa3db8275fdbf2462e6bb6d6e115815d4769217cda0a7f6466d917b6d47b2
+
+SOURCES.sha256 records the exact unmodified archive-member bytes, including
+their original CRLF line endings. The unused msn* TCP/IP sources are retained;
+the build defines no_network on the assembler command line and omits them.
+
+Licensing evidence: licensing.html, supplied in the same tools cache, from
+The Kermit Project's "Kermit Software - Licensing" page. Its effective date
+is explicitly "As of 20 July 2011"; its footer is dated 27 September 2011.
+The page says:
+
+"All other software in the Kermit archive to which Columbia University
+holds the copyright should be considered to have the Revised 3-Clause BSD
+License."
+
+It immediately specifies: "This category includes, in particular, MS-DOS
+Kermit" (followed by the other named programs). Old restrictive notices in
+the original sources are preserved as historical text, as the page requests.
+LICENSE reproduces the Revised 3-Clause BSD license with the copyright from
+mssker.asm. See tools/jwasm/README.md for the tool-side MASM compatibility
+fixes; no Kermit source is edited or preprocessed.

@@ -1,0 +1,73 @@
+--- a/src/H/globals.h
++++ b/src/H/globals.h
+@@ -621,6 +621,7 @@
+     bool        listif;                  /* -Sx, -Sa option  */
+     bool        list_generated_code;     /* -Sg, -Sa option  */
+     enum listmacro list_macro;           /* -Sa option  */
++    bool        force_listing;          /* -Sl: retain source and macro rows */
+     bool        no_symbol_listing;       /* -Sn option  */
+     bool        first_pass_listing;      /* -Sf option  */
+ #ifndef __I86__
+--- a/src/cmdline.c
++++ b/src/cmdline.c
+@@ -133,6 +133,7 @@
+     /* listif                */     FALSE,
+     /* list_generated_code   */     FALSE,
+     /* list_macro            */     LM_LISTMACRO,
++    /* force_listing         */     FALSE,
+     /* no_symbol_listing     */     FALSE,
+     /* first_pass_listing    */     FALSE,
+ #ifndef __I86__
+@@ -696,6 +697,7 @@
+     { "Sa",     0,        Set_Sa },
+     { "Sf",     optofs( first_pass_listing  ), Set_True },
+     { "Sg",     optofs( list_generated_code ), Set_True },
++    { "Sl",     optofs( force_listing       ), Set_True },
+     { "Sn",     optofs( no_symbol_listing   ), Set_True },
+     { "Sx",     optofs( listif              ), Set_True },
+ #ifndef __I86__
+--- a/src/listing.c
++++ b/src/listing.c
+@@ -1339,7 +1339,8 @@
+         break;
+     case T_DOT_NOLIST:
+     case T_DOT_XLIST:
+-        ModuleInfo.list = FALSE;
++        if ( !Options.force_listing )
++            ModuleInfo.list = FALSE;
+         break;
+     case T_DOT_NOCREF:
+     case T_DOT_XCREF:
+@@ -1436,7 +1437,8 @@
+         return( EmitErr( SYNTAX_ERROR_EX, tokenarray[i+1].string_ptr ) );
+     }
+ 
+-    ModuleInfo.list_macro = GetSflagsSp( tokenarray[i].tokval );
++    ModuleInfo.list_macro = Options.force_listing ? LM_LISTMACROALL :
++                           GetSflagsSp( tokenarray[i].tokval );
+ 
+     return( NOT_ERROR );
+ }
+--- a/src/parser.c
++++ b/src/parser.c
+@@ -2858,6 +2858,20 @@
+         op1_size = OperandSize( op1, CodeInfo );
+         op2_size = OperandSize( op2, CodeInfo );
+         DebugMsg1(("check_size default: op1_size1=%u, op2_size=%u\n", op1_size, op2_size));
++        /* MASM 5.1 evaluates constants modulo the destination width in
++         * 16-bit code. In particular, 0FFFFh in a byte MOV is FFh and PIT
++         * interval arithmetic exceeding 65535 wraps at 16 bits. Do not
++         * truncate typed operands, addresses, fixups or 32/64-bit code. */
++        if ( Options.masm51_compat && CodeInfo->Ofssize == USE16 &&
++             ( op1_size == 1 || op1_size == 2 ) && op2_size > op1_size &&
++             ( op2 & OP_I ) && !opndx[OPND2].explicit &&
++             opndx[OPND2].kind == EXPR_CONST &&
++             CodeInfo->opnd[OPND2].InsFixup == NULL ) {
++            CodeInfo->opnd[OPND2].data32l &= op1_size == 1 ? 0xff : 0xffff;
++            CodeInfo->opnd[OPND2].type = op1_size == 1 ? OP_I8 : OP_I16;
++            op2 = CodeInfo->opnd[OPND2].type;
++            op2_size = op1_size;
++        }
+         if( op1_size > op2_size ) {
+             if( ( op2 >= OP_I8 ) && ( op2 <= OP_I32 ) ) {     /* immediate */
+                 op2_size = op1_size;    /* promote to larger size */

@@ -29,6 +29,7 @@ files, and as WebAssembly in any browser. No emulator runs at run time.
 | bootLogo, a Logo with turtle graphics | Oscar Toledo G., 2024 | BSD-2 |
 | Rogue 5.4.4, the original roguelike | Michael Toy, Ken Arnold, Glenn Wichman, 1980-1985 | BSD-3 |
 | VZ Editor 1.6 | c.mos, Village Center, 1990s | BSD-3 |
+| MS-DOS Kermit 3.15 | Columbia University, 1982-1997 | BSD-3 (released 2011) |
 
 **Try it in your browser: [notanemulator.com](https://notanemulator.com/).** VC starts at once,
 and runs VZ Editor, GW-BASIC, twelve classic BASIC games, bootLogo turtle graphics and Rogue
@@ -85,6 +86,7 @@ goes to `~/.cache/vc-linux/vc.log`.
 | Alt-letter | Speed search | takes a `*` wildcard |
 | Command line | Translated DOS programs, else `/bin/sh` | Searches the current DOS directory and DOS `PATH` for `.COM`/`.EXE`; `vc` runs native VC; `cd ~` works |
 | Enter on `.BAS` | GW-BASIC | `SYSTEM` returns to VC; Ctrl-Pause or Ctrl-Shift-B stops BASIC |
+| `kermit take bbs.tak, stay` (Linux), or Enter on `H:\BBS.TAK` (browser) | Dial the BBS in MS-DOS Kermit | Ctrl-] then C returns to Kermit's prompt; `HANGUP`, then `EXIT`, returns to VC |
 | `bootlogo`, or Enter on `BOOTLOGO.COM` | bootLogo turtle graphics | `QUIT`, then VC's Enter confirmation returns to the panels |
 | `rogue`, or Enter on `ROGUE.EXE` | Original Rogue 5.4.4 | `h j k l` or arrows move, `?` gives help, `Q` then `y` quits, `S` saves |
 | Mouse | Click to move the cursor | SGR mouse reporting |
@@ -142,6 +144,42 @@ the exact pixels on a crisp canvas. The original BASIC has only 31 bytes of type
 long statements normally rather than pasting a whole line at once. bootLogo is deliberately
 tiny: always close brackets, keep procedure definitions under 120 characters, and avoid zero
 distances or repeat counts (which mean 65536).
+
+In the browser, select `H:\BBS.TAK` and press Enter to dial the notanemulator BBS
+with the original MS-DOS Kermit 3.15. Its own script sets COM1 to 57600 baud and selects `ANSI-BBS`,
+Kermit's terminal mode with PC colours, transparent eight-bit characters and CP437.
+The association runs `kermit stay, take BBS.TAK`: Kermit's command-line `STAY`
+keeps its prompt open after you leave the terminal. The selected filename is
+passed as a pinned DOS short path, so commas cannot become Kermit commands.
+The virtual Hayes modem answers `ATDT555-1992` with `CONNECT 14400` and carries
+telnet data at about 14400 bits per second. Telnet negotiation is handled by the
+modem, not by a modified Kermit. The browser connects on dial to
+`wss://axis.tail85247.ts.net:8443/`; the page remains a static site.
+
+Linux deliberately has **no default TCP endpoint**. Start it with
+`VC_MODEM_555_1992=host:port build/vc` to connect to a telnet BBS you can reach.
+Then type `kermit take bbs.tak, stay` on VC's command line, from any directory.
+Kermit's own `TAKE` searches the current directory and then DOS `PATH`; `STAY`
+keeps its prompt open after you leave the terminal. No init-file workaround or
+Kermit source change is needed.
+An unset endpoint, an unknown number, or an unavailable server produces `NO ANSWER`.
+`BBS.TAK` and `KERMIT.TXT` install beside `KERMIT.EXE` and the other files in
+`$XDG_CONFIG_HOME/vc-linux` (default `~/.config/vc-linux`), on DOS `PATH`.
+Existing scripts and guides in that config directory are preserved. VC does not
+create, update, move or delete copies directly in your real home directory;
+any files left there by an earlier version remain untouched.
+`make kermit` rebuilds the pure-assembly executable with `no_network` defined on
+the assembler command line; vendor sources remain unedited. The source and
+licensing provenance, including both archive hashes, are in
+[`third_party/mskermit/UPSTREAM`](third_party/mskermit/UPSTREAM).
+
+In Kermit's terminal, Ctrl-] followed by C returns to `MS-Kermit>` without hanging
+up. `CONNECT` resumes; `HANGUP` drops DTR; `EXIT` or `QUIT` returns to VC's panels.
+To use Hayes commands directly, leave a one-second typing gap, type `+++`, then
+wait another second for `OK`. Type `ATH` and Enter for `NO CARRIER`; `ATO` instead
+resumes the existing call. A disconnected server also produces `NO CARRIER`.
+`KERMIT.TXT` keeps these instructions beside the script: in the config directory
+on Linux, and at `H:\KERMIT.TXT` in the browser.
 
 In a plain terminal, Ctrl-[ sends the same byte as Esc. Ctrl-I sends the same byte as Tab, and
 Ctrl-M the same as Enter. VC gives each of them a different job, so vc asks the terminal to report
@@ -241,20 +279,35 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 
 | Suite | What it proves |
 |---|---|
-| `test-translator` | Every distinct instruction in VC, GW-BASIC, bootLogo, Rogue and VZ matches Unicorn from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
+| `test-translator` | Every distinct instruction in VC, GW-BASIC, bootLogo, Rogue, VZ and Kermit matches Unicorn from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
 | `test-rogue-build` | The original Rogue/PDCurses DOS build, linked runtime licence and reproducible EXE bytes. |
 | `test-vz-build` | Exact shipped US COM bytes, reproducible map/listings, and the build-time MASM compatibility layer. |
 | `test-fs` | The DOS file layer, DOS 1.x FCB calls, and per-process short-path leases: over 4,400 checks against a temporary tree. |
 | `test-exec` | Byte-identical EXEC, DOS search order, command tails, safe F4/associations, VZ path/temp limits and child cleanup. |
 | `test-machine` | Timer interrupts, IF, HLT, Ctrl-Break, PIT speaker frequencies and declared mutable operands. |
+| `test-kermit-build` | Unedited, licensed Kermit sources, a reproducible pure-assembly EXE and complete linked listings. |
+| `test-modem`, `test-serial-machine` | UART registers, DLAB, real IRQ 4/8259 EOI, INT 14h, Hayes commands, guard timing, 14400-bps pacing and exact telnet replies to the captured BBS. |
+| `test-modem-transport` | Real nonblocking TCP on loopback, including failure and disconnect behavior. |
+| `test-embed` | Exact native/web DOS-file round trips, VC image deduplication, and bounded startup decompression with corruption checks. |
 | `test-process` | Child fault recovery, parent interrupt/device state, and fatal no-translation faults in VC itself. |
 | `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,600 checks. |
 | `test-cga` | Every CGA mode and pixel address, palette, XOR/readback, graphics glyphs, cursor and scrolling: over 823,000 checks. |
 | `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
-| `test-web` | The WebAssembly build under Node: VC, VZ F4/edit/save/quit with MEMFS readback, Rogue play/save/restore, GW-BASIC, bootLogo, exact CGA pixels, canvas transitions and sound. Needs Emscripten. |
-| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real DOS launches, identity/injection checks, VZ editing and backups, Rogue play/save/restore, Ctrl-Break, every shipped BASIC game's first prompt, Logo drawings and BASIC graphics. |
+| `test-web` | The WebAssembly build under Node: VC, VZ F4/edit/save/quit with MEMFS readback, Rogue play/save/restore, GW-BASIC, bootLogo, Kermit BBS dial/type/hangup/EXIT, exact CGA pixels, canvas transitions and sound. Needs Emscripten. |
+| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real DOS launches, identity/injection checks, VZ editing and backups, Rogue play/save/restore, Kermit's full BBS workflow, Ctrl-Break, every shipped BASIC game's first prompt, Logo drawings and BASIC graphics. |
 
 Every finding from the three code reviews was fixed with a test that failed on the old code first.
+
+The Kermit e2e tests replay `tests/fixtures/enigma-connect-2026-10-02.bin` using a
+local TCP BBS and an injected binary WebSocket in Node; neither contacts the live
+server. Restricted environments that deny `socket()` cannot run the TCP gate.
+Supplemental native syscall and pipe-transport tests exercise the same modem and
+translated Kermit without network access, but do not count as the TCP gate.
+
+The browser keeps the same 1.3 MB first-load limit. Startup reconstructs VC's
+files from its linked image bytes and losslessly unpacks the other DOS files
+with a bounded, fixed-profile decoder. Checksums and byte-for-byte tests cover
+this packaging; every file is complete before DOS starts, without another fetch.
 
 ## Debugging
 

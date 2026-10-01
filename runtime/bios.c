@@ -292,7 +292,12 @@ unsigned hle_other_calls;
 
 void bios_init(void)
 {
-    bda_set_word(0x10, 0x0020); /* 80-column colour, no invented peripherals. */
+    bda_set_word(0x00, 0x03f8); /* One 8250 serial port: COM1. */
+    bda_set_word(0x02, 0);
+    bda_set_word(0x04, 0);
+    bda_set_word(0x06, 0);
+    bda_set_word(0x10, 0x0220); /* 80-column colour, one serial port. */
+    mem[0x47c] = 1; /* BIOS serial timeout in seconds. */
     mode_text(3, 0);
     mem[0x417] = 0;
     mem[0x418] = 0;

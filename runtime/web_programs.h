@@ -7,7 +7,7 @@
 #include "image.h"
 
 enum {
-    WEB_VC_COM, WEB_VC_OVL, WEB_GWBASIC, WEB_BOOTLOGO, WEB_ROGUE, WEB_VZ,
+    WEB_VC_COM, WEB_VC_OVL, WEB_GWBASIC, WEB_BOOTLOGO, WEB_ROGUE, WEB_VZ, WEB_KERMIT,
     WEB_IMAGE_COUNT
 };
 const char *web_image_filename(size_t index);

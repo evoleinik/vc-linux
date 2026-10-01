@@ -12,7 +12,7 @@ import pytest
 from test_gwbasic_e2e import ROOT, VcSession, panels, running_vc, until
 
 
-PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE", "VZ.COM")
+PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE")
 
 
 @contextmanager
@@ -134,6 +134,7 @@ def web_demo(destination):
         str(ROOT / "build/bootlogo/LOGO.COM"),
         str(ROOT / "build/rogue/ROGUE.EXE"),
         str(ROOT / "build/vz/VZ.COM"),
+        str(ROOT / "build/kermit/KERMIT.EXE"),
     ], text=True, capture_output=True)
 
 

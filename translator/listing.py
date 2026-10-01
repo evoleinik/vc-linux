@@ -88,6 +88,7 @@ class Structure:
     name: str
     fields: list[tuple[int, str]] = field(default_factory=list)
     size: int = 0
+    defaults: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -226,7 +227,7 @@ def parse_listing(path: str | Path, *, linked: bool = False, flat: bool = False)
     if linked:
         # GW-BASIC's historical segment class is CODESG, not MASM's newer
         # conventional CODE. This opt-in leaves the single-image path alone.
-        for match in re.finditer(r"^(\S+).*16 Bit.*'CODESG'", text, re.M):
+        for match in re.finditer(r"^(\S+).*16 Bit.*'(?:CODESG|KCODE)'", text, re.M | re.I):
             segments[match[1]].is_code = True
         for match in re.finditer(r"^(\S+).*\bExternal\b", text, re.M):
             label = labels.pop(match[1], None)
@@ -257,6 +258,13 @@ def parse_listing(path: str | Path, *, linked: bool = False, flat: bool = False)
             rows.append(ListingLine(lineno, None, None, (), 0, source))
             continue
         label, mnemonic, operands = _statement(source, structures)
+        if linked and mnemonic in {"SEGMENT", "ENDS"} and label not in segments:
+            # CASEMAP:ALL puts uppercase identifiers in the symbol table,
+            # while source rows retain their original case. Do not conflate
+            # genuinely distinct CASEMAP:NONE segments.
+            matches = [name for name in segments if name.upper() == (label or "").upper()]
+            if len(matches) == 1:
+                label = matches[0]
         if mnemonic == "COMMENT" and operands:
             comment_delimiter = operands[0]
             rows.append(ListingLine(lineno, None, None, (), 0, source))
@@ -293,6 +301,8 @@ def parse_listing(path: str | Path, *, linked: bool = False, flat: bool = False)
                     constants[label] = offset
                 if mnemonic in DATA_WIDTHS or mnemonic in structures:
                     structure.fields.append((offset or 0, mnemonic))
+                    if linked:
+                        structure.defaults[offset or 0] = operands
             rows.append(ListingLine(lineno, None, offset, byte_values, len(byte_values), source))
             continue
         if raw.startswith(" = ") and label:
@@ -321,7 +331,7 @@ def parse_listing(path: str | Path, *, linked: bool = False, flat: bool = False)
             procedures[label] = Procedure(label, segment, offset, far="FAR" in operands.upper(), uses=used_regs)
             active_procs[segment] = proc = label
         if (label and segment and mnemonic not in {"EQU", "=", "SEGMENT", "ENDS"}
-                and not (flat and mnemonic == "ENDP")):
+                and not (linked and mnemonic == "ENDP")):
             if offset is not None:
                 key = f"{proc}::{label}" if label.startswith("@@") and proc else label
                 labels[key] = Label(label, segment, offset, proc)
@@ -374,7 +384,8 @@ def _initializers(kind: str, operands: str, listing: Listing, base: int = 0) -> 
             return []
         values = split_operands(operands[1:-1])
         result = []
-        for (offset, member_type), value in zip(structure.fields, values):
+        for index, (offset, member_type) in enumerate(structure.fields):
+            value = values[index] if index < len(values) and values[index] else structure.defaults.get(offset, "")
             if value:
                 result.extend(_initializers(member_type, value, listing, base + offset))
         return result
@@ -382,10 +393,26 @@ def _initializers(kind: str, operands: str, listing: Listing, base: int = 0) -> 
         return []
     width = DATA_WIDTHS[kind]
     result, cursor = [], base
-    for value in split_operands(operands):
+    values = split_operands(operands)
+    for index, value in enumerate(values):
         if not value:
             continue
         if re.search(r"\bDUP\s*\(", value, re.I):
+            if index + 1 < len(values):
+                repeat = re.fullmatch(r"(.+)\s+DUP\s*\(([^()]*)\)", value, re.I)
+                count = None
+                if repeat:
+                    from .layout import _evaluate
+                    try:
+                        count = _evaluate(repeat[1], {k.upper(): v for k, v in listing.constants.items()}, {})
+                    except (KeyError, SyntaxError, TypeError, ValueError):
+                        pass
+                if count is None or not 0 <= count <= 65536:
+                    raise ListingError(f"{listing.path}: cannot place initializer after {value!r}")
+                for _ in range(count):
+                    result.extend(_initializers(kind, repeat[2], listing, cursor))
+                    cursor += width * len(split_operands(repeat[2]))
+                continue
             # DUP arrays in these images contain only literals/uninitialized
             # storage. Symbolic DUP is rejected if layout needs to resolve it.
             result.append(DataInitializer(cursor, width, value))

@@ -17,6 +17,11 @@ You are @. Move with h (left), j (down), k (up), l (right); y/u/b/n
 move diagonally. ? shows help. Q then y quits and returns to VC.
 S then y saves in the current directory; ROGUE there restores the game.
 Saves and scores disappear when the page is reloaded, like all H: files.
+Select BBS.TAK and press Enter to dial the notanemulator BBS in MS-DOS Kermit.
+Its own ANSI-BBS terminal connects through a virtual 14400-bps Hayes modem.
+Ctrl-] then C returns to Kermit's prompt; HANGUP, then EXIT, returns to VC.
+Or pause typing for a second, type +++, wait a second for OK, then type ATH.
+NO CARRIER confirms the hangup. KERMIT.TXT has the complete instructions.
 The Linux version manages real files: github.com/evoleinik/vc-linux
 
 Keys to try:
@@ -59,3 +64,4 @@ GAMES/ROGUELIC.TXT is Rogue's BSD-3 licence, by Toy, Arnold and Wichman.
 GAMES/PDCLIC.TXT has the public-domain notice for its PDCurses DOS port.
 GAMES/OWLIC.TXT has the OpenWatcom runtime licence and its source link.
 VZLIC.TXT is VZ Editor's BSD-3 licence, by c.mos / Village Center.
+KERMLIC.TXT is MS-DOS Kermit's BSD-3 licence, by Columbia University.

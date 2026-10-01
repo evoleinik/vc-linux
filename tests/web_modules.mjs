@@ -89,6 +89,7 @@ const programs = [
   ['bootlogo', [], []],
   ['rogue', [], []],
   ['vz', ['port_in8', 'port_out8', 'rt_fault'], []],
+  ['kermit', ['port_in8', 'port_out8', 'port_in16', 'port_out16'], []],
 ];
 const linkerSymbols = new Set(['__memory_base', '__table_base', '__stack_pointer',
   '__indirect_function_table', 'memory']);
@@ -119,4 +120,4 @@ for (const [name, extraImports, extraExports] of programs) {
   assert.ok(imports.some((entry) => entry.name === '__indirect_function_table' && entry.kind === 'table'),
     `${name} shares the main indirect-call table`);
 }
-console.log('web modules: VC-only main, no eager libraries, shared host ABI, bounded side static memory, and four non-Asyncified sides passed');
+console.log('web modules: VC-only main, no eager libraries, shared host ABI, bounded side static memory, and five non-Asyncified sides passed');
