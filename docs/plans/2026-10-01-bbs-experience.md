@@ -71,3 +71,8 @@ people log in (a handle and password, or GitHub), and what saved state means.
 - **Server:** ENiGMA½ on `axis` behind Traefik with TLS: accounts, boards, private mail, who's
   online, paging and chat. Eugene is the sysop.
 - **Later:** saved state per user (H: tied to the BBS account) and translated BBS doors.
+
+4. Eugene, 2026-10-01: reach the BBS through Tailscale Funnel today, at
+   `wss://axis.tail85247.ts.net:8443`, since the Oracle API key on axis returns 401 and opening
+   ports needs a console sign-in. `bbs.notanemulator.com` can follow once ports 80 and 443 are open.
+   Funnel on axis already serves another app on 443, which stays untouched.
