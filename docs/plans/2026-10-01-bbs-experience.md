@@ -39,3 +39,24 @@ people log in (a handle and password, or GitHub), and what saved state means.
 
 1. (Criterion 1) What does a visitor see first: the BBS login, with VC and games as doors behind
    it, or VC as today, with the BBS as something you dial from inside it?
+
+## Answers
+
+1. Eugene, 2026-10-01, after inline mocks of both flows: "B: VC first, dial the BBS". VC opens as
+   today. A terminal program on H: dials the BBS with a modem moment (`ATDT`, `CONNECT 14400`),
+   then the BBS login, boards, mail and paging happen there.
+
+## How the dial works (checked 2026-10-01)
+
+- **The terminal program is MS-DOS Kermit**, from Columbia University. It has been open source
+  under the revised BSD-3 licence since 1 July 2011, and its source is assembly (`ms*.asm`). It
+  is translated like VC and has real VT100/ANSI emulation, Hayes dialling and file transfer.
+- **The modem is ours.** The runtime emulates a Hayes modem on COM1, at the 8250 UART ports and
+  INT 14h. `ATDT 555-1992` opens a WebSocket from the page, or a TCP connection on Linux, to the
+  BBS server. It answers `CONNECT 14400` and passes bytes both ways. `+++ATH` hangs up.
+- So the BBS server is the only new hosted piece. The page stays static on GitHub Pages.
+
+## Questions for Eugene, continued
+
+2. (Criteria 2, 4, 5) Which BBS runs on the server: ENiGMA½ (BSD-2, maintained, multi-node with
+   boards, mail and paging built in), a small server of our own, or Maximus translated like VC?
