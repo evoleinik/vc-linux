@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you cite vc-linux, please cite it as below."
+title: "vc-linux: preserving DOS software by translation, not emulation"
+abstract: >-
+  Volkov Commander, GW-BASIC and other DOS programs, kept as their original unedited source, a
+  reproducible build, and a machine translation from 8086 assembly to C checked instruction by
+  instruction. DOS and the PC hardware are reimplemented, so the programs run natively on Linux
+  and as WebAssembly in any browser.
+type: software
+authors:
+  - family-names: Oleynik
+    given-names: Evgeny
+repository-code: "https://github.com/evoleinik/vc-linux"
+url: "https://notanemulator.com/"
+license: BSD-2-Clause
+keywords:
+  - software preservation
+  - static recompilation
+  - binary translation
+  - DOS
+  - 8086
+  - Volkov Commander
+  - WebAssembly
+references:
+  - type: software
+    title: "Volkov Commander"
+    authors:
+      - family-names: Volkov
+        given-names: Vsevolod V.
+    year: 2000
+    license: BSD-2-Clause
+    url: "https://vc.vvv.kyiv.ua/"
