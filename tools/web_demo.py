@@ -1,6 +1,6 @@
 """Assemble the small, offline H: drive for the WebAssembly build.
 
-Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE
+Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE
 The original assembly lives only in asm/; this copies it at build time.
 """
 from pathlib import Path
@@ -11,7 +11,10 @@ import textwrap
 
 
 ROOT = Path(__file__).resolve().parent.parent
-LIMIT = 400_000  # Decimal KB is stricter than the brief's 400 KB ceiling.
+# Brief 16 adds the complete compiled Rogue/PDCurses DOS image and runtime
+# notices. The measured drive is now about 494 KB (formerly about 270 KB);
+# keep a finite 600 KB packaging budget instead of the pre-Rogue 400 KB cap.
+LIMIT = 600_000
 
 
 def history_text(readme: str) -> bytes:
@@ -32,7 +35,7 @@ def history_text(readme: str) -> bytes:
 
 
 def main() -> None:
-    if len(sys.argv) != 5:
+    if len(sys.argv) != 6:
         raise SystemExit(__doc__)
     destination = Path(sys.argv[1])
     files = {
@@ -44,6 +47,10 @@ def main() -> None:
         "BOOTLOGO.TXT": (ROOT / "web/BOOTLOGO.TXT").read_text(encoding="ascii").replace("\n", "\r\n").encode("ascii"),
         "LOGOLIC.TXT": (ROOT / "third_party/bootlogo/LICENSE").read_bytes(),
         "GAMES/SPIRAL.BAS": (ROOT / "web/GAMES/SPIRAL.BAS").read_text(encoding="ascii").replace("\n", "\r\n").encode("ascii"),
+        "GAMES/ROGUE.EXE": Path(sys.argv[5]).read_bytes(),
+        "GAMES/ROGUELIC.TXT": (ROOT / "third_party/rogue/LICENSE.TXT").read_bytes(),
+        "GAMES/PDCLIC.TXT": (ROOT / "third_party/pdcurses/README.md").read_bytes(),
+        "GAMES/OWLIC.TXT": Path(sys.argv[5]).with_name("OWLIC.TXT").read_bytes(),
     }
     for path in sorted(Path(sys.argv[3]).iterdir()):
         files[f"GAMES/{path.name}"] = path.read_bytes()

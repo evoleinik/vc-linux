@@ -344,7 +344,7 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
  * including its MZ header and relocation table: comparing only the load module
  * would accept a damaged header. VC.COM and VC.OVL bypass this disk check. */
 static const Image *const images[] = {
-    &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo
+    &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue
 };
 
 static const EmbeddedFile *image_file(const Image *img) {
@@ -807,7 +807,8 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     if (nprocs == (int)(sizeof procs / sizeof procs[0])) return 8;
     rt_log("load %s: translation %s", dos_prog, img->name);
     Proc *p = &procs[nprocs];
-    p->machine = rt_save_process_state();
+    const Image *parent_image = nprocs ? procs[nprocs - 1].image : &image_vc_com;
+    p->machine = rt_save_process_state(parent_image);
     if (!p->machine) return 8;
     p->image = img;
     p->break_vector = lin(rd16(0, 0x1b * 4 + 2), rd16(0, 0x1b * 4));
@@ -1174,7 +1175,7 @@ void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
     if (slash) slash[1] = 0;
     else strcpy(program_dir, "C:\\");
 #ifdef __EMSCRIPTEN__
-    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;%s;C:\\", program_dir) + 1;
+    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\GAMES;%s;C:\\", program_dir) + 1;
 #else
     n += (size_t)snprintf(env + n, sizeof env - n, "PATH=%s;C:\\", program_dir) + 1;
 #endif

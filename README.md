@@ -26,9 +26,10 @@ files, and as WebAssembly in any browser. No emulator runs at run time.
 | GW-BASIC | Microsoft, 1983 | MIT (released 2020) |
 | *BASIC Computer Games*, twelve of them | David H. Ahl, 1978 | public domain (2022) |
 | bootLogo, a Logo with turtle graphics | Oscar Toledo G., 2024 | BSD-2 |
+| Rogue 5.4.4, the original roguelike | Michael Toy, Ken Arnold, Glenn Wichman, 1980-1985 | BSD-3 |
 
 **Try it in your browser: [notanemulator.com](https://notanemulator.com/).** VC starts at once,
-and runs GW-BASIC, the BASIC games and bootLogo from its `H:` drive, the way DOS did.
+and runs GW-BASIC, the BASIC games, bootLogo and Rogue from its `H:` drive, the way DOS did.
 
 ## How this differs from emulation and rewrites
 
@@ -46,11 +47,19 @@ and runs GW-BASIC, the BASIC games and bootLogo from its `H:` drive, the way DOS
 That is one static binary for x86-64 Linux, with no dependencies. You need a terminal of at least
 80×25. Set `COLORTERM=truecolor` for the exact VGA palette.
 
-To build from source, you need gcc, make and [uv](https://docs.astral.sh/uv/):
+To build from source, you need gcc, make, [uv](https://docs.astral.sh/uv/), and an
+OpenWatcom 2.0 installation for the bundled 16-bit DOS C program. Set `WATCOM`
+to that installation's root, or fetch the pinned version below (the 524 MB
+toolchain is not in this repository):
 
     git clone https://github.com/evoleinik/vc-linux && cd vc-linux
+    tools/fetch-openwatcom.sh build/openwatcom && export WATCOM=$PWD/build/openwatcom
     uv sync && make
     build/vc
+
+`make rogue` builds `build/rogue/ROGUE.EXE` and its verbose link map. Project-owned
+DOS shims adapt Rogue's Unix interfaces and 32-bit integer assumptions; the
+vendored Rogue and PDCurses sources are never edited.
 
 `build/vc [DIRECTORY]` opens in that directory. Settings live in `~/.config/vc-linux/` and a log
 goes to `~/.cache/vc-linux/vc.log`.
@@ -74,6 +83,7 @@ goes to `~/.cache/vc-linux/vc.log`.
 | Command line | Translated DOS programs, else `/bin/sh` | Searches the current DOS directory and DOS `PATH` for `.COM`/`.EXE`; `vc` runs native VC; `cd ~` works |
 | Enter on `.BAS` | GW-BASIC | `SYSTEM` returns to VC; Ctrl-Pause or Ctrl-Shift-B stops BASIC |
 | `bootlogo`, or Enter on `BOOTLOGO.COM` | bootLogo turtle graphics | `QUIT`, then VC's Enter confirmation returns to the panels |
+| `rogue`, or Enter on `ROGUE.EXE` | Original Rogue 5.4.4 | `h j k l` or arrows move, `?` gives help, `Q` then `y` quits, `S` saves |
 | Mouse | Click to move the cursor | SGR mouse reporting |
 
 Drives: `C:` is `/` and `H:` is your home directory. Names are shown in code page 866, so Cyrillic
@@ -96,6 +106,17 @@ its text panels. `BOOTLOGO.COM` is a real, 503-byte NASM-built COM file installe
 Renamed copies run by the same byte-matching EXEC rule. The `logo` command remains available
 for a host program such as UCBLogo.
 
+Type `rogue` for the original dungeon game, compiled with OpenWatcom to a real
+large-model 8086 DOS EXE and then translated ahead of time. There is no native
+Rogue port running behind that command. `y u b n` move diagonally, `i` shows
+inventory, `,` picks up an item, and `?` explains the other keys. `S`, then `y`,
+saves to `rogue.sav`; the next plain `rogue` restores it. Saves and `rogue.scr`
+scores live in the current DOS directory, not beside the installed executable.
+If automatic restore rejects a save, it is renamed to `rogue.bad` and a new
+game starts with a notice. An existing `rogue.bad` is never overwritten.
+The player name is fixed to Rogue, shell escape and Unix signals are disabled,
+and successful restore consumes the save, as in the original game.
+
 CGA modes 4/5 (320×200, four colours) and 6 (640×200, two colours) use real interlaced B800h
 video memory. GW-BASIC's `SCREEN 1`, `PSET`, `LINE`, `CIRCLE` and `DRAW` work; `SCREEN 0`
 returns BASIC to text. Terminals display an 80×25 coloured braille reduction; a browser shows
@@ -113,7 +134,7 @@ WezTerm does too once `enable_kitty_keyboard` is on. xterm does it through modif
 
 The same translated C also compiles to WebAssembly with Emscripten. The page opens VC at once on a
 small in-memory `H:` drive holding a README, VC's history, its own assembly sources, GW-BASIC,
-bootLogo, and twelve of David Ahl's public-domain BASIC Computer Games. xterm.js
+bootLogo, Rogue, and twelve of David Ahl's public-domain BASIC Computer Games. xterm.js
 shows the screen in the IBM VGA font. The page reports keys in full, so Ctrl-[, Ctrl-I and Ctrl-M
 work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload. There is no shell
 and no editor, but `cd` and translated DOS programs run from the command line. Open `GAMES` and
@@ -123,6 +144,9 @@ the first key press. Use Ctrl-Pause or Ctrl-Shift-B to stop a game, then `SYSTEM
 `GAMES\SPIRAL.BAS` example uses BASIC's `SCREEN 1` and `DRAW`; press a key when it finishes to
 return to text. The CGA canvas occupies the same screen area as xterm and keeps its keyboard
 input active.
+`H:\GAMES\ROGUE.EXE` is also on the DOS `PATH`: type `rogue` from either panel
+directory, or press Enter on that EXE. Its saves, like all browser files, vanish
+on reload.
 
 To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
 
@@ -164,6 +188,11 @@ flowchart LR
   bootLogo's single mutable pen-colour operand is read from live memory. Four indirect
   `DRAW` entries are emitted in a separate, source-proved supplement; VC's and GW-BASIC's
   original generated C stay byte-identical.
+  For compiled C, it reads the verbose Watcom link map, checks every linked
+  object's initialized bytes and relocations (C library members included), and
+  checks WDIS instruction boundaries against Capstone before emitting C. JWasm
+  cannot preserve all Watcom instruction encodings when reassembling symbolic
+  disassembly; the verified map-driven path avoids changing the DOS executable.
 - **The runtime** (`runtime/rt.c`, `runtime/dos_core.c`) keeps the machine faithful: a 1 MB
   memory array, a real stack, a real interrupt vector table, MCB chain and PSPs. VC's tricks run
   as written. It runs VC.OVL as a child process, splits its own memory block, and copies its
@@ -257,6 +286,12 @@ unchanged COM source (`tools/nasm`). Graphics text uses Daniel Hepper's public-d
 (`third_party/font8x8`). The shared CP437/866 box and block characters have glyphs; other
 unsupported non-ASCII graphics characters remain blank. `web/GAMES/SPIRAL.BAS` is an original
 example under this repository's BSD-2 license, separate from Ahl's public-domain games.
+
+Rogue 5.4.4 is by Michael Toy, Ken Arnold and Glenn Wichman, with Nicholas
+Kisseberth's portable save and platform code (BSD-3-Clause; `third_party/rogue`).
+PDCurses is public domain (`third_party/pdcurses`). OpenWatcom's linked C runtime
+uses the Sybase Open Watcom Public License. `ROGUELIC.TXT`, `PDCLIC.TXT`, and
+`OWLIC.TXT` accompany the installed game and its browser copy.
 
 The translator, runtime and tests are BSD 2-Clause (`LICENSE`). They were built with Claude Code
 and OpenAI Codex.

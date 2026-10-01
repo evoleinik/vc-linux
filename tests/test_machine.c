@@ -436,6 +436,110 @@ static void cga_color_port(void) {
     CHECK(bios_cga_color(3) == 15);
 }
 
+static unsigned catalog_calls;
+static int catalog_run(uint32_t off, uint16_t loadseg) {
+    if (off) return -1;
+    CHECK(loadseg == 0x2000 + (catalog_calls % 5) * 0x100);
+    CHECK(mem[lin(loadseg, 0)] == 0x90 + catalog_calls % 5);
+    if (++catalog_calls == 10) rt_exited = 1;
+    else cpu.cs = (uint16_t)(0x2000 + (catalog_calls % 5) * 0x100);
+    return 0;
+}
+
+static void five_program_catalog(void) {
+    /* VC, its overlay, BASIC, Logo and Rogue must coexist even after their
+     * child sessions return. Revisit each entry to check none was evicted. */
+    static const uint8_t bytes[5][8] = {{0x90}, {0x91}, {0x92}, {0x93}, {0x94}};
+    Image images[5];
+    memset(&cpu, 0, sizeof cpu);
+    memset(images, 0, sizeof images);
+    for (unsigned i = 0; i < 5; ++i) {
+        images[i].name = "CATALOG.EXE";
+        images[i].bytes = bytes[i];
+        images[i].size = sizeof bytes[i];
+        images[i].run = catalog_run;
+        uint16_t seg = (uint16_t)(0x2000 + i * 0x100);
+        memcpy(mem + lin(seg, 0), bytes[i], sizeof bytes[i]);
+        rt_register_image(&images[i], seg);
+    }
+    cpu.cs = 0x2000;
+    cpu.ss = 0x8000;
+    cpu.sp = 0xf000;
+    rt_run();
+    CHECK(catalog_calls == 10);
+}
+
+static uint16_t resumed_loadseg;
+static unsigned resumed_calls;
+static int resumed_image_run(uint32_t off, uint16_t loadseg) {
+    if (off) return -1;
+    CHECK(loadseg == resumed_loadseg);
+    CHECK(rd16(loadseg, 1) == (uint16_t)(0x1234 + loadseg));
+    resumed_calls++;
+    rt_exited = 1;
+    return 0;
+}
+
+static void same_image_return(int forced, int corrupt_parent) {
+    /* A relocated immediate inside the first twelve bytes prevents the
+     * copied-code fallback from confusing two loads of the same EXE. */
+    static const uint8_t parent_code[16] = {
+        0xb8, 0x34, 0x12, 0x50, 0x9f, 0x5b, 0x50, 0x90,
+        0x58, 0x9e, 0x59, 0x5a, 0x5b, 0x5d, 0x5e, 0xcb,
+    };
+    static const uint8_t new_code[16] = {
+        0xbb, 0x34, 0x12, 0x50, 0x9f, 0x5b, 0x50, 0x90,
+        0x58, 0x9e, 0x59, 0x5a, 0x5b, 0x5d, 0x5e, 0xcb,
+    };
+    static const uint32_t relocs[] = {1};
+    const Image parent = {
+        .name = "RECURSE.EXE", .is_exe = 1, .bytes = parent_code, .size = sizeof parent_code,
+        .relocs = relocs, .nrelocs = 1, .run = resumed_image_run,
+    };
+    const Image newcomer = {
+        .name = "RESIDENT.EXE", .is_exe = 1, .bytes = new_code, .size = sizeof new_code,
+        .relocs = relocs, .nrelocs = 1, .run = resumed_image_run,
+    };
+    setup(MUTABLE_CODE);
+    memcpy(mem + 0x20000, parent_code, sizeof parent_code);
+    wr16(0x2000, 1, 0x3234);
+    rt_register_image(&parent, 0x2000);
+    wr16(0, 0x60 * 4, 0x2222);
+    port_out8(0x21, 0xaa);
+    /* Even a mutation before capture must not become approved code:
+     * capture must preserve the registered snapshot, not reread RAM. */
+    if (corrupt_parent) wr8(0x2000, 0, 0xcc);
+    RtProcessState *state = rt_save_process_state(&parent);
+    CHECK(state);
+    memcpy(mem + 0x30000, parent_code, sizeof parent_code);
+    wr16(0x3000, 1, 0x4234);
+    rt_register_image(&parent, 0x3000);
+    memcpy(mem + 0x40000, new_code, sizeof new_code);
+    wr16(0x4000, 1, 0x5234);
+    rt_register_image(&newcomer, 0x4000);
+    wr16(0, 0x60 * 4, 0x3333);
+    port_out8(0x21, 0x55);
+    rt_finish_process_state(state, forced);
+    CHECK(rd16(0, 0x60 * 4) == (forced ? 0x2222 : 0x3333));
+    CHECK(port_in8(0x21) == (forced ? 0xaa : 0x55));
+    resumed_loadseg = cpu.cs = 0x2000;
+    cpu.ip = 0;
+    cpu.ifl = 0;
+    rt_run();
+    CHECK(resumed_calls == 1);
+    /* Returning to the parent must not evict newly registered, distinct
+     * images: VC can still call copied or resident code from its overlay. */
+    resumed_loadseg = cpu.cs = 0x4000;
+    rt_exited = 0;
+    rt_run();
+    CHECK(resumed_calls == 2);
+}
+
+static void same_image_normal_return(void) { same_image_return(0, 0); }
+static void same_image_forced_return(void) { same_image_return(1, 0); }
+static void same_image_changed_parent_refused(void) { same_image_return(0, 1); }
+static void same_image_forced_changed_parent_refused(void) { same_image_return(1, 1); }
+
 static int run_test(const char *name, Test test, int expected_status) {
     fflush(NULL);
     pid_t child = fork();
@@ -479,6 +583,11 @@ int main(void) {
     failed += run_test("copied listing-proved supplement", copied_image_supplement, 0);
     failed += run_test("changed supplement bytes refused", changed_supplement_refused, 70);
     failed += run_test("supplement scoped to its image", wrong_image_supplement_refused, 70);
-    printf("test_machine: 22 cases, %d failures\n", failed);
+    failed += run_test("all five translated programs remain callable", five_program_catalog, 0);
+    failed += run_test("same-image EXEC restores parent registration", same_image_normal_return, 0);
+    failed += run_test("same-image forced exit restores parent registration", same_image_forced_return, 0);
+    failed += run_test("same-image return refuses changed parent bytes", same_image_changed_parent_refused, 70);
+    failed += run_test("same-image forced return refuses changed parent bytes", same_image_forced_changed_parent_refused, 70);
+    printf("test_machine: 27 cases, %d failures\n", failed);
     return failed ? 1 : 0;
 }

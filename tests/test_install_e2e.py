@@ -12,7 +12,7 @@ import pytest
 from test_gwbasic_e2e import ROOT, VcSession, panels, running_vc, until
 
 
-PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM")
+PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE")
 
 
 @contextmanager
@@ -85,6 +85,7 @@ def web_demo(destination):
         sys.executable, str(ROOT / "tools/web_demo.py"), str(destination),
         str(ROOT / "build/gwbasic/GWBASIC.EXE"), str(ROOT / "build/games"),
         str(ROOT / "build/bootlogo/LOGO.COM"),
+        str(ROOT / "build/rogue/ROGUE.EXE"),
     ], text=True, capture_output=True)
 
 
@@ -110,6 +111,18 @@ def test_web_demo_installs_bootlogo_only(tmp_path, previous):
     assert (tmp_path / "BOOTLOGO.TXT").is_file()
     assert not (tmp_path / "LOGO.COM").exists()
     assert not (tmp_path / "LOGO.TXT").exists()
+
+
+def test_web_demo_installs_real_rogue_and_licenses_in_games(tmp_path):
+    result = web_demo(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "GAMES/ROGUE.EXE").read_bytes() == (ROOT / "build/rogue/ROGUE.EXE").read_bytes()
+    assert not (tmp_path / "ROGUE.EXE").exists(), "one real Rogue file belongs in H:\\GAMES"
+    assert (tmp_path / "GAMES/ROGUELIC.TXT").read_bytes() == (ROOT / "third_party/rogue/LICENSE.TXT").read_bytes()
+    assert b"public domain" in (tmp_path / "GAMES/PDCLIC.TXT").read_bytes()
+    assert (tmp_path / "GAMES/OWLIC.TXT").read_bytes() == (ROOT / "build/rogue/OWLIC.TXT").read_bytes()
+    readme = (tmp_path / "README.TXT").read_text()
+    assert all(text in readme for text in ("ROGUE.EXE", "Q then y", "S then y", "h (left)"))
 
 
 @pytest.mark.parametrize("name", ["LOGO.COM", "LOGO.TXT"])

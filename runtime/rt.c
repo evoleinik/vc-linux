@@ -165,7 +165,12 @@ static void speaker_update(void) {
 #endif
 }
 
+typedef struct Known Known;
+static Known *save_known_image(const Image *parent);
+static void restore_known_image(Known *saved);
+
 struct RtProcessState {
+    Known *parent_image;
     uint8_t vectors[1024];
     PitChannel pit[3];
     uint8_t speaker_control, pic_mask;
@@ -173,9 +178,11 @@ struct RtProcessState {
     int timer_in_service;
 };
 
-RtProcessState *rt_save_process_state(void) {
+RtProcessState *rt_save_process_state(const Image *parent) {
     RtProcessState *state = malloc(sizeof *state);
     if (!state) return NULL;
+    state->parent_image = parent ? save_known_image(parent) : NULL;
+    if (parent && !state->parent_image) { free(state); return NULL; }
     memcpy(state->vectors, mem, sizeof state->vectors);
     memcpy(state->pit, pit, sizeof pit);
     state->speaker_control = speaker_control;
@@ -202,6 +209,7 @@ void rt_finish_process_state(RtProcessState *state, int restore) {
         bios_cancel_read();
         speaker_update();
     }
+    restore_known_image(state->parent_image);
     free(state);
 }
 
@@ -289,16 +297,18 @@ static Moved moved[MAX_MOVED];
 static int nmoved;
 static void nmoved_reset(void) { nmoved = 0; }
 
-typedef struct {
+struct Known {
     const Image *img;
     uint16_t loadseg;
     uint32_t base;
     uint8_t *snap;
     int32_t deltas[8]; /* offsets of copies seen so far */
     int ndeltas;
-} Known;
+};
 
-#define MAX_KNOWN 4
+/* Five shipped images now include Rogue; leave room for the compiled-C
+ * programs using the same loader next. Entries survive child termination. */
+#define MAX_KNOWN 8
 static Known known[MAX_KNOWN];
 static int nknown;
 static struct { const Image *image; RtImageRunner run; } supplements[MAX_KNOWN];
@@ -360,6 +370,34 @@ static int run_moved(Known *k, uint32_t off, uint32_t L) {
 static Known *find_known(const Image *img) {
     for (int i = 0; i < nknown; i++) if (known[i].img == img) return &known[i];
     return NULL;
+}
+
+static Known *save_known_image(const Image *parent) {
+    Known *current = find_known(parent);
+    if (!current) return NULL;
+    Known *saved = malloc(sizeof *saved);
+    if (!saved) return NULL;
+    *saved = *current;
+    saved->snap = malloc(parent->size);
+    if (!saved->snap) { free(saved); return NULL; }
+    /* Keep the originally approved, relocated bytes. Copying live RAM
+     * here would silently approve an undeclared parent code mutation. */
+    memcpy(saved->snap, current->snap, parent->size);
+    return saved;
+}
+
+static void restore_known_image(Known *saved) {
+    if (!saved) return;
+    Known *current = find_known(saved->img);
+    if (!current) rt_fault("lost parent image registration");
+    free(current->snap);
+    /* A recursive EXEC replaced this same Image's relocation base and
+     * snapshot. Restore only its parent, keeping other newly loaded images
+     * registered for VC's resident/copied code, and prefer the parent. */
+    *current = known[nknown - 1];
+    known[nknown - 1] = *saved;
+    free(saved);
+    nmoved_reset();
 }
 
 static int code_matches(const Known *k, uint32_t off, uint32_t L, uint32_t n) {

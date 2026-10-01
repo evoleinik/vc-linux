@@ -6,6 +6,7 @@ Linux. Read `README.md` for what it is and `docs/plans/2026-09-30-native-port.md
 ## Commands
 
     uv sync                 # Python tools: capstone, unicorn, pytest, pyte
+    tools/fetch-openwatcom.sh build/openwatcom && export WATCOM=$PWD/build/openwatcom
     make                    # images -> gen -> build/vc
     make test               # every suite, about 5 minutes
     make test-fs test-term test-ini   # the fast ones, seconds

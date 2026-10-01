@@ -6,7 +6,8 @@ Repeat SBB while planting/restoring a carry bug:
     .venv/bin/python -m pytest -q -s tests/test_translator_ops.py -k sbb
 
 Family parameterization only changes reporting/reproduction: the default suite
-walks every bytes/image-offset instruction from VC, GW-BASIC and bootLogo's validated listings.
+walks every bytes/image-offset instruction from VC, GW-BASIC, bootLogo and
+Rogue's validated listing/map front ends (including Rogue's complete CRT).
 """
 
 from __future__ import annotations
@@ -55,6 +56,22 @@ def test_every_linked_instruction_against_unicorn(instruction_library, family):
         assert failure is None, failure.decode() if failure else ""
 
 
+def test_oracle_executes_every_software_interrupt_vector():
+    """DoINTR adds reserved vectors too, notably Unicorn's INT 6 special case."""
+    decoder = Cs(CS_ARCH_X86, CS_MODE_16)
+    decoder.detail = True
+    cases = []
+    for vector in range(256):
+        insn = next(decoder.disasm(bytes([0xcd, vector]), 0x1234))
+        cases.append(InstructionCase(vector, "SOFTWARE_INTERRUPT_ORACLE_TEST", SimpleNamespace(
+            off=insn.address, insn=insn,
+        ), ()))
+    library = build_library(tuple(cases))
+    for vector in range(256):
+        failure = library.ops_check_instruction(vector, STATES_PER_INSTRUCTION)
+        assert failure is None, failure.decode() if failure else ""
+
+
 def _oracle_corruption_check(monkeypatch, opcode, before, after):
     """Alter only a test wrapper, proving the oracle notices a known error."""
     decoder = Cs(CS_ARCH_X86, CS_MODE_16)
@@ -84,6 +101,33 @@ def test_oracle_detects_corrupted_divide_fault_flags(monkeypatch):
     # interrupt entry, leaving the already-written interrupt frame untouched.
     failure = _oracle_corruption_check(monkeypatch, b"\xf7\xf3", "", "cpu.cf ^= 1;")
     assert "FLAGS differs" in failure and "compared_mask=ffff" in failure, failure
+
+
+def test_oracle_detects_corrupted_software_int6_flags(monkeypatch):
+    failure = _oracle_corruption_check(monkeypatch, b"\xcd\x06", "", "cpu.cf ^= 1;")
+    assert "FLAGS differs" in failure and "compared_mask=ffff" in failure, failure
+
+
+def test_int6_oracle_adapter_does_not_accept_an_actual_invalid_opcode(monkeypatch):
+    decoder = Cs(CS_ARCH_X86, CS_MODE_16)
+    decoder.detail = True
+    insn = next(decoder.disasm(b"\x0f\x0b", 0x1234))  # UD2, genuinely invalid.
+    case = InstructionCase(0, "INVALID_OPCODE_ORACLE_TEST", SimpleNamespace(off=insn.address, insn=insn), ())
+    original_metadata = ops_build._metadata
+
+    def mislabeled_interrupt(case):
+        metadata = original_metadata(case)
+        assert ".special=0, .vector=0" in metadata
+        return metadata.replace(".special=0, .vector=0", ".special=OPS_INT, .vector=6")
+
+    # A deliberately incorrect generated no-op makes the reference execute.
+    # Even mislabeled metadata must not turn UD2 into the INT 6 workaround.
+    monkeypatch.setattr(ops_build, "_metadata", mislabeled_interrupt)
+    monkeypatch.setattr(ops_build, "emit_instruction_function",
+                        lambda record, relocations, symbol: f"int {symbol}(uint16_t loadseg) {{ return 0; }}\n")
+    library = build_library((case,))
+    failure = library.ops_check_instruction(0, STATES_PER_INSTRUCTION)
+    assert failure is not None and b"UC_ERR_INSN_INVALID" in failure, failure
 
 
 @pytest.mark.parametrize("opcode", (b"\xec", b"\xed"), ids=("byte", "word"))

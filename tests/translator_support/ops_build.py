@@ -67,6 +67,7 @@ def load_cases() -> tuple[InstructionCase, ...]:
     from translator.linked import build_linked_layout
     from translator.nasm import build_nasm_layout, parse_nasm_listing
     from translator.supplement import build_gwbasic_graphics_layout
+    from translator.compiled import build_compiled_layout
     from tools.build_gwbasic import modules
 
     # Stock listings omit assembler-generated prologue/epilogue boundaries.
@@ -77,8 +78,12 @@ def load_cases() -> tuple[InstructionCase, ...]:
     assert generated.returncode == 0, generated.stdout
     result = []
     seen = set()
-    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM"):
-        if name == "GWBASIC.EXE":
+    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM", "ROGUE.EXE"):
+        if name == "ROGUE.EXE":
+            directory = ROOT / "build" / "rogue"
+            loaded = load_image(directory / name)
+            layout = build_compiled_layout(loaded, directory / "ROGUE.MAP")
+        elif name == "GWBASIC.EXE":
             directory = ROOT / "build" / "gwbasic"
             loaded = load_image(directory / name)
             layout = build_linked_layout(loaded, [directory / (module + ".lst") for module in modules()],

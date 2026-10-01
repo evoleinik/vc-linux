@@ -132,6 +132,21 @@ const isPanel = (text) => hasPanels(text) && text.includes('README');
 // independent of the left panel's remembered C: directory.
 const selected = (text) => (text.split('\n')[21] || '').slice(40);
 const commandLine = (text) => text.split('\n')[23] || '';
+const rogueStatus = /Level:\s*(\d+)\s+Gold:\s*\d+\s+Hp:\s*\d+\(\s*\d+\)/;
+const roguePlayers = (text) => text.split('\n').flatMap((line, row) =>
+  row > 0 && !rogueStatus.test(line)
+    ? Array.from(line).flatMap((char, col) => char === '@' ? [[row, col]] : []) : []);
+const isRogue = (text) => rogueStatus.test(text) && roguePlayers(text).length === 1 && text.includes('.');
+const rogueState = (text) => text.split('\n').slice(1).join('\n');
+
+async function quitRogue() {
+  send('Q');
+  await until('Rogue really quit? confirmation', (text) => text.toLowerCase().includes('really quit?'));
+  assert.ok(!hasPanels(screen), 'Q asks before ending the game');
+  send('y');
+  await until('VC panels after Rogue Q then y', hasPanels);
+  assert.equal(exitCalls, 0, 'quitting Rogue must not quit VC');
+}
 
 async function selectFile(name) {
   // The status row, not the listing (where every name is always visible),
@@ -418,7 +433,90 @@ try {
   await until('VC panels after the interrupted BASIC exits normally', isPanel);
   console.log('PASS 18: GW-BASIC still handles Ctrl-Break with Break in 10 and SYSTEM');
 
-  stage = '19 quit and exit hook';
+  stage = '19 Rogue installation and typed launch';
+  const rogueImage = vc.FS.readFile('/home/vc/GAMES/ROGUE.EXE');
+  assert.equal(String.fromCharCode(...rogueImage.slice(0, 2)), 'MZ',
+    'ROGUE.EXE is a real compiled DOS image in H:\\GAMES');
+  assert.ok(rogueImage.length > 50000, 'the game must contain the linked Rogue/PDCurses program');
+  assert.ok(!vc.FS.analyzePath('/home/vc/ROGUE.EXE').exists,
+    'DOS PATH finds H:\\GAMES without a second root copy');
+  assert.match(vc.FS.readFile('/home/vc/GAMES/ROGUELIC.TXT', { encoding: 'utf8' }),
+    /Michael Toy, Ken Arnold and Glenn Wichman/);
+  assert.match(vc.FS.readFile('/home/vc/GAMES/PDCLIC.TXT', { encoding: 'utf8' }), /public domain/);
+  send('rogue\r');
+  await until('Rogue dungeon and Level: 1 Gold: Hp: status', (text) =>
+    isRogue(text) && rogueStatus.exec(text)[1] === '1');
+  assert.equal(graphics, null, 'PDCurses uses the real DOS text screen');
+  console.log('PASS 19: rogue resolves the real H:\\GAMES\\ROGUE.EXE and shows a level-1 dungeon');
+
+  stage = '20 Rogue movement';
+  const [oldRow, oldColumn] = roguePlayers(screen)[0];
+  const rogueLines = screen.split('\n');
+  const moves = [['h', 0, -1], ['j', 1, 0], ['k', -1, 0], ['l', 0, 1],
+    ['y', -1, -1], ['u', -1, 1], ['b', 1, -1], ['n', 1, 1]];
+  const movement = ['.', '*%:!?)=/]'].flatMap((floor) =>
+    moves.filter(([, dy, dx]) => floor.includes(rogueLines[oldRow + dy]?.[oldColumn + dx])))[0];
+  assert.ok(movement, 'the lit first-level room must have an adjacent unoccupied floor');
+  const [moveKey, dy, dx] = movement;
+  send(moveKey);
+  // Some traps emit two messages before updating @. Handle their visible
+  // prompt while waiting, without allowing a dropped movement key to pass.
+  for (let messages = 0; messages <= 8; ++messages) {
+    await until('Rogue movement changes @ or asks --More--', (text) => text.includes('--More--')
+      || isRogue(text) && roguePlayers(text).some(([row, col]) => row !== oldRow || col !== oldColumn));
+    if (!screen.includes('--More--')) break;
+    assert.ok(messages < 8, 'Rogue movement produces at most eight continuation prompts');
+    const previous = screen;
+    send(' ');
+    await until('Rogue acknowledges its visible --More-- prompt', (text) => text !== previous);
+  }
+  assert.ok(!screen.includes('--More--'), 'Rogue is ready for the next command');
+  // Level 1 can contain a hidden teleport trap. T_TELEP in move.c silently
+  // relocates @ and draws ^ at the selected cell; @ must still change.
+  const revealedTeleport = rogueLines[oldRow + dy][oldColumn + dx] !== '^'
+    && screen.split('\n')[oldRow + dy][oldColumn + dx] === '^'
+    && roguePlayers(screen).some(([row, col]) => row !== oldRow || col !== oldColumn);
+  if (!(screen.toLowerCase().includes('you fell into a trap!') && rogueStatus.exec(screen)[1] !== '1'
+        || revealedTeleport))
+    assert.deepEqual(roguePlayers(screen), [[oldRow + dy, oldColumn + dx]],
+      'an ordinary movement key changes @ by exactly one requested step');
+  const savedRogueState = rogueState(screen);
+  console.log('PASS 20: a real movement key moves @ in Rogue');
+
+  stage = '21 Rogue save and restore';
+  send('S');
+  await until('Rogue default save confirmation', (text) => text.toLowerCase().includes('save file (rogue.sav)?'));
+  send('y');
+  await until('VC panels after Rogue saves', isPanel);
+  assert.ok(vc.FS.stat('/home/vc/rogue.sav').size > 4096, 'S writes game state to the current H: directory');
+  assert.ok(vc.FS.analyzePath('/home/vc/rogue.scr').exists, 'scores use the current H: directory too');
+  assert.ok(!vc.FS.analyzePath('/home/vc/GAMES/rogue.sav').exists,
+    'the save directory is not the executable directory');
+  send('rogue\r');
+  await until('plain rogue restores the same dungeon, @ and status', (text) =>
+    isRogue(text) && rogueState(text) === savedRogueState);
+  assert.ok(!vc.FS.analyzePath('/home/vc/rogue.sav').exists, 'successful restore consumes the save');
+  console.log('PASS 21: S/y writes the current-directory save and rogue restores the exact game');
+
+  stage = '22 Rogue Q/y returns to VC';
+  await quitRogue();
+  await until('H: root panels after Rogue quit', isPanel);
+  console.log('PASS 22: Q then y ends Rogue and redraws VC panels');
+
+  stage = '23 Enter on ROGUE.EXE';
+  send('cd GAMES\r');
+  await until('GAMES panel for Rogue Enter launch', (text) =>
+    hasPanels(text) && commandLine(text).trimEnd() === 'H:\\GAMES>');
+  await selectFile('ROGUE.EXE');
+  send('\r');
+  await until('Enter on ROGUE.EXE starts a fresh dungeon', (text) =>
+    isRogue(text) && rogueStatus.exec(text)[1] === '1');
+  await quitRogue();
+  send('cd ..\r');
+  await until('H: root panel after Rogue Enter launch', isPanel);
+  console.log('PASS 23: Enter on H:\\GAMES\\ROGUE.EXE plays and returns to VC');
+
+  stage = '24 quit and exit hook';
   send('\x1b[21~');
   await until('the quit confirmation', (text) =>
     text.includes('Do you want to quit the Volkov Commander?') && text.includes('Yes'));
@@ -426,8 +524,8 @@ try {
   await until('the JavaScript exit hook', () => exitCalls > 0);
   assert.equal(exitCalls, 1, 'the exit hook fires exactly once');
   assert.equal(exitCode, 0, 'VC exits successfully');
-  console.log('PASS 19: F10, Enter quits and fires the exit hook');
-  console.log('web smoke: all 19 checks passed');
+  console.log('PASS 24: F10, Enter quits and fires the exit hook');
+  console.log('web smoke: all 24 checks passed');
   process.exit(0);
 } catch (error) {
   let log = '';

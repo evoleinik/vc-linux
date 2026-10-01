@@ -181,6 +181,66 @@ MASM `?` and `DUP(?)` allocations have no defined initial bytes. Their printed
 zero placeholders are not compared: notably, VC.COM overlays those reserved
 buffers with real code using `ORG`.
 
+## Compiled C: Watcom OMF and a verbose map
+
+Rogue uses the additional `--format watcom` front end:
+
+```sh
+WATCOM=/path/to/openwatcom make rogue
+.venv/bin/python -m translator build/rogue/ROGUE.EXE --format watcom \
+  --map build/rogue/ROGUE.MAP --name ROGUE.EXE --symbol image_rogue \
+  -o build/gen/rogue.c
+```
+
+This is a map-driven path, not an EXE disassembly sweep. The map's module
+contributions identify every object that was actually linked, including
+PDCurses and selected C-library members. `omf.py` reads their original OMF
+records directly out of object/library files. `compiled.py` verifies their
+segment sizes/classes, expands initialized LEDATA/LIDATA, resolves every
+FIXUPP against segment/group/public addresses, compares every initialized
+byte with the EXE, and requires the complete MZ relocation table and exact
+entry CS:IP to agree with the map.
+Code frames come from the map's segment part, not from paragraph-rounding a
+module contribution; a large-model program has several 64-KiB code frames.
+
+WDIS disassembles those same original objects. Its OMF-aware data-in-code
+metadata distinguishes switch tables and literal constants from instructions.
+The `.dis` listings and original extracted objects are cached under
+`build/rogue/disasm/` by object-content hash. Listing bytes must agree with
+OMF; instruction lengths must agree with Capstone decoding the linked bytes;
+every initialized CODE byte needs a listing row. Data classifications also
+need independent OMF FD/s scan ranges or complete scalar-fixup fields, so
+relabeling a callback instruction as data cannot hide it. Removing a CRT member,
+instruction row, fixup or callback target fails before a game can start.
+
+The preferred WDIS → JWasm → JWlink round trip was tried and is retained as
+an executable regression test. It does not preserve instruction encodings:
+Watcom's `MOV DX,AX` is `89 C2`, but JWasm chooses `8B D0`; `SUB AX,DX`
+changes from `29 D0` to `2B C2`. `-Zg` does not fix this. The test extracts
+every selected original CRT object (old JWlink also rejects the new library
+dictionary attribute), links both EXEs and compares their unrelocated code.
+Restoring direction bits with raw DB directives would require exactly the
+OMF byte/boundary knowledge used by the map front end, without an additional
+independent source of truth.
+
+Function-pointer and switch destinations come from all resolved code-address
+fixups, including local symbols absent from the map's public table. Their
+complete successor closure and all procedure/entry addresses must exist in
+the generated dispatcher. Rogue's option/daemon/fuse callbacks and the CRT's
+formatting/scanning and XI/YI initializer tables are included. Watcom's
+`_DoINTR_` is the one computed-return template: it dispatches by RETF to a
+256-entry `3 * intno` table. The gate proves its arithmetic and every slot's
+bytes and requires all 256 targets, including INT 3 and DOS 25h/26h special
+slots. No playback trace is used to discover missing entries.
+
+Every distinct compiled instruction joins the normal 32-state Unicorn gate.
+Unsupported opcodes and unproved CS-relative instruction stores are build
+errors. Compiled programs use 64-instruction C chunks to bound compiler
+optimization cost; the older ASM/NASM front ends and their generated C are
+unchanged. This path currently accepts 16-bit OMF only; unsupported communal,
+absolute-segment, 32-bit, or iterated-data-fixup forms fail explicitly rather
+than silently weakening byte verification.
+
 ## Boundaries and limitations
 
 The listing parser is deliberately aimed at this JWasm listing dialect and

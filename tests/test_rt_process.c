@@ -54,6 +54,7 @@ const Image image_gwbasic = {
     .hdr_sp = 0x800, .min_alloc = 0x100, .max_alloc = 0x100, .run = basic_run,
 };
 const Image image_bootlogo = {.name = "LOGO.COM"}; /* Not executed by this fixture. */
+const Image image_rogue = {.name = "ROGUE.EXE"}; /* Not executed by this fixture. */
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file},

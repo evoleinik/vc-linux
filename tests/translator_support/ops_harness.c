@@ -10,6 +10,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <setjmp.h>
+#include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -203,6 +204,25 @@ static void unicorn_interrupt(uc_engine *uc, uint32_t vector, void *data) {
     uc_emu_stop(uc);
 }
 
+static bool unicorn_invalid_instruction(uc_engine *uc, void *data) {
+    /* Unicorn 2.1.4 routes the valid software INT 6 (CD 06) through its #UD
+     * hook, not UC_HOOK_INTR. Recover only those exact fetched bytes and the
+     * unchanged starting IP, then use the same independent Intel interrupt
+     * entry implementation as every other vector. Real invalid opcodes are
+     * still errors; no case/state or register/flag/memory comparison is lost.
+     */
+    uint32_t address = ((uint32_t)current_loadseg << 4) + current->offset;
+    uint32_t ip = 0;
+    if (!(current->special & OPS_INT) || current->vector != 6 ||
+        current->length != 2 || reference_memory[address] != 0xcd ||
+        reference_memory[address + 1] != 6)
+        return false;
+    if (uc_reg_read(uc, UC_X86_REG_IP, &ip) || ip != starting[OPS_IP])
+        return false;
+    unicorn_interrupt(uc, 6, data);
+    return true;
+}
+
 static void unicorn_code(uc_engine *uc, uint64_t address, uint32_t size, void *data) {
     (void)size; (void)data;
     if ((current->special & OPS_REP) &&
@@ -223,6 +243,9 @@ static uc_err initialize(void) {
     error = uc_hook_add(reference, &hook, UC_HOOK_MEM_WRITE, unicorn_write, NULL, 1, 0);
     if (error) return error;
     error = uc_hook_add(reference, &hook, UC_HOOK_INTR, unicorn_interrupt, NULL, 1, 0);
+    if (error) return error;
+    error = uc_hook_add(reference, &hook, UC_HOOK_INSN_INVALID,
+                        unicorn_invalid_instruction, NULL, 1, 0);
     if (error) return error;
     error = uc_hook_add(reference, &hook, UC_HOOK_CODE, unicorn_code, NULL, 1, 0);
     if (error) return error;

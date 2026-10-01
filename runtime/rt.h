@@ -34,11 +34,11 @@ void rt_run(void);
  * Linux stays silent; the browser forwards changes to Module.vcSpeaker. */
 double rt_speaker_hz(void);
 
-/* Preserve the parent's interrupt vectors and PIT/PIC/speaker state while
- * a DOS child runs. Normal exits discard this snapshot; a forced exit must
- * restore it because the child cannot execute its own cleanup routines. */
+/* Preserve the active parent's image registration, including its original
+ * relocated bytes, across every child exit. Interrupt vectors and device
+ * state are restored only on forced exits, when child cleanup cannot run. */
 typedef struct RtProcessState RtProcessState;
-RtProcessState *rt_save_process_state(void);
+RtProcessState *rt_save_process_state(const Image *parent);
 void rt_finish_process_state(RtProcessState *state, int restore);
 
 /* dos_core.c */

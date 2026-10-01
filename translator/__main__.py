@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 from .emit import EmissionError, emit_image
+from .compiled import build_compiled_layout
 from .image import ImageError, load_image
 from .layout import LayoutError, build_layout
 from .listing import ListingError, parse_listing
@@ -16,10 +17,11 @@ from .supplement import build_gwbasic_graphics_layout, emit_supplement
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
-    parser.add_argument("listing", type=Path, nargs="+")
+    parser.add_argument("listing", type=Path, nargs="*")
     parser.add_argument("--map", type=Path, help="JWlink verbose map for a multi-module EXE")
-    parser.add_argument("--format", choices=("jwasm", "nasm"), default="jwasm",
+    parser.add_argument("--format", choices=("jwasm", "nasm", "watcom"), default="jwasm",
                         help="listing dialect (NASM requires -LefFt and a flat COM)")
+    parser.add_argument("--watcom", type=Path, help="OpenWatcom root (otherwise WATCOM)")
     parser.add_argument("--supplement", choices=("gwbasic-graphics",),
                         help="emit additional source-proved indirect entries only")
     parser.add_argument("--name", required=True, help="DOS image name")
@@ -27,7 +29,11 @@ def main() -> int:
     parser.add_argument("-o", "--output", required=True, type=Path)
     args = parser.parse_args()
     try:
-        if args.format == "nasm":
+        if args.format == "watcom":
+            if not args.map or args.listing or args.supplement:
+                parser.error("Watcom requires --map and obtains all OMF inputs from it")
+            layout = build_compiled_layout(load_image(args.image), args.map, watcom=args.watcom)
+        elif args.format == "nasm":
             if args.map or len(args.listing) != 1:
                 parser.error("NASM requires one flat-COM listing, without --map")
             layout = build_nasm_layout(load_image(args.image), parse_nasm_listing(args.listing[0]))

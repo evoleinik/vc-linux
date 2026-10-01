@@ -19,6 +19,7 @@ static const uint8_t vc_file[] = {0xCD, 0x20};
 static const uint8_t ovl_file[] = {'M', 'Z', 1, 0, 0, 0, 0, 0, 0xCB};
 static const uint8_t basic_file[] = {'M', 'Z', 2, 0, 0, 0, 0, 0, 0x90, 0xCB};
 static const uint8_t logo_file[] = {0xB8, 0x04, 0x00, 0xCD, 0x10, 0xCD, 0x20};
+static const uint8_t rogue_file[] = {'M', 'Z', 3, 0, 0, 0, 0, 0, 0xB8, 0x00, 0x4C, 0xCD, 0x21};
 static const uint8_t association[] = "bas: gwbasic !.!\r\n";
 const Image image_vc_com = {.name = "VC.COM", .bytes = vc_file, .size = sizeof vc_file};
 const Image image_vc_ovl = {
@@ -30,11 +31,16 @@ const Image image_gwbasic = {
     .hdr_sp = 0x100, .min_alloc = 0x10, .max_alloc = 0x20,
 };
 const Image image_bootlogo = {.name = "LOGO.COM", .bytes = logo_file, .size = sizeof logo_file};
+const Image image_rogue = {
+    .name = "ROGUE.EXE", .is_exe = 1, .bytes = rogue_file + 8, .size = sizeof rogue_file - 8,
+    .hdr_sp = 0x200, .min_alloc = 0x20, .max_alloc = 0x30,
+};
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file}, {"VC.EXT", association, sizeof association - 1},
     /* The installed asset name is independent of the translation's label. */
     {"BOOTLOGO.COM", logo_file, sizeof logo_file},
+    {"ROGUE.EXE", rogue_file, sizeof rogue_file},
 };
 const int embedded_file_count = sizeof embedded_files / sizeof embedded_files[0];
 int hle_redirect, rt_exited, rt_exit_code;
@@ -44,7 +50,7 @@ static uint16_t parent_psp;
 static char fixture[128], original_cwd[4096], output[4096];
 
 void rt_register_image(const Image *img, uint16_t seg) { (void)seg; registered = img; }
-RtProcessState *rt_save_process_state(void) { return malloc(1); }
+RtProcessState *rt_save_process_state(const Image *parent) { (void)parent; return malloc(1); }
 void rt_finish_process_state(RtProcessState *state, int restore) { (void)restore; free(state); }
 void rt_log(const char *fmt, ...) { (void)fmt; }
 void rt_update_clock(void) {}
@@ -272,6 +278,43 @@ static void test_search(void) {
     CHECK(!hle_redirect && cpu.cf && cpu.a.x == 2 && !host_runs);
 }
 
+static void test_rogue_identity(void) {
+    /* Compiled C is still a DOS executable: its name and extension do not
+     * select the runner, and even a header-only change must be refused. */
+    const char *names[] = {"ROGUE.EXE", "DUNGEON.EXE", "RENAMED.COM"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        host_file(names[i], rogue_file, sizeof rogue_file);
+        fresh_machine();
+        exec_file(names[i], " -r");
+        CHECK(registered == &image_rogue && !host_runs);
+        CHECK(cpu.ip == 0 && cpu.cs == cpu.ds + 0x10 && cpu.sp == 0x200);
+        CHECK(!memcmp(mem + lin(cpu.cs, 0), rogue_file + 8, sizeof rogue_file - 8));
+        child_tail(" -r");
+        end_child();
+    }
+    for (size_t byte = 0; byte < sizeof rogue_file; ++byte) {
+        uint8_t changed[sizeof rogue_file];
+        memcpy(changed, rogue_file, sizeof changed);
+        changed[byte] ^= 1;
+        host_file("DUNGEON.EXE", changed, sizeof changed);
+        fresh_machine();
+        exec_file("DUNGEON.EXE", "");
+        CHECK(!hle_redirect && !registered && cpu.cf && cpu.a.x == 11 && !host_runs);
+    }
+    for (int quick = 0; quick < 2; ++quick) {
+        fresh_machine();
+        command("rogue", quick);
+        CHECK(registered == &image_rogue && !host_runs);
+        end_child();
+    }
+    CHECK(rename("ROGUE.EXE", "BIN1/ROGUE.EXE") == 0);
+    fresh_machine();
+    path_env("H:\\BIN1");
+    command("rogue", 0);
+    CHECK(registered == &image_rogue && !host_runs);
+    end_child();
+}
+
 static void test_association(void) {
     host_file("safe;touch PWNED;.bas", (const uint8_t *)"10 END\r\n", 8);
     for (int quick = 0; quick < 2; quick++) {
@@ -387,6 +430,7 @@ int main(void) {
     test_exec_identity();
     test_logo_identity();
     test_search();
+    test_rogue_identity();
     test_association();
     test_psp_services();
     test_child_fcb_lifetime();

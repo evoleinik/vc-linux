@@ -1,7 +1,8 @@
 # Instruction oracle
 
 `test_translator_ops.py` validates the production emitter for every distinct
-`(linked bytes, image offset)` pair in both images. Identical pairs with different
+`(linked bytes, image offset)` pair in VC, GW-BASIC, bootLogo and Rogue (all
+selected PDCurses/CRT objects included). Identical pairs with different
 relocation meanings are retained separately. Every retained instruction receives
 32 accepted deterministic random states; pytest groups by mnemonic only to make
 failures and `-k sbb` reruns convenient. No instruction family is sampled out.
@@ -45,6 +46,19 @@ is restored before every state: otherwise its retained exception state converts
 a second #DE into a spurious #DF. TF is randomized, but post-step #DB notifications
 are not dispatched because the comparison observes one instruction's result,
 before debugger entry.
+
+Rogue's Watcom `_DoINTR_` table exercises every software interrupt vector.
+Unicorn 2.1.4 unexpectedly sends valid `CD 06` to `UC_HOOK_INSN_INVALID` with
+unchanged IP, instead of calling `UC_HOOK_INTR`. The first complete Rogue gate
+failed at image offset `0x1955f`, load segment `0x1666`, CS:IP `1ff5:fc6f`,
+SS:SP `5c16:0000`, FLAGS `31d2`, with `UC_ERR_INSN_INVALID`. No other vector
+failed when all 256 were probed independently. A narrowly guarded invalid
+instruction callback verifies actual fetched `CD 06`, vector/length metadata,
+and the unchanged IP, then invokes the same independent interrupt-entry
+oracle used for every other INT. All 32 states and all register/flag/write
+comparisons remain. Tests cover all 256 vectors, deliberate CF corruption
+after INT 6, and a mislabeled real UD2 that must still be rejected. The two
+INT 6 tests were observed failing before that adapter was installed.
 
 ## Deliberate state restriction: no active-code writes
 

@@ -134,7 +134,10 @@ static void install_files(const char *dir) {
 #ifdef __EMSCRIPTEN__
         /* H: is the program drive in the browser. Configuration remains out
          * of sight under /var/vc/config, as before. */
-        const char *target = !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM")
+        int rogue_asset = !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "ROGUELIC.TXT") ||
+                          !strcmp(f->name, "PDCLIC.TXT") || !strcmp(f->name, "OWLIC.TXT");
+        const char *target = rogue_asset ? "/home/vc/GAMES" :
+            !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM")
             ? "/home/vc" : dir;
 #else
         const char *target = dir;
@@ -145,7 +148,8 @@ static void install_files(const char *dir) {
             exit(1);
         }
         int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL") ||
-                      !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM");
+                      !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
+                      !strcmp(f->name, "ROGUE.EXE");
         if (!program && access(path, F_OK) == 0 && !holds_retired_default(path, f->name)) continue;
         if (!file_matches(path, f) && install_file(path, f)) {
             fprintf(stderr, "vc: cannot write %s: %s\n", path, strerror(errno));
