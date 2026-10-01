@@ -13,7 +13,7 @@ machine, then reimplements the DOS and BIOS services it calls on top of Linux. T
 comes out is native x86-64 code. No emulator runs at run time. You manage real Linux files with
 the real VC: the same keys, colours, dialogs and quirks.
 
-**Try it in your browser: [evoleinik.github.io/vc-linux](https://evoleinik.github.io/vc-linux/).**
+**Try it in your browser: [notanemulator.com](https://notanemulator.com/).**
 The same translated code, compiled to WebAssembly. It starts at once, with GW-BASIC and twelve
 classic BASIC games on its `H:` drive.
 

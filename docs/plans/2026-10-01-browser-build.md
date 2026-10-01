@@ -80,3 +80,8 @@ Built by codex from `docs/briefs/10-browser.md`, then checked in Chromium.
 
 Known limits: the paste queue in `web/vc-web.js` has no cap. MEMFS has no birth time, so a
 file's creation date falls back to its change time.
+
+Domain, 2026-10-01: Eugene registered `notanemulator.com` at GoDaddy and added the four GitHub
+Pages A records. Claude deleted GoDaddy's "Parked" A record, pointed `www` at
+`evoleinik.github.io`, set the Pages custom domain and turned on HTTPS. The github.io and `www`
+addresses now redirect to https://notanemulator.com/.
