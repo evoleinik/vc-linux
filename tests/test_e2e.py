@@ -335,6 +335,19 @@ def test_home_is_drive_h(tmp_path):
         s.close()
 
 
+def test_overlong_config_path_is_a_plain_error(work, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    s = VcSession(work, home, extra_env={"XDG_CONFIG_HOME": str(tmp_path / ("c" * 140))})
+    try:
+        assert s.wait_exit() == 1
+    finally:
+        s.close()
+    screen = "".join(s.screen.display)  # the message wraps at 80 columns
+    assert "set XDG_CONFIG_HOME to a shorter directory" in screen
+    assert "AX=" not in screen  # no register dump
+
+
 def test_refuses_to_run_without_a_terminal(work):
     import subprocess
     r = subprocess.run([str(VC)], cwd=work, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)

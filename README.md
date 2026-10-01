@@ -1,5 +1,8 @@
 # vc-linux
 
+[![ci](https://github.com/evoleinik/vc-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/evoleinik/vc-linux/actions/workflows/ci.yml)
+[![license: BSD-2](https://img.shields.io/badge/license-BSD--2-blue)](LICENSE)
+
 **Volkov Commander, the DOS file manager, running natively on Linux.**
 
 ![Volkov Commander on Linux: two panels, the Copy dialog open](docs/screenshot.png)
@@ -20,12 +23,17 @@ the real VC: the same keys, colours, dialogs and quirks.
 
 ## Quick start
 
+    curl -fLo vc https://github.com/evoleinik/vc-linux/releases/latest/download/vc-linux-x86_64
+    chmod +x vc && ./vc
+
+That is one static binary for x86-64 Linux, with no dependencies. You need a terminal of at least
+80×25. Set `COLORTERM=truecolor` for the exact VGA palette.
+
+To build from source, you need gcc, make and [uv](https://docs.astral.sh/uv/):
+
     git clone https://github.com/evoleinik/vc-linux && cd vc-linux
     uv sync && make
     build/vc
-
-You need Linux on x86-64, gcc, make and [uv](https://docs.astral.sh/uv/), plus a terminal of at
-least 80×25. Set `COLORTERM=truecolor` for the exact VGA palette.
 
 `build/vc [DIRECTORY]` opens in that directory. Settings live in `~/.config/vc-linux/` and a log
 goes to `~/.cache/vc-linux/vc.log`.

@@ -791,8 +791,13 @@ static void mark_valid_drives(void) {
 void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
     mark_valid_drives();
     uint8_t dos_prog[128];
-    if (utf8_to_dos(host_prog, dos_prog, sizeof dos_prog))
-        rt_fault("%s: path too long for DOS or not representable in code page 866", host_prog);
+    if (utf8_to_dos(host_prog, dos_prog, sizeof dos_prog)) {
+        /* A user error, not a crash: say what to change. */
+        term_shutdown();
+        fprintf(stderr, "vc: %s: DOS needs this path under 128 bytes in code page 866;"
+                        " set XDG_CONFIG_HOME to a shorter directory\n", host_prog);
+        exit(1);
+    }
 
     char env[2048];
     size_t n = 0;
