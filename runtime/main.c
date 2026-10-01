@@ -62,8 +62,12 @@ static int holds_retired_default(const char *path, const char *name) {
     return 0;
 }
 
-static int file_matches(const char *path, const EmbeddedFile *file) {
-    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+/* A one-byte migration can compare the previous default without keeping a
+ * second embedded copy. change_at == size requests an ordinary exact match. */
+static int file_matches_with_change(const char *path, const EmbeddedFile *file,
+                                    size_t change_at, uint8_t old_byte) {
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC |
+                       (change_at < file->size ? O_NOFOLLOW : 0));
     if (fd < 0) return 0;
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size != file->size) {
@@ -77,7 +81,18 @@ static int file_matches(const char *path, const EmbeddedFile *file) {
     for (size_t at = 0; at < file->size;) {
         size_t n = file->size - at;
         if (n > sizeof buf) n = sizeof buf;
-        if (fread(buf, 1, n, in) != n || memcmp(buf, file->data + at, n)) {
+        if (fread(buf, 1, n, in) != n) {
+            matches = 0;
+            break;
+        }
+        if (change_at >= at && change_at < at + n) {
+            if (buf[change_at - at] != old_byte) {
+                matches = 0;
+                break;
+            }
+            buf[change_at - at] = file->data[change_at];
+        }
+        if (memcmp(buf, file->data + at, n)) {
             matches = 0;
             break;
         }
@@ -86,6 +101,24 @@ static int file_matches(const char *path, const EmbeddedFile *file) {
     if (matches && (fgetc(in) != EOF || ferror(in))) matches = 0;
     if (fclose(in)) matches = 0;
     return matches;
+}
+
+static int file_matches(const char *path, const EmbeddedFile *file) {
+    return file_matches_with_change(path, file, file->size, 0);
+}
+
+static int holds_retired_vz_default(const char *path, const EmbeddedFile *file) {
+    if (strcmp(file->name, "VZ.DEF")) return 0;
+    static const uint8_t backup[] = "\r\nEb+\t\t\t;make backup\r\n";
+    size_t found = file->size;
+    for (size_t at = 0; at + sizeof backup - 1 <= file->size; at++) {
+        if (memcmp(file->data + at, backup, sizeof backup - 1)) continue;
+        if (found != file->size) return 0; /* Refuse an ambiguous definition. */
+        found = at;
+    }
+    /* Only the exact previously shipped bytes qualify; user-edited settings,
+     * including another Eb- definition, remain owned by the user. */
+    return found != file->size && file_matches_with_change(path, file, found + 4, '-');
 }
 
 /* A concurrent vc, or one whose write fails, must never expose a truncated
@@ -136,8 +169,12 @@ static void install_files(const char *dir) {
          * of sight under /var/vc/config, as before. */
         int rogue_asset = !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "ROGUELIC.TXT") ||
                           !strcmp(f->name, "PDCLIC.TXT") || !strcmp(f->name, "OWLIC.TXT");
+        const char *ext = strrchr(f->name, '.');
+        /* VZ loads its English definitions next to its COM, not VC.INI. */
         const char *target = rogue_asset ? "/home/vc/GAMES" :
-            !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM")
+            !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
+            !strcmp(f->name, "VZ.COM") || !strcmp(f->name, "VZLIC.TXT") ||
+            (ext && !strcmp(ext, ".DEF"))
             ? "/home/vc" : dir;
 #else
         const char *target = dir;
@@ -149,8 +186,11 @@ static void install_files(const char *dir) {
         }
         int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL") ||
                       !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
-                      !strcmp(f->name, "ROGUE.EXE");
-        if (!program && access(path, F_OK) == 0 && !holds_retired_default(path, f->name)) continue;
+                      !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "VZ.COM");
+        struct stat existing;
+        if (!program && !lstat(path, &existing) &&
+            (!S_ISREG(existing.st_mode) ||
+             (!holds_retired_default(path, f->name) && !holds_retired_vz_default(path, f)))) continue;
         if (!file_matches(path, f) && install_file(path, f)) {
             fprintf(stderr, "vc: cannot write %s: %s\n", path, strerror(errno));
             exit(1);

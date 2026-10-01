@@ -1,0 +1,6 @@
+MSG.ASM(11) : Error A2209: Syntax error: label	byte
+ GDATA(1)[vz.inc]: Macro called from
+  MSG.ASM(11): Main line code
+MSG.ASM(140) : Error A2209: Syntax error: label byte
+ GDATA(1)[vz.inc]: Macro called from
+  MSG.ASM(140): Main line code

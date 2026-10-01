@@ -6,8 +6,8 @@ Repeat SBB while planting/restoring a carry bug:
     .venv/bin/python -m pytest -q -s tests/test_translator_ops.py -k sbb
 
 Family parameterization only changes reporting/reproduction: the default suite
-walks every bytes/image-offset instruction from VC, GW-BASIC, bootLogo and
-Rogue's validated listing/map front ends (including Rogue's complete CRT).
+walks every bytes/image-offset instruction from VC, GW-BASIC, bootLogo, Rogue
+and VZ's validated listing/map front ends (including Rogue's complete CRT).
 """
 
 from __future__ import annotations
@@ -69,6 +69,35 @@ def test_oracle_executes_every_software_interrupt_vector():
     library = build_library(tuple(cases))
     for vector in range(256):
         failure = library.ops_check_instruction(vector, STATES_PER_INSTRUCTION)
+        assert failure is None, failure.decode() if failure else ""
+
+
+def test_oracle_executes_patched_software_interrupt_vectors():
+    """VZ's live vector must also reach Rogue's reserved INT 6 adapter."""
+    decoder = Cs(CS_ARCH_X86, CS_MODE_16)
+    decoder.detail = True
+    instruction = next(decoder.disasm(b"\xcd\x00", 0x1234))
+    record = SimpleNamespace(off=instruction.address, insn=instruction,
+                             mutable_offsets=(1,), linked=True)
+    library = build_library((InstructionCase(0, "PATCHED_INTERRUPT_ORACLE_TEST", record, ()),))
+    # The deterministic random stream reaches live CD 06 at sample 54, even
+    # though the original template and its metadata specify INT 0.
+    failure = library.ops_check_instruction(0, 1024)
+    assert failure is None, failure.decode() if failure else ""
+
+
+def test_vz_oracle_includes_both_macro_variants():
+    cases = [case for case in CASES if case.image_name == "VZ.COM"]
+    assert len(cases) > 20000
+    variants = [case for case in cases if case.record.variants]
+    assert [case.name for case in variants] == ["int", "jmp"]
+    # A zero DW is not a real third execution path; &i patches it first.
+    assert all(bytes(case.record.insn.bytes) != b"\0\0" for case in variants)
+    small = tuple(InstructionCase(index, case.image_name, case.record, case.relocations)
+                  for index, case in enumerate(variants))
+    library = build_library(small)
+    for case in small:
+        failure = library.ops_check_instruction(case.index, STATES_PER_INSTRUCTION)
         assert failure is None, failure.decode() if failure else ""
 
 
@@ -148,7 +177,8 @@ def test_oracle_detects_truncated_input_port(monkeypatch, opcode):
     (bytes.fromhex("b80000"), (1, 2)),
     (bytes.fromhex("eaffffffff"), (1, 2, 3, 4)),
     (bytes.fromhex("b8030c"), (1,)),
-], ids=("patched-ds", "patched-isr", "bootlogo-color"))
+    (bytes.fromhex("cd00"), (1,)),
+], ids=("patched-ds", "patched-isr", "bootlogo-color", "vz-interrupt"))
 def test_oracle_detects_ignored_patched_operand(monkeypatch, opcode, mutable):
     decoder = Cs(CS_ARCH_X86, CS_MODE_16)
     decoder.detail = True

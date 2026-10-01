@@ -506,6 +506,412 @@ static void test_alias_collision_scale(void)
     }
 }
 
+static void host_equals(const char *name, const char *expected, const char *why)
+{
+    char path[PATH_MAX], bytes[256];
+    host_path(path, sizeof path, name);
+    int fd = open(path, O_RDONLY);
+    CHECK(fd >= 0, "%s: host file exists", why);
+    if (fd < 0) return;
+    ssize_t n = read(fd, bytes, sizeof(bytes));
+    CHECK(n == (ssize_t)strlen(expected) && !memcmp(bytes, expected, strlen(expected)),
+          "%s: selected host contents remain exact", why);
+    close(fd);
+}
+
+static DosPathLease *pin_file(const char *name, char dos[128])
+{
+    path_begin(0x6000, name);
+    if (!ok("canonical path before editor lease")) return NULL;
+    getstr(ES, OUT, dos, 128);
+    char host[PATH_MAX];
+    host_path(host, sizeof(host), name);
+    Cpu before = cpu;
+    DosPathLease *lease = NULL;
+    int error = dos_fs_pin_path(dos, host, &lease);
+    CHECK(!error && lease, "prepare editor path lease: DOS error %d", error);
+    CHECK(!memcmp(&cpu, &before, sizeof(cpu)), "preparing a path lease does not change DOS registers");
+    return lease;
+}
+
+static void refused_lease_open(const char *dos, unsigned fn, const char *why)
+{
+    path_begin((uint16_t)fn, dos);
+    if (!error(5, why) && !cpu.cf) close_file(cpu.a.x);
+}
+
+static void test_path_lease_alias_changes(void)
+{
+    char path[PATH_MAX], dos[128], lower[128], ordinary[128];
+    host_path(path, sizeof path, "PinPath");
+    host_require(mkdir(path, 0755) == 0, "mkdir pinned path fixture");
+    host_file("PinPath/sameprefix-a.txt", "alpha", 0644);
+    host_file("PinPath/sameprefix-b.txt", "bravo", 0644);
+    DosPathLease *lease = pin_file("PinPath/sameprefix-b.txt", dos);
+    if (!lease) return;
+    CHECK(strstr(dos, "SAMEPR~2.TXT") != NULL, "lease fixture starts at the second short alias");
+    host_file("PinPath/sameprefix-0.txt", "zero", 0644);
+    /* A prepared-but-unbound lease must not alter the parent's name view. */
+    uint16_t h = open_file(dos, 0);
+    if (h != 0xffff) { read_equals(h, "alpha", "pending lease is not active"); close_file(h); }
+    dos_fs_bind_path(lease, 0x5aa5);
+    dos_fs_set_process(0x5aa5);
+    for (size_t i = 0; i <= strlen(dos); ++i)
+        lower[i] = dos[i] >= 'A' && dos[i] <= 'Z' ? (char)(dos[i] + ('a' - 'A')) : dos[i];
+    h = open_file(lower, 2);
+    if (h != 0xffff) { read_equals(h, "bravo", "pinned alias survives sibling insertion");
+        seek_file(h, 0, 0); write_bytes(h, "saved"); close_file(h); }
+    host_equals("PinPath/sameprefix-b.txt", "saved", "save follows original selected file");
+    host_equals("PinPath/sameprefix-a.txt", "alpha", "save never targets the reassigned sibling");
+    host_equals("PinPath/sameprefix-0.txt", "zero", "new sibling remains untouched");
+    Found entries[4];
+    size_t n = find_entries(0, lower, 0, 0, entries, 4);
+    CHECK(n == 1 && !strcmp(entries[0].name, "SAMEPR~2.TXT") && entries[0].size == 5,
+          "classic exact find keeps the leased alias and selected metadata");
+    path_begin(0x4300, lower); ok("attributes work through pinned alias");
+    path_begin(0x6000, lower); ok("truename works through pinned alias");
+    getstr(ES, OUT, ordinary, sizeof(ordinary));
+    CHECK(!strcmp(dos, ordinary), "canonical short path remains stable during the child");
+    /* Other PSPs still use the ordinary recomputed aliases. */
+    dos_fs_set_process(0x5aa6);
+    h = open_file(dos, 0);
+    if (h != 0xffff) { read_equals(h, "alpha", "leases are scoped to their owner PSP"); close_file(h); }
+    dos_fs_set_process(0x5aa5);
+    host_path(path, sizeof path, "PinPath/sameprefix-a.txt");
+    host_require(unlink(path) == 0, "remove first colliding sibling");
+    host_path(path, sizeof path, "PinPath/sameprefix-0.txt");
+    host_require(unlink(path) == 0, "remove inserted colliding sibling");
+    path_begin(0x3c00, lower);
+    if (ok("create/truncate remains bound after sibling deletion")) {
+        h = cpu.a.x; write_bytes(h, "again"); close_file(h);
+    }
+    host_equals("PinPath/sameprefix-b.txt", "again", "repeated in-place save keeps its lease");
+    host_path(path, sizeof path, "PinPath/samepr~2.txt");
+    CHECK(access(path, F_OK) != 0, "stale alias never creates an unintended literal short-name duplicate");
+    if (access(path, F_OK) == 0) host_require(unlink(path) == 0, "remove red-run duplicate");
+    dos_fs_close_process(0x5aa5);
+    path_begin(0x3d00, lower); error(2, "exiting child releases the reserved alias");
+    dos_fs_set_process(0);
+    h = open_file("PinPath/samepr~1.txt", 0);
+    if (h != 0xffff) { read_equals(h, "again", "ordinary alias rules return after child cleanup"); close_file(h); }
+}
+
+static void test_path_lease_stale_and_conflicting(void)
+{
+    char path[PATH_MAX], target[PATH_MAX], dos[128], save_as[128];
+    host_path(path, sizeof path, "PinStale");
+    host_require(mkdir(path, 0755) == 0, "mkdir stale lease fixture");
+    host_file("PinStale/sameprefix-a.txt", "alpha", 0644);
+    host_file("PinStale/sameprefix-b.txt", "bravo", 0644);
+    DosPathLease *lease = pin_file("PinStale/sameprefix-b.txt", dos);
+    if (!lease) return;
+    dos_fs_bind_path(lease, 0x5aa7);
+    dos_fs_set_process(0x5aa7);
+    host_path(target, sizeof target, "PinStale/sameprefix-b.txt");
+    for (unsigned kind = 0; kind < 4; ++kind) {
+        const char *name = kind & 1 ? "PinStale/SAMEPR~2.TXT" : "PinStale/samepr~2.txt";
+        host_path(path, sizeof path, name);
+        if (!kind) host_file(name, "native", 0644);
+        else if (kind == 1) host_require(link(target, path) == 0, "native short-name hardlink conflict");
+        else host_require(symlink(kind == 2 ? "sameprefix-b.txt" : "missing-target", path) == 0,
+                          "native short-name symlink conflict");
+        refused_lease_open(dos, 0x3d02, "native short-name collision refuses open");
+        refused_lease_open(dos, 0x3c00, "native short-name collision refuses truncation");
+        host_equals("PinStale/sameprefix-b.txt", "bravo", "conflicting native entry never damages original");
+        if (!kind) host_equals(name, "native", "conflicting native file is not overwritten either");
+        host_require(unlink(path) == 0, "remove native conflict fixture");
+        host_file("PinStale/sameprefix-b.txt", "bravo", 0644);
+    }
+    host_require(unlink(target) == 0, "remove originally pinned inode");
+    refused_lease_open(dos, 0x3d02, "vanished original fails closed");
+    refused_lease_open(dos, 0x3c00, "vanished original is never recreated through a stale alias");
+    CHECK(access(target, F_OK) != 0, "stale lease does not recreate original after deletion");
+    strcpy(save_as, dos);
+    strcpy(strrchr(save_as, '\\') + 1, "OTHER.TXT");
+    path_begin(0x3c00, save_as);
+    if (ok("missing leased leaf does not poison Save As in its parent directory")) {
+        uint16_t h = cpu.a.x; write_bytes(h, "saved elsewhere"); close_file(h);
+    }
+    host_equals("PinStale/OTHER.TXT", "saved elsewhere", "Save As remains available after external deletion");
+    host_file("PinStale/sameprefix-b.txt", "replacement", 0644);
+    path_begin(0x3d02, dos);
+    if (ok("external regular-file replacement can be reopened through the selected alias")) {
+        uint16_t h = cpu.a.x;
+        read_equals(h, "replacement", "replacement lookup preserves the selected host pathname");
+        close_file(h);
+    }
+    path_begin(0x3c00, dos);
+    if (ok("external regular-file replacement remains saveable")) {
+        uint16_t h = cpu.a.x; write_bytes(h, "saved replacement"); close_file(h);
+    }
+    host_equals("PinStale/sameprefix-b.txt", "saved replacement", "save updates the external replacement at its long host name");
+    host_equals("PinStale/sameprefix-a.txt", "alpha", "replacement never redirects save to the alias neighbor");
+    host_require(unlink(target) == 0, "replace selected leaf with a symlink");
+    host_require(symlink("sameprefix-a.txt", target) == 0, "create replacement symlink");
+    refused_lease_open(dos, 0x3d02, "replacement symlink cannot redirect an update open");
+    refused_lease_open(dos, 0x3c00, "replacement symlink cannot redirect truncation");
+    host_equals("PinStale/sameprefix-a.txt", "alpha", "replacement symlink target stays intact");
+    host_require(unlink(target) == 0, "remove replacement symlink");
+    host_require(mkdir(target, 0755) == 0, "create directory at selected leaf");
+    refused_lease_open(dos, 0x3c00, "replacement directory cannot become a regular-file save target");
+    host_require(rmdir(target) == 0, "remove replacement directory");
+    host_file("PinStale/sameprefix-b.txt", "restored", 0644);
+    dos_fs_release_path(lease);
+    dos_fs_set_process(0);
+    DosPathLease *invalid = (DosPathLease *)1;
+    CHECK(dos_fs_pin_path(dos, fixture, &invalid) == 5 && !invalid,
+          "lease preparation rejects a mismatched host path");
+    CHECK(dos_fs_pin_path("relative.txt", target, &invalid) == 5 && !invalid,
+          "lease preparation requires an absolute DOS path");
+    CHECK(dos_fs_pin_path(dos, target, NULL) == 5, "lease preparation requires an output owner");
+    lease = pin_file("PinStale/sameprefix-a.txt", dos);
+    if (lease) dos_fs_release_path(lease); /* Failed launch cleanup, before binding. */
+}
+
+static void test_path_lease_owner_backup_rename(void)
+{
+    for (unsigned long_name = 0; long_name < 2; ++long_name) {
+        char directory[32], selected[128], path[PATH_MAX], dos[128], backup[128];
+        char backup_host[128], new_name[128];
+        snprintf(directory, sizeof directory, "PinBack%u", long_name);
+        host_path(path, sizeof path, directory);
+        host_require(mkdir(path, 0755) == 0, "mkdir owner backup fixture");
+        snprintf(selected, sizeof selected, "%s/%s", directory,
+                 long_name ? "sameprefix-b.txt" : "NOTE.TXT");
+        snprintf(new_name, sizeof new_name, "%s/sameprefix-a.txt", directory);
+        if (long_name) host_file(new_name, "neighbor", 0644);
+        host_file(selected, "original", 0644);
+        DosPathLease *lease = pin_file(selected, dos);
+        if (!lease) continue;
+        dos_fs_bind_path(lease, (uint16_t)(0x5aad + long_name));
+        dos_fs_set_process((uint16_t)(0x5aad + long_name));
+        if (long_name) {
+            CHECK(strstr(dos, "SAMEPR~2.TXT") != NULL, "long backup fixture initially has second alias");
+            snprintf(new_name, sizeof new_name, "%s/sameprefix-0.txt", directory);
+            host_file(new_name, "inserted neighbor", 0644);
+        }
+        strcpy(backup, dos);
+        strcpy(strrchr(backup, '.') + 1, "BAK");
+        snprintf(backup_host, sizeof backup_host, "%s/%s", directory, strrchr(backup, '\\') + 1);
+        path_begin(0x5600, dos); putstr(ES, OUT, backup);
+        ok("owner renames selected short or long file to its VZ backup");
+        host_equals(backup_host, "original", "owner backup holds the original bytes");
+        path_begin(0x3d02, dos);
+        error(2, "owner rename drops old identity so VZ can detect a missing original");
+        path_begin(0x6000, dos);
+        if (ok("truename preserves the selected name while its owner-renamed leaf is vacant")) {
+            getstr(ES, OUT, new_name, sizeof new_name);
+            CHECK(!strcmp(new_name, dos), "vacant selected long basename retains its original full short path");
+        }
+        path_begin(0x71a8, dos); cpu.d.x = 0x0100;
+        if (ok("short-name generation preserves an owner-renamed leaf reservation")) {
+            getstr(ES, OUT, new_name, sizeof new_name);
+            CHECK(!strcmp(new_name, strrchr(dos, '\\') + 1), "short-name generation does not renumber a vacant selected alias");
+        }
+        if (long_name) {
+            snprintf(new_name, sizeof new_name, "%s/samepr~2.txt", directory);
+            host_file(new_name, "conflicting literal alias", 0644);
+            refused_lease_open(dos, 0x3c00, "native alias created during owner rename vacancy refuses recreation");
+            host_equals(new_name, "conflicting literal alias", "vacant reservation cannot overwrite a new conflicting native file");
+            host_path(path, sizeof path, new_name);
+            host_require(unlink(path) == 0, "remove vacancy alias conflict");
+        }
+        path_begin(0x3c00, dos);
+        if (ok("owner backup rename permits recreating the original selected pathname")) {
+            uint16_t h = cpu.a.x; write_bytes(h, "edited"); close_file(h);
+        }
+        host_equals(selected, "edited", "backup save keeps the original host spelling");
+        host_equals(backup_host, "original", "recreating the original never truncates the backup");
+        strcpy(new_name, dos);
+        strcpy(strrchr(new_name, '\\') + 1, "OTHER.TXT");
+        path_begin(0x3c00, new_name);
+        if (ok("Save As works in the same directory after owner backup rename")) {
+            uint16_t h = cpu.a.x; write_bytes(h, "other"); close_file(h);
+        }
+        if (long_name) {
+            snprintf(new_name, sizeof new_name, "%s/sameprefix-a.txt", directory);
+            host_equals(new_name, "neighbor", "owner rename and recreate never touch a reassigned alias neighbor");
+            snprintf(new_name, sizeof new_name, "%s/sameprefix-0.txt", directory);
+            host_equals(new_name, "inserted neighbor", "owner backup leaves the newly inserted neighbor intact");
+            snprintf(new_name, sizeof new_name, "%s/SAMEPR~2.TXT", directory);
+            host_path(path, sizeof path, new_name);
+            CHECK(access(path, F_OK) != 0, "owner recreation does not create a literal stale short-alias file");
+        }
+        path_begin(0x5600, dos); putstr(ES, OUT, backup);
+        error(80, "failed owner rename to existing backup leaves the selected lease live");
+        path_begin(0x4100, backup); ok("remove old backup before second save");
+        path_begin(0x5600, dos); putstr(ES, OUT, backup);
+        ok("second owner backup rename follows the recreated original");
+        path_begin(0x3c00, dos);
+        if (ok("second backup save recreates the same long host pathname again")) {
+            uint16_t h = cpu.a.x; write_bytes(h, "second edit"); close_file(h);
+        }
+        host_equals(selected, "second edit", "repeated backup save keeps the selected pathname");
+        host_equals(backup_host, "edited", "second backup contains the first saved version");
+        dos_fs_close_process((uint16_t)(0x5aad + long_name));
+        dos_fs_set_process(0);
+    }
+}
+
+static void test_path_lease_parent_identity(void)
+{
+    char path[PATH_MAX], old_parent[PATH_MAX], moved_parent[PATH_MAX], moved_file[PATH_MAX];
+    char dos[128], new_name[128];
+    host_path(path, sizeof path, "PinIdentity");
+    host_require(mkdir(path, 0755) == 0, "mkdir parent identity fixture");
+    host_path(old_parent, sizeof old_parent, "PinIdentity/parent");
+    host_require(mkdir(old_parent, 0755) == 0, "mkdir original leased parent");
+    host_file("PinIdentity/parent/NOTE.TXT", "original", 0644);
+    DosPathLease *lease = pin_file("PinIdentity/parent/NOTE.TXT", dos);
+    if (!lease) return;
+    dos_fs_bind_path(lease, 0x5aaf);
+    dos_fs_set_process(0x5aaf);
+    host_path(moved_parent, sizeof moved_parent, "PinIdentity/moved");
+    host_require(rename(old_parent, moved_parent) == 0, "move the leased parent directory");
+    host_require(mkdir(old_parent, 0755) == 0, "replace the leased parent directory");
+    host_path(moved_file, sizeof moved_file, "PinIdentity/moved/NOTE.TXT");
+    host_path(path, sizeof path, "PinIdentity/parent/NOTE.TXT");
+    host_require(link(moved_file, path) == 0, "give the substituted parent the original leaf inode");
+    refused_lease_open(dos, 0x3c00, "parent identity is checked independently even when leaf inode is unchanged");
+    host_equals("PinIdentity/moved/NOTE.TXT", "original", "directory substitution never truncates the held file");
+    strcpy(new_name, dos);
+    strcpy(strrchr(new_name, '\\') + 1, "OTHER.TXT");
+    refused_lease_open(new_name, 0x3c00, "a substituted parent cannot receive a Save As file");
+    dos_fs_close_process(0x5aaf);
+    dos_fs_set_process(0);
+}
+
+static void test_path_lease_parent_alias(void)
+{
+    char path[PATH_MAX], dos[128];
+    host_path(path, sizeof path, "PinTree");
+    host_require(mkdir(path, 0755) == 0, "mkdir parent lease fixture");
+    host_path(path, sizeof path, "PinTree/sameprefix-a");
+    host_require(mkdir(path, 0755) == 0, "mkdir first parent collision");
+    host_path(path, sizeof path, "PinTree/sameprefix-b");
+    host_require(mkdir(path, 0755) == 0, "mkdir selected parent");
+    host_file("PinTree/sameprefix-b/NOTE.TXT", "original", 0644);
+    DosPathLease *lease = pin_file("PinTree/sameprefix-b/NOTE.TXT", dos);
+    if (!lease) return;
+    dos_fs_bind_path(lease, 0x5aa8);
+    dos_fs_set_process(0x5aa8);
+    const char *part = strstr(dos, "SAMEPR~2");
+    CHECK(part != NULL, "parent fixture initially has second alias");
+    host_path(path, sizeof path, "PinTree/sameprefix-a");
+    host_require(rmdir(path) == 0, "remove sibling of pinned parent");
+    uint16_t h = open_file(dos, 2);
+    if (h != 0xffff) { write_bytes(h, "modified"); close_file(h); }
+    host_equals("PinTree/sameprefix-b/NOTE.TXT", "modified", "whole path stays pinned when parent alias changes");
+    host_path(path, sizeof path, "PinTree/sameprefix-0");
+    host_require(mkdir(path, 0755) == 0, "insert colliding parent");
+    host_file("PinTree/sameprefix-0/NOTE.TXT", "neighbor", 0644);
+    h = open_file(dos, 0);
+    if (h != 0xffff) { read_equals(h, "modified", "parent alias also survives insertion"); close_file(h); }
+    host_path(path, sizeof path, "PinTree/SAMEPR~2");
+    host_require(symlink("sameprefix-0", path) == 0, "conflicting native parent symlink");
+    refused_lease_open(dos, 0x3c00, "new native parent alias refuses redirected save");
+    host_equals("PinTree/sameprefix-0/NOTE.TXT", "neighbor", "conflicting parent link never redirects truncation");
+    host_require(unlink(path) == 0, "remove parent conflict symlink");
+    dos_fs_init(); /* Reinitialization releases every lease, even a bound one. */
+    h = open_file("PinTree/samepr~1/NOTE.TXT", 0);
+    if (h != 0xffff) { read_equals(h, "neighbor", "reinitialization restores ordinary parent aliases"); close_file(h); }
+}
+
+static void test_path_lease_directory_creation(void)
+{
+    char path[PATH_MAX], target[PATH_MAX], dos[128], child[144];
+    host_path(path, sizeof path, "PinDirs");
+    host_require(mkdir(path, 0755) == 0, "mkdir directory lease fixture");
+    host_path(path, sizeof path, "PinDirs/sameprefix-a");
+    host_require(mkdir(path, 0755) == 0, "mkdir first directory alias collision");
+    host_path(target, sizeof target, "PinDirs/sameprefix-b");
+    host_require(mkdir(target, 0755) == 0, "mkdir selected directory lease");
+    DosPathLease *lease = pin_file("PinDirs/sameprefix-b", dos);
+    if (!lease) return;
+    CHECK(strstr(dos, "SAMEPR~2") != NULL, "directory lease initially has the second alias");
+    dos_fs_bind_path(lease, 0x5aac);
+    dos_fs_set_process(0x5aac);
+    host_require(rmdir(path) == 0, "delete predecessor of pinned directory");
+    snprintf(child, sizeof child, "%s\\NEW.TXT", dos);
+    path_begin(0x3c00, child);
+    if (ok("create new file in pinned directory after sibling deletion")) {
+        uint16_t h = cpu.a.x; write_bytes(h, "new contents"); close_file(h);
+    }
+    host_equals("PinDirs/sameprefix-b/NEW.TXT", "new contents", "new file is created in selected directory");
+    host_require(mkdir(path, 0755) == 0, "restore directory alias predecessor");
+    host_path(path, sizeof path, "PinDirs/sameprefix-0");
+    host_require(mkdir(path, 0755) == 0, "insert earlier directory alias predecessor");
+    snprintf(child, sizeof child, "%s\\OTHER.TXT", dos);
+    path_begin(0x3c00, child);
+    if (ok("create another new file after directory alias insertion")) {
+        uint16_t h = cpu.a.x; write_bytes(h, "other contents"); close_file(h);
+    }
+    host_equals("PinDirs/sameprefix-b/OTHER.TXT", "other contents", "insertion cannot redirect new-file creation");
+    host_path(path, sizeof path, "PinDirs/sameprefix-a/OTHER.TXT");
+    CHECK(access(path, F_OK) != 0, "new file never appears in reassigned neighbor directory");
+    host_path(path, sizeof path, "PinDirs/SAMEPR~2");
+    host_require(symlink("sameprefix-0", path) == 0, "native alias conflict for leased directory");
+    refused_lease_open(child, 0x3c00, "native parent conflict refuses creation under directory lease");
+    host_require(unlink(path) == 0, "remove directory lease conflict");
+    host_path(path, sizeof path, "PinDirs/moved");
+    host_require(rename(target, path) == 0, "move leased directory away");
+    host_require(mkdir(target, 0755) == 0, "replace original leased directory");
+    refused_lease_open(child, 0x3c00, "replacement directory is not the leased original");
+    dos_fs_close_process(0x5aac);
+    dos_fs_set_process(0);
+}
+
+static size_t native_fd_count(void)
+{
+    DIR *dir = opendir("/proc/self/fd");
+    host_require(dir != NULL, "inspect path lease descriptor cleanup");
+    size_t count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)))
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) ++count;
+    closedir(dir);
+    return count;
+}
+
+static void test_path_lease_lifetime_and_home(void)
+{
+    char dos[128], host[PATH_MAX];
+    host_file("home/sameprefix-a.txt", "alpha", 0644);
+    host_file("home/sameprefix-b.txt", "bravo", 0644);
+    size_t before = native_fd_count();
+    DosPathLease *lease = pin_file("home/sameprefix-b.txt", dos);
+    if (!lease) return;
+    CHECK(!strncmp(dos, "H:\\", 3), "lease supports the canonical HOME drive root");
+    CHECK(native_fd_count() == before + 1, "pending lease holds exactly the selected file descriptor");
+    dos_fs_release_path(lease);
+    CHECK(native_fd_count() == before, "failed-launch release closes the pending lease descriptor");
+    lease = pin_file("home/sameprefix-b.txt", dos);
+    if (!lease) return;
+    dos_fs_bind_path(lease, 0x5aa9);
+    dos_fs_set_process(0x5aa9);
+    host_file("home/sameprefix-0.txt", "zero", 0644);
+    uint16_t h = open_file(dos, 0);
+    if (h != 0xffff) { read_equals(h, "bravo", "HOME drive alias remains attached after insertion"); close_file(h); }
+    dos_fs_close_process(0x5aaa);
+    CHECK(native_fd_count() == before + 1, "closing another PSP does not release the owner lease");
+    dos_fs_close_process(0x5aa9);
+    CHECK(native_fd_count() == before, "child exit closes its lease descriptor");
+    dos_fs_set_process(0);
+    DosPathLease *pending = pin_file("home/sameprefix-a.txt", dos);
+    DosPathLease *bound = pin_file("home/sameprefix-b.txt", dos);
+    if (bound) dos_fs_bind_path(bound, 0x5aab);
+    CHECK(pending && bound && native_fd_count() == before + 2,
+          "bound and unbound leases both retain their own inode descriptors");
+    dos_fs_init();
+    CHECK(native_fd_count() == before, "reinitialization closes both pending and bound lease descriptors");
+    path_begin(0x6000, "home"); ok("canonical existing directory for invalid lease");
+    getstr(ES, OUT, dos, sizeof dos);
+    host_path(host, sizeof host, "home");
+    CHECK(dos_fs_pin_path(dos, host, &lease) == 5 && !lease,
+          "a drive root needs no alias lease");
+    CHECK(native_fd_count() == before, "refused preparation leaks no descriptor");
+}
+
 static void test_io_and_handles(void)
 {
     path_begin(0x3c00, "io.bin"); cpu.c.x = 0;
@@ -2584,6 +2990,13 @@ int main(void)
     setup_fixture();
     test_names_and_finds();
     test_alias_collision_scale();
+    test_path_lease_alias_changes();
+    test_path_lease_stale_and_conflicting();
+    test_path_lease_owner_backup_rename();
+    test_path_lease_parent_identity();
+    test_path_lease_parent_alias();
+    test_path_lease_directory_creation();
+    test_path_lease_lifetime_and_home();
     test_dta_state();
     test_io_and_handles();
     test_paths_and_mutations();

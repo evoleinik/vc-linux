@@ -12,7 +12,7 @@ import pytest
 from test_gwbasic_e2e import ROOT, VcSession, panels, running_vc, until
 
 
-PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE")
+PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE", "VZ.COM")
 
 
 @contextmanager
@@ -80,12 +80,60 @@ def test_install_retires_only_unchanged_logo_image(old_file):
             assert (config / "BOOTLOGO.COM").read_bytes() == original
 
 
+@pytest.mark.parametrize("previous", ["installed", "customized", "current", "symlink", "dangling-symlink"])
+def test_install_upgrades_only_unmodified_vz_backup_default(previous):
+    original = (ROOT / "third_party/vzeditor/VZ-IBM/VZIBM.DEF").read_bytes()
+    option = b"\r\nEb-\t\t\t;make backup\r\n"
+    assert original.count(option) == 1
+    current = original.replace(option, option.replace(b"Eb-", b"Eb+"))
+    with running_vc() as (_, work, config):
+        definition = config / "VZ.DEF"
+        definition.unlink()
+        target = work / "USER.DEF"
+        if previous in ("symlink", "dangling-symlink"):
+            if previous == "symlink":
+                target.write_bytes(original)
+            definition.symlink_to(target)
+        else:
+            contents = current if previous == "current" else original
+            if previous == "customized":
+                # One unrelated setting, with exactly the same file size and
+                # backup still off: the migration must compare every byte.
+                contents = original.replace(b"\r\nEi+\t", b"\r\nEi-\t", 1)
+                assert contents != original and len(contents) == len(original)
+            definition.write_bytes(contents)
+            definition.chmod(0o640)
+            os.utime(definition, ns=(1_000_000_000, 1_000_000_000))
+        before = definition.lstat()
+        with another_vc(work, config) as second:
+            second.wait_for("10Quit", timeout=15)
+            until(second, lambda: panels(second.text()))
+            if previous == "installed":
+                assert definition.read_bytes() == current, "the unchanged old default must enable backups"
+                assert definition.stat().st_ino != before.st_ino, "publish the upgrade atomically"
+                assert definition.stat().st_mode & 0o777 == 0o640
+            else:
+                after = definition.lstat()
+                assert (after.st_ino, after.st_mtime_ns, after.st_mode) == (
+                    before.st_ino, before.st_mtime_ns, before.st_mode), "user settings must not be rewritten"
+                if previous in ("symlink", "dangling-symlink"):
+                    assert definition.is_symlink(), "a user-created link is not an installed default"
+                    assert definition.readlink() == target
+                    if previous == "symlink":
+                        assert target.read_bytes() == original
+                    else:
+                        assert not target.exists()
+                else:
+                    assert definition.read_bytes() == contents
+
+
 def web_demo(destination):
     return subprocess.run([
         sys.executable, str(ROOT / "tools/web_demo.py"), str(destination),
         str(ROOT / "build/gwbasic/GWBASIC.EXE"), str(ROOT / "build/games"),
         str(ROOT / "build/bootlogo/LOGO.COM"),
         str(ROOT / "build/rogue/ROGUE.EXE"),
+        str(ROOT / "build/vz/VZ.COM"),
     ], text=True, capture_output=True)
 
 
@@ -123,6 +171,26 @@ def test_web_demo_installs_real_rogue_and_licenses_in_games(tmp_path):
     assert (tmp_path / "GAMES/OWLIC.TXT").read_bytes() == (ROOT / "build/rogue/OWLIC.TXT").read_bytes()
     readme = (tmp_path / "README.TXT").read_text()
     assert all(text in readme for text in ("ROGUE.EXE", "Q then y", "S then y", "h (left)"))
+
+
+def test_web_demo_installs_vz_and_all_definitions_alongside_rogue(tmp_path):
+    result = web_demo(tmp_path)
+    assert result.returncode == 0, result.stderr
+    vendor = ROOT / "third_party/vzeditor"
+    assert (tmp_path / "VZ.COM").read_bytes() == (vendor / "VZ-IBM/US/VZUS.COM").read_bytes()
+    assert (tmp_path / "GAMES/ROGUE.EXE").read_bytes() == (ROOT / "build/rogue/ROGUE.EXE").read_bytes()
+    assert (tmp_path / "VZLIC.TXT").read_bytes() == (vendor / "LICENSE").read_bytes()
+    for installed, source in (("VZ.DEF", "VZIBM.DEF"), ("VZFLE.DEF", "VZFLE.DEF"),
+                              ("HELPE.DEF", "HELPE.DEF"), ("BLOCK.DEF", "BLOCK.DEF"),
+                              ("PALET.DEF", "PALET.DEF"), ("BW.DEF", "BW.DEF")):
+        expected = (vendor / "VZ-IBM" / source).read_bytes()
+        if installed == "VZ.DEF":
+            option = b"\r\nEb-\t\t\t;make backup\r\n"
+            assert expected.count(option) == 1
+            expected = expected.replace(option, option.replace(b"Eb-", b"Eb+"))
+        assert (tmp_path / installed).read_bytes() == expected
+    readme = (tmp_path / "README.TXT").read_text()
+    assert all(text in readme for text in ("VZ Editor", "VZ NEW.TXT", "Alt-S", "Alt-Q"))
 
 
 @pytest.mark.parametrize("name", ["LOGO.COM", "LOGO.TXT"])

@@ -27,9 +27,11 @@ files, and as WebAssembly in any browser. No emulator runs at run time.
 | *BASIC Computer Games*, twelve of them | David H. Ahl, 1978 | public domain (2022) |
 | bootLogo, a Logo with turtle graphics | Oscar Toledo G., 2024 | BSD-2 |
 | Rogue 5.4.4, the original roguelike | Michael Toy, Ken Arnold, Glenn Wichman, 1980-1985 | BSD-3 |
+| VZ Editor 1.6 | c.mos, Village Center, 1990s | BSD-3 |
 
 **Try it in your browser: [notanemulator.com](https://notanemulator.com/).** VC starts at once,
-and runs GW-BASIC, the BASIC games, bootLogo and Rogue from its `H:` drive, the way DOS did.
+and runs VZ Editor, GW-BASIC, twelve classic BASIC games, bootLogo turtle graphics and Rogue
+from its `H:` drive, the way DOS did. It is the same translated code, compiled to WebAssembly.
 
 ## How this differs from emulation and rewrites
 
@@ -69,7 +71,7 @@ goes to `~/.cache/vc-linux/vc.log`.
 | Key | Action | Notes |
 |---|---|---|
 | F3 | View | VC's own viewer |
-| F4 | Edit | opens `$EDITOR` (VC 4.99.09's own editor is disabled in its source) |
+| F4 | Edit | opens `$EDITOR` on Linux; VZ Editor when unset/empty, and in the browser |
 | F5, F6 | Copy, rename or move | long and Cyrillic names kept |
 | F7, F8 | Make directory, delete | F8 on a symlink removes only the link |
 | Alt-F10, Ctrl-Z | Directory tree | scans the whole drive, so use it on `H:` |
@@ -99,6 +101,21 @@ of VC: they always use their built-in translations, independently of the install
 Linux installs the interpreter in the config directory; bring your own `.bas` files. Linux sound
 stays silent. A `CALL` or `USR` into code without a translation stops that BASIC session with a
 short message and returns to VC.
+
+F4 opens the selected file in VZ Editor 1.6 (US), another translated DOS program. On Linux,
+a nonempty `$EDITOR` still takes precedence and receives the resolved host path as one argument.
+Otherwise VZ receives an absolute DOS short name, pinned to the selected pathname until the editor
+exits even if neighboring names change or another program replaces the file. VZ refuses file
+paths longer than its 63-byte absolute-path limit and current directories whose short path plus
+13 bytes reaches 64; each VZ child gets a private short temporary directory for its swap files.
+Type `vz NEW.TXT` to create a file. Use the arrows to move, Alt-S (or Esc then S)
+to save, Enter to accept the name, and Alt-Q (or Esc then Q), then Y, to quit. F1 opens the English
+file menu; F12 shows help. The defaults write DOS CRLF lines and a final Ctrl-Z byte. The installed
+`VZ.DEF` enables backups (`Eb+`): saving keeps the previous contents in `.BAK`, including when a
+write fails partway. Restore that backup if a save fails. An unchanged earlier `Eb-` default is
+upgraded; customized definitions and symlinks are preserved, so check their Backup File option.
+`make vz` reproduces the shipped 55,856-byte `VZUS.COM` exactly without changing vendor sources.
+`VZ.COM` and its English `.DEF` files install beside GW-BASIC; EXEC still matches complete bytes.
 
 Type `bootlogo` for Oscar Toledo G.'s original bootLogo. Try `REPEAT 4 [REPEAT 4 [FD 20 RT 90] RT 90]`
 or `REPEAT 36 [FD 60 RT 170]`. `QUIT` exits; VC's own DOS code then asks for Enter and restores
@@ -133,11 +150,11 @@ WezTerm does too once `enable_kitty_keyboard` is on. xterm does it through modif
 ## In your browser
 
 The same translated C also compiles to WebAssembly with Emscripten. The page opens VC at once on a
-small in-memory `H:` drive holding a README, VC's history, its own assembly sources, GW-BASIC,
-bootLogo, Rogue, and twelve of David Ahl's public-domain BASIC Computer Games. xterm.js
+small in-memory `H:` drive holding a README, VC's history, its own assembly sources, VZ Editor,
+GW-BASIC, bootLogo, Rogue, and twelve of David Ahl's public-domain BASIC Computer Games. xterm.js
 shows the screen in the IBM VGA font. The page reports keys in full, so Ctrl-[, Ctrl-I and Ctrl-M
-work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload. There is no shell
-and no editor, but `cd` and translated DOS programs run from the command line. Open `GAMES` and
+work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload. There is no shell,
+but F4 edits with VZ, and `cd` and translated DOS programs run from the command line. Open `GAMES` and
 press Enter on a `.BAS` file to play. `BEEP`, `SOUND` and `PLAY` use a Web Audio square wave after
 the first key press. Use Ctrl-Pause or Ctrl-Shift-B to stop a game, then `SYSTEM` to return to VC.
 `BOOTLOGO.TXT` explains bootLogo with a square, a star and the original README's flower. The original
@@ -151,7 +168,7 @@ on reload.
 To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
 
     make web          # build/web/: index.html, vc.mjs, vc.wasm
-    make test-web     # Node checks VC, BASIC, Logo, CGA pixels, sound and returns
+    make test-web     # Node checks VC, VZ edits/saves, Rogue, BASIC, Logo, CGA pixels and sound
 
 Serve `build/web/` over HTTP to open it. The design is in `docs/plans/2026-10-01-browser-build.md`.
 
@@ -185,7 +202,8 @@ flowchart LR
   decodes the linked bytes with capstone. It emits C for each instruction, flags included. It
   also decodes bytes the CPU runs that the listing calls data. VC starts by executing the text
   `RESIDENT`.
-  bootLogo's single mutable pen-colour operand is read from live memory. Four indirect
+  bootLogo's single mutable pen-colour operand is read from live memory. VZ's macro interrupt
+  slot has two source-proved forms, selected and checked against live bytes. Four indirect
   `DRAW` entries are emitted in a separate, source-proved supplement; VC's and GW-BASIC's
   original generated C stay byte-identical.
   For compiled C, it reads the verbose Watcom link map, checks every linked
@@ -210,16 +228,18 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 
 | Suite | What it proves |
 |---|---|
-| `test-translator` | All 63,901 distinct instructions in VC, GW-BASIC and bootLogo match Unicorn from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
-| `test-fs` | The DOS file layer, including GW-BASIC's DOS 1.x FCB calls: over 4,300 checks against a temporary tree. |
-| `test-exec` | Byte-identical EXEC, DOS search order, command tails, safe missing associations and child FCB cleanup. |
+| `test-translator` | Every distinct instruction in VC, GW-BASIC, bootLogo, Rogue and VZ matches Unicorn from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
+| `test-rogue-build` | The original Rogue/PDCurses DOS build, linked runtime licence and reproducible EXE bytes. |
+| `test-vz-build` | Exact shipped US COM bytes, reproducible map/listings, and the build-time MASM compatibility layer. |
+| `test-fs` | The DOS file layer, DOS 1.x FCB calls, and per-process short-path leases: over 4,400 checks against a temporary tree. |
+| `test-exec` | Byte-identical EXEC, DOS search order, command tails, safe F4/associations, VZ path/temp limits and child cleanup. |
 | `test-machine` | Timer interrupts, IF, HLT, Ctrl-Break, PIT speaker frequencies and declared mutable operands. |
 | `test-process` | Child fault recovery, parent interrupt/device state, and fatal no-translation faults in VC itself. |
 | `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,600 checks. |
 | `test-cga` | Every CGA mode and pixel address, palette, XOR/readback, graphics glyphs, cursor and scrolling: over 823,000 checks. |
 | `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
-| `test-web` | The WebAssembly build under Node: VC, GW-BASIC, bootLogo, exact CGA pixels, canvas transitions, BEEP/SOUND/PLAY hooks and quit. Needs Emscripten. |
-| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real DOS launches, identity/injection checks, Ctrl-Break, every shipped game's first prompt, Logo drawings and BASIC graphics. |
+| `test-web` | The WebAssembly build under Node: VC, VZ F4/edit/save/quit with MEMFS readback, Rogue play/save/restore, GW-BASIC, bootLogo, exact CGA pixels, canvas transitions and sound. Needs Emscripten. |
+| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real DOS launches, identity/injection checks, VZ editing and backups, Rogue play/save/restore, Ctrl-Break, every shipped BASIC game's first prompt, Logo drawings and BASIC graphics. |
 
 Every finding from the three code reviews was fixed with a test that failed on the old code first.
 
@@ -292,6 +312,11 @@ Kisseberth's portable save and platform code (BSD-3-Clause; `third_party/rogue`)
 PDCurses is public domain (`third_party/pdcurses`). OpenWatcom's linked C runtime
 uses the Sybase Open Watcom Public License. `ROGUELIC.TXT`, `PDCLIC.TXT`, and
 `OWLIC.TXT` accompany the installed game and its browser copy.
+
+VZ Editor 1.6 is by c.mos (Village Center), BSD-3-Clause (`third_party/vzeditor/LICENSE`).
+The pinned US executable is reproduced byte-for-byte, with its original English definitions
+installed alongside it except for the backup-enabled `VZ.DEF` default described above.
+The browser drive includes its licence as `VZLIC.TXT`.
 
 The translator, runtime and tests are BSD 2-Clause (`LICENSE`). They were built with Claude Code
 and OpenAI Codex.

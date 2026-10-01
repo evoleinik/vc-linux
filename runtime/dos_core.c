@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "cp866.h"
+#include "dos_fs.h"
 #include "hle.h"
 #include "rt.h"
 
@@ -40,6 +41,7 @@ typedef struct {
     uint32_t break_vector; /* Inherited INT 1Bh is not the child's hook. */
     Cpu parent;        /* parent registers at its EXEC call */
     uint16_t dta_seg, dta_off;
+    char temp_dir[32]; /* Private, short VZ swap directory; not guest memory. */
 } Proc;
 static Proc procs[8];
 static int nprocs;
@@ -344,7 +346,7 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
  * including its MZ header and relocation table: comparing only the load module
  * would accept a damaged header. VC.COM and VC.OVL bypass this disk check. */
 static const Image *const images[] = {
-    &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue
+    &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue, &image_vz
 };
 
 static const EmbeddedFile *image_file(const Image *img) {
@@ -422,9 +424,9 @@ static int host_cwd(char *out, size_t cap) {
 static int host_run(const char *script, const char *arg0, const char *arg1) {
 #ifdef __EMSCRIPTEN__
     (void)script;
+    (void)arg0;
     (void)arg1;
-    const char *message = arg0 && !strcmp(arg0, "vc-edit") ?
-        "No editor in the browser. F3 views the file. The Linux version opens $EDITOR.\r\n" :
+    const char *message =
         "No shell in the browser, only cd works here. The Linux version runs "
         "commands: github.com/evoleinik/vc-linux\r\n";
     /* VC has switched to its user screen. Writing through CON preserves the
@@ -572,6 +574,26 @@ static int dos_path_host(const char *path, char *host, size_t cap) {
     return dos_fs_to_host(DOS_SEG, SCRATCH_OFF, host, cap);
 }
 
+/* Classic DOS true-name gives the short spelling that old programs parse.
+ * AH=60 has a 128-byte result buffer. Use disjoint scratch halves and leave
+ * every caller register intact, including an EXEC's pending return frame. */
+static int short_dos_path(const char *path, char out[128]) {
+    size_t n = strlen(path);
+    if (n >= 128) return 3;
+    for (size_t i = 0; i <= n; ++i)
+        wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), (uint8_t)path[i]);
+    Cpu saved = cpu;
+    cpu.a.x = 0x6000;
+    cpu.ds = cpu.es = DOS_SEG;
+    cpu.si = SCRATCH_OFF;
+    cpu.di = SCRATCH_OFF + 128;
+    dos_fs_int21();
+    int err = cpu.cf ? cpu.a.x : 0;
+    if (!err) get_str(DOS_SEG, SCRATCH_OFF + 128, out, 128);
+    cpu = saved;
+    return err;
+}
+
 static void environment_value(const char *name, char *out, size_t cap) {
     out[0] = 0;
     uint16_t env = rd16(cur_psp, 0x2C);
@@ -678,12 +700,31 @@ static int dos_file_association(const char *word) {
     return 0;
 }
 
+/* Private launch errors select one useful DOS diagnostic. They become error 3
+ * at the EXEC boundary, not an extra misleading "Program not found" line. */
+enum { VZ_LONG_DIRECTORY = 0x100, VZ_LONG_FILE, VZ_LONG_TAIL };
+
+static int vz_path_error(int err) {
+    return err >= VZ_LONG_DIRECTORY && err <= VZ_LONG_TAIL;
+}
+
 static int command_error(int err) {
     rt_log("DOS command error %d", err);
-    const char *msg = err == 2 || err == 3 ? "Program not found\r\n" :
+    const char *msg = err == VZ_LONG_DIRECTORY ? "Current directory too long for VZ\r\n" :
+                      err == VZ_LONG_FILE ? "File path too long for VZ\r\n" :
+                      err == VZ_LONG_TAIL ? "Command line too long for VZ\r\n" :
+                      err == 2 || err == 3 ? "Program not found\r\n" :
                       err == 8 ? "Not enough memory\r\n" :
                       err == 11 ? "Invalid program format\r\n" : "Access denied\r\n";
     con_write((const uint8_t *)msg, strlen(msg));
+    if (vz_path_error(err)) term_render(); /* VC immediately restores its panels. */
+    return vz_path_error(err) ? 3 : err;
+}
+
+static int vz_short_directory(char out[128]) {
+    int err = short_dos_path(".", out);
+    /* An overlong AH=60 result is also an unsafe VZ current directory. */
+    if (err == 3 || (!err && strlen(out) + 13 >= 64)) return VZ_LONG_DIRECTORY;
     return err;
 }
 
@@ -729,9 +770,9 @@ static int dos_program_command(const uint8_t *cmd, size_t len) {
     tail[0] = (uint8_t)n;
     memcpy(tail + 1, cmd + pos, n);
     tail[n + 1] = '\r';
-    /* Preserve DOS tail bytes exactly. Programs own their argument syntax;
-     * GW-BASIC itself inserts the quotes around its startup file name. No
-     * shell sees this tail, including when its association EXE is absent. */
+    /* Programs own their argument syntax; GW-BASIC itself inserts quotes.
+     * VZ alone needs its filename paths bounded and shortened at launch.
+     * No shell sees a DOS tail, including when its association EXE is absent. */
     err = start_child(img, dos, tail, 0);
     return err ? command_error(err) : 0;
 }
@@ -740,6 +781,46 @@ static int dos_program_command(const uint8_t *cmd, size_t len) {
  * place of !.!, and everything after the word is taken as that one name, so
  * no shell ever parses it: `$(id).txt` stays a file name. */
 static const char EDIT_WORD[] = "vc-edit ";
+
+/* SCRATCH_OFF holds the file name VC selected. VZ's DOS parser stops at
+ * spaces, commas and '+', so hand it the file layer's absolute 8.3 spelling.
+ * The two 128-byte scratch halves keep AH=60's input and output disjoint.
+ * A renamed/changed/missing editor is an error, never a host-shell command. */
+static int edit_in_vz(const char *original_host) {
+    char file[128], directory[128];
+    get_str(DOS_SEG, SCRATCH_OFF, file, sizeof file);
+    int err = vz_short_directory(directory);
+    if (!err) err = short_dos_path(file, file);
+    if (err) return command_error(err);
+    size_t n = strlen(file);
+    /* VZ.INC's PATHSZ is 64, tighter than the DOS command-tail limit.
+     * Its makefulpath copies the canonical name into that fixed buffer. */
+    if (n >= 64) {
+        rt_log("VZ path exceeds its 63-byte limit: %zu bytes", n);
+        return command_error(VZ_LONG_FILE);
+    }
+    char dos[256], host[4096];
+    int found = find_program("VZ.COM", dos, sizeof dos, host, sizeof host);
+    if (found <= 0) return command_error(found < 0 ? -found : 2);
+    const Image *img;
+    err = known_image(host, &img);
+    if (err || img != &image_vz) return command_error(err ? err : 11);
+    /* Generated 8.3 names normally follow the current directory contents.
+     * Hold this spelling to the selected file until the editor exits, so a
+     * neighbor's creation/deletion cannot redirect a later save. */
+    DosPathLease *lease;
+    err = dos_fs_pin_path(file, original_host, &lease);
+    if (err) return command_error(err);
+    uint8_t tail[128] = {0};
+    tail[0] = (uint8_t)(n + 1);
+    tail[1] = ' ';
+    memcpy(tail + 2, file, n);
+    tail[n + 2] = '\r';
+    err = start_child(img, dos, tail, 0);
+    if (err) dos_fs_release_path(lease);
+    else dos_fs_bind_path(lease, cur_psp);
+    return err ? command_error(err) : 0;
+}
 
 /* Run one COMMAND.COM-style command line, given in code page 866 without its
  * CR. Both ways VC runs commands come here: EXEC of COMSPEC with "/C cmd",
@@ -756,7 +837,7 @@ static int run_dos_command(const uint8_t *cmd, size_t len) {
          * it, trailing spaces included. The DOS layer maps it to the real host
          * file, so a displayed name with a generated suffix finds its file. */
         size_t n = len - w;
-        if (n > 255) n = 255;
+        if (n >= 128) return command_error(3);
         for (size_t i = 0; i < n; i++) wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + i), cmd[w + i]);
         wr8(DOS_SEG, (uint16_t)(SCRATCH_OFF + n), 0);
         char host[4096];
@@ -765,7 +846,11 @@ static int run_dos_command(const uint8_t *cmd, size_t len) {
             con_write((const uint8_t *)msg, sizeof msg - 1);
             return 2;
         }
-        return host_run("exec ${EDITOR:-vi} \"$1\"", "vc-edit", host);
+#ifndef __EMSCRIPTEN__
+        const char *editor = getenv("EDITOR");
+        if (editor && *editor) return host_run("exec $EDITOR \"$1\"", "vc-edit", host);
+#endif
+        return edit_in_vz(host);
     }
     int program = dos_program_command(cmd, len);
     if (program >= 0) return program;
@@ -803,13 +888,208 @@ static int exec_host(const char *host_prog, const uint8_t *tail) {
 
 /* ---- EXEC and terminate --------------------------------------------------- */
 
+/* MAIN.ASM appends "\\VZTEMP.$$$" into TMPPATHSZ=32 with an unbounded
+ * strcpy. Give VZ a short, private swap directory: a host TMPDIR may exceed
+ * that limit, and sharing /tmp would collide with another VZ's fixed name.
+ * Retain all other variables and other children's TMP/TEMP unchanged. */
+static int vz_environment(char *env, size_t *length, size_t cap, Proc *p) {
+    size_t used = 0;
+    for (size_t at = 0; at < *length;) {
+        const char *end = memchr(env + at, 0, *length - at);
+        if (!end) return 10;
+        size_t n = (size_t)(end - (env + at)) + 1;
+        if (strncasecmp(env + at, "TMP=", 4) && strncasecmp(env + at, "TEMP=", 5)) {
+            memmove(env + used, env + at, n);
+            used += n;
+        }
+        at += n;
+    }
+    strcpy(p->temp_dir, "/tmp/vXXXXXX"); /* Seven-character, native 8.3 basename. */
+    if (!mkdtemp(p->temp_dir)) { p->temp_dir[0] = 0; return 5; }
+    const char *names[] = {"TMP", "TEMP"};
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        int n = snprintf(env + used, cap - used, "%s=C:\\tmp\\%s", names[i], p->temp_dir + 5);
+        if (n < 0 || (size_t)n >= cap - used) return 8;
+        used += (size_t)n + 1;
+    }
+    *length = used;
+    return 0;
+}
+
+static void remove_vz_temp(Proc *p) {
+    if (!p->temp_dir[0]) return;
+    /* Only our own directory and VZ's known swap names, never recursive
+     * removal. Dp+ can lowercase DOS-created names on the host. */
+    const char *names[] = {"VZTEMP.$$$", "vztemp.$$$", "FILES.$$$", "files.$$$"};
+    char path[64];
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        snprintf(path, sizeof path, "%s/%s", p->temp_dir, names[i]);
+        if (unlink(path) && errno != ENOENT) rt_log("cannot remove VZ swap %s: %s", path, strerror(errno));
+    }
+    if (rmdir(p->temp_dir)) rt_log("cannot remove VZ temp %s: %s", p->temp_dir, strerror(errno));
+    p->temp_dir[0] = 0;
+}
+
+static int vz_document_path(char path[128]) {
+    const char *wildcard = strpbrk(path, "*?");
+    if (!wildcard) {
+        int err = short_dos_path(path, path);
+        return err == 3 ? VZ_LONG_FILE : err;
+    }
+    /* A mask is not a missing literal file: AH=60 would invent an alias for
+     * it. Canonicalize only the parent and preserve VZ's final-name pattern.
+     * DOS/VZ do not expand wildcard directory components here. */
+    char *leaf = path + (path[1] == ':' ? 2 : 0);
+    for (char *p = path; *p; ++p) if (*p == '\\' || *p == '/') leaf = p + 1;
+    if (wildcard < leaf) return 3;
+    char pattern[128];
+    strcpy(pattern, leaf);
+    if (leaf == path) strcpy(path, ".");
+    else if (leaf == path + 2 && path[1] == ':') strcpy(path + 2, ".");
+    else *leaf = 0;
+    int err = short_dos_path(path, path);
+    if (err) return err == 3 ? VZ_LONG_FILE : err;
+    size_t n = strlen(path), len = strlen(pattern);
+    int separator = n && path[n - 1] != '\\';
+    if (n + separator + len >= 64) return VZ_LONG_FILE;
+    if (separator) path[n++] = '\\';
+    memcpy(path + n, pattern, len + 1);
+    return 0;
+}
+
+/* Expand each document operand, not only F4's first file: a safe CWD can still
+ * be followed by an unsafe explicit path. MAIN.ASM's readopt owns '-' options
+ * and DEF selectors; reference selectors also have VZ-specific search rules.
+ * Keep that auxiliary syntax, while quoted documents become 8.3 names. */
+static int vz_command_tail(const uint8_t *tail, uint8_t out[128]) {
+    size_t pos = 1, end = (size_t)tail[0] + 1, used = 0;
+    int options = 1;
+    if (tail[0] > 126) return VZ_LONG_TAIL;
+    while (pos < end && tail[pos] != '\r') {
+        if (tail[pos] == ' ' || tail[pos] == '\t') {
+            if (used == 126) return VZ_LONG_TAIL;
+            out[++used] = tail[pos++];
+            continue;
+        }
+        if (options && tail[pos] == '-') {
+            do {
+                if (used == 126) return VZ_LONG_TAIL;
+                out[++used] = tail[pos++];
+            } while (pos < end && tail[pos] > ' ');
+            continue;
+        }
+        /* DEF selectors and reference files have a leading VZ marker, not a
+         * DOS path component. Keep a standalone marker and its spacing too. */
+        int definition = options && (tail[pos] == '/' || tail[pos] == '+');
+        int reference = tail[pos] == '@';
+        if (definition || reference) {
+            if (used == 126) return VZ_LONG_TAIL;
+            out[++used] = tail[pos++];
+            if (reference && pos < end && tail[pos] == '@') {
+                if (used == 126) return VZ_LONG_TAIL;
+                out[++used] = tail[pos++];
+            }
+            while (pos < end && (tail[pos] == ' ' || tail[pos] == '\t')) {
+                if (used == 126) return VZ_LONG_TAIL;
+                out[++used] = tail[pos++];
+            }
+            if (pos == end || tail[pos] == '\r') break;
+            size_t start = pos;
+            while (pos < end && tail[pos] > ' ') ++pos;
+            size_t n = pos - start;
+            if (n >= 64) return VZ_LONG_FILE;
+            if (used + n > 126) return VZ_LONG_TAIL;
+            /* These names may be relative to VZDEF or the executable, not
+             * the CWD. Rewriting them here would silently change the file. */
+            memcpy(out + used + 1, tail + start, n);
+            used += n;
+            if (reference) options = 0;
+            continue;
+        }
+        /* readopt stops at the first document. Later '-' and '/' prefixes
+         * are filenames, so they must not bypass the length check. */
+        options = 0;
+        int quoted = tail[pos] == '"';
+        if (quoted) ++pos;
+        size_t start = pos;
+        while (pos < end && (quoted ? tail[pos] != '"' : tail[pos] > ' ')) ++pos;
+        size_t n = pos - start;
+        if (!n) return 11;
+        if (quoted) {
+            if (pos == end) return 11;
+            if (++pos < end && tail[pos] > ' ') return 11;
+        }
+        char path[128];
+        memcpy(path, tail + start, n); path[n] = 0;
+        int err = vz_document_path(path);
+        if (err) return err;
+        n = strlen(path);
+        if (n >= 64) return VZ_LONG_FILE;
+        if (used + n > 126) return VZ_LONG_TAIL;
+        memcpy(out + used + 1, path, n);
+        used += n;
+    }
+    out[0] = (uint8_t)used;
+    out[used + 1] = '\r';
+    return 0;
+}
+
+static int prepare_vz_paths(const char *program, char short_program[128],
+                            DosPathLease **executable, DosPathLease **directory) {
+    char host[4096], short_directory[128];
+    *executable = *directory = NULL;
+    /* makefulpath appends a separator and up to twelve 8.3 name bytes, then
+     * its NUL, into PATHSZ=64. Reserve that headroom even for an empty tail:
+     * VZ's own Open dialog can later supply a relative filename. */
+    int err = vz_short_directory(short_directory);
+    if (err) return err;
+    if (dos_path_host(program, host, sizeof host)) return 3;
+    err = short_dos_path(program, short_program);
+    if (!err && strlen(short_program) >= 64) err = VZ_LONG_FILE;
+    if (!err) err = dos_fs_pin_path(short_program, host, executable);
+    /* Typed new files remember the DOS current directory, even when the
+     * editor lives on another drive. Keep those ancestor aliases stable
+     * too; otherwise a save could follow a neighboring directory's name. */
+    if (!err && dos_path_host(".", host, sizeof host)) err = 3;
+    if (!err && strlen(short_directory) > 3) /* A drive root has no aliases. */
+        err = dos_fs_pin_path(short_directory, host, directory);
+    if (err) {
+        dos_fs_release_path(*directory);
+        dos_fs_release_path(*executable);
+        *executable = *directory = NULL;
+    }
+    return err;
+}
+
 static int start_child(const Image *img, const char *dos_prog, const uint8_t *tail, uint16_t envseg) {
     if (nprocs == (int)(sizeof procs / sizeof procs[0])) return 8;
+    char short_program[128];
+    uint8_t short_tail[128] = {0};
+    DosPathLease *executable = NULL, *directory = NULL;
+    if (img == &image_vz) {
+        /* VZ derives its DEF name from this environment path with the same
+         * 8.3 parser it uses for documents. Host config directories can
+         * contain spaces, commas and '+', even when the COM name is short. */
+        int err = prepare_vz_paths(dos_prog, short_program, &executable, &directory);
+        if (!err) err = vz_command_tail(tail, short_tail);
+        if (err) {
+            dos_fs_release_path(directory);
+            dos_fs_release_path(executable);
+            return err;
+        }
+        dos_prog = short_program;
+        tail = short_tail;
+    }
     rt_log("load %s: translation %s", dos_prog, img->name);
     Proc *p = &procs[nprocs];
+    p->temp_dir[0] = 0;
     const Image *parent_image = nprocs ? procs[nprocs - 1].image : &image_vc_com;
     p->machine = rt_save_process_state(parent_image);
-    if (!p->machine) return 8;
+    if (!p->machine) {
+        dos_fs_release_path(directory);
+        dos_fs_release_path(executable);
+        return 8;
+    }
     p->image = img;
     p->break_vector = lin(rd16(0, 0x1b * 4 + 2), rd16(0, 0x1b * 4));
     p->parent = cpu;
@@ -818,13 +1098,19 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     uint16_t parent_psp = cur_psp;
     static char envbuf[32768];
     size_t elen = env_strings(envseg ? envseg : rd16(cur_psp, 0x2C), envbuf, sizeof envbuf);
-    int err = load_image(img, envbuf, elen, tail, dos_prog, parent_psp, ret_cs, ret_ip);
+    int err = img == &image_vz ? vz_environment(envbuf, &elen, sizeof envbuf, p) : 0;
+    if (!err) err = load_image(img, envbuf, elen, tail, dos_prog, parent_psp, ret_cs, ret_ip);
     if (err) {
+        dos_fs_release_path(directory);
+        dos_fs_release_path(executable);
+        remove_vz_temp(p);
         rt_finish_process_state(p->machine, 0);
         p->machine = NULL;
         cpu = p->parent;
         return err;
     }
+    dos_fs_bind_path(executable, cur_psp);
+    dos_fs_bind_path(directory, cur_psp);
     p->child = cur_psp;
     nprocs++;
     hle_redirect = 1;
@@ -876,6 +1162,7 @@ static void do_exec(void) {
         err = known_image(host, &img);
     }
     if (!err) err = start_child(img, dos_prog, tail, envseg);
+    if (vz_path_error(err)) err = command_error(err);
     if (err) fail((uint16_t)err);
 }
 
@@ -884,6 +1171,9 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
     last_retcode = (uint16_t)(code | (tsr ? 0x300 : 0));
     rt_log("terminate psp %04X code %u%s", psp, code, tsr ? " (resident)" : "");
     if (tsr) {
+        /* These host launch leases are not DOS handles belonging to resident
+         * code. Drop them without closing a generic TSR's live FCBs. */
+        dos_fs_release_process_paths(psp);
         uint16_t maxp;
         mem_resize(psp, keep < 6 ? 6 : keep, &maxp);
     } else {
@@ -896,6 +1186,7 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
     uint16_t term_ip = rd16(psp, 0x0A), term_cs = rd16(psp, 0x0C);
     if (nprocs > 0 && procs[nprocs - 1].child == psp) {
         Proc *p = &procs[--nprocs];
+        remove_vz_temp(p);
         rt_finish_process_state(p->machine, 0);
         p->machine = NULL;
         cpu = p->parent;

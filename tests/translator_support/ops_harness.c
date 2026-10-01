@@ -168,7 +168,10 @@ static uint16_t reference_word(uint32_t address) {
 
 static void unicorn_interrupt(uc_engine *uc, uint32_t vector, void *data) {
     (void)data;
-    int software = (current->special & OPS_INT) && vector == current->vector;
+    uint32_t address = (starting[OPS_CS] << 4) + starting[OPS_IP];
+    unsigned expected_vector = (current->length >= 2 && current->bytes[current->length - 2] == 0xcd)
+        ? reference_memory[address + current->length - 1] : current->vector;
+    int software = (current->special & OPS_INT) && vector == expected_vector;
     int into = (current->special & OPS_INTO) && vector == 4;
     int divide = (current->flags_kind == OPS_DIV || current->flags_kind == OPS_IDIV)
                  && vector == 0;
@@ -210,10 +213,12 @@ static bool unicorn_invalid_instruction(uc_engine *uc, void *data) {
      * unchanged starting IP, then use the same independent Intel interrupt
      * entry implementation as every other vector. Real invalid opcodes are
      * still errors; no case/state or register/flag/memory comparison is lost.
+     * VZ patches the vector operand, so inspect the fetched CD 06 rather than
+     * requiring the original instruction template's vector to be 6 too.
      */
     uint32_t address = ((uint32_t)current_loadseg << 4) + current->offset;
     uint32_t ip = 0;
-    if (!(current->special & OPS_INT) || current->vector != 6 ||
+    if (!(current->special & OPS_INT) ||
         current->length != 2 || reference_memory[address] != 0xcd ||
         reference_memory[address + 1] != 6)
         return false;

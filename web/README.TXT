@@ -6,7 +6,8 @@ It is not an emulator.
 
 H: is your playground. These files live only in memory.
 Reload the page to undo every change and start again.
-There is no shell or external editor. The cd command works.
+There is no shell. The cd command works; F4 edits files with VZ Editor.
+Type VZ NEW.TXT to create a text file, then answer Y to "New file?".
 Type GWBASIC to start BASIC. Try PRINT 2+2, then SYSTEM to return.
 Type BOOTLOGO for turtle graphics, or press Enter on BOOTLOGO.COM.
 Try REPEAT 36 [FD 60 RT 170]. QUIT, then Enter, returns to VC.
@@ -20,6 +21,7 @@ The Linux version manages real files: github.com/evoleinik/vc-linux
 
 Keys to try:
   F3          View the selected file. Esc closes the viewer.
+  F4          Edit the selected file in VZ Editor (US version 1.6).
   F5          Copy to the other panel.
   F6          Rename or move.
   F7          Make a directory.
@@ -35,6 +37,15 @@ Keys to try:
   Tab         Switch panels.
   F10         Quit.
 
+Inside VZ Editor:
+  Arrow keys  Move the cursor. Typing inserts text; Enter starts a line.
+  Alt-S       Save As: press Enter to keep the displayed filename.
+  Alt-Q       Quit: answer Y. Unsaved changes prompt to save first.
+  Esc, S/Q    Same as Alt-S/Alt-Q; press Esc, then the letter.
+  F1          File menu. Esc closes a menu.
+  F12         English help. Esc closes help.
+New lines use DOS CRLF. VZ's original settings add a final Ctrl-Z byte on save.
+
 HISTORY.TXT tells VC's story. SRC holds its assembly sources.
 GAMES holds twelve of David Ahl's public-domain BASIC Computer Games.
 SPIRAL.BAS is our own short SCREEN 1 / DRAW graphics demonstration.
@@ -47,3 +58,4 @@ LOGOLIC.TXT is bootLogo's BSD-2 licence, by Oscar Toledo G.
 GAMES/ROGUELIC.TXT is Rogue's BSD-3 licence, by Toy, Arnold and Wichman.
 GAMES/PDCLIC.TXT has the public-domain notice for its PDCurses DOS port.
 GAMES/OWLIC.TXT has the OpenWatcom runtime licence and its source link.
+VZLIC.TXT is VZ Editor's BSD-3 licence, by c.mos / Village Center.

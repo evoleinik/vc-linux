@@ -74,7 +74,7 @@ def parse_map(path: str | Path) -> LinkMap:
     return LinkMap(path, segments, contributions, symbols)
 
 
-def _values(listing: Listing, link: LinkMap):
+def _values(listing: Listing, link: LinkMap, *, flat: bool = False):
     values = {name.strip("`").upper(): value for name, value in listing.constants.items()}
     values.update({name: offset for name, (_, offset) in link.symbols.items()})
     segvalues = {name: segment for name, (segment, _) in link.symbols.items()}
@@ -91,12 +91,24 @@ def _values(listing: Listing, link: LinkMap):
         base = link.segments[label.segment][0]
         values[name.strip("`").upper()] = piece.address + label.offset - base
         segvalues[name.strip("`").upper()] = base // 16
+    if flat:
+        # The COM's group frame is its PSP, not each contribution's segment.
+        # Public map symbols already use that group; private symbols need
+        # their contribution address added before resolving OFFSET fields.
+        values.update({name: segment * 16 + offset for name, (segment, offset) in link.symbols.items()})
+        values.update({name.strip("`").upper():
+                       link.contributions[(listing.path.stem.upper(), label.segment)].address + label.offset
+                       for name, label in listing.labels.items()})
+        for name, (_, _, _, group) in link.segments.items():
+            values[name.upper()] = values[group.upper()] = 0
+        segvalues = {name.upper(): 0 for name in segvalues}
     return values, segvalues
 
 
 def _expression(expression: str, values, segvalues, location: int) -> int:
     expr = expression.replace("`", "")
     expr = re.sub(r"\b(?:CSEG|DSEG|CS|DS):", "", expr, flags=re.I)
+    expr = re.sub(r"\b([\w@?$]+):", lambda match: "" if match[1].upper() in segvalues else match[0], expr)
     expr = re.sub(r"\b([0-9]+)[dD]\b", r"\1", expr)
     expr = re.sub(r"\b([0-7]+)[oOqQ]\b", lambda m: str(int(m[1], 8)), expr)
     expr = re.sub(r"(?<![\w$])\$(?![\w$])", str(location), expr)
@@ -121,7 +133,8 @@ def _expression(expression: str, values, segvalues, location: int) -> int:
 
 
 def _verify_module(image: LoadedImage, listing: Listing, link: LinkMap):
-    values, segvalues = _values(listing, link)
+    origin = 0 if image.is_exe else 0x100
+    values, segvalues = _values(listing, link, flat=not image.is_exe)
     # Plain assembler constants are already fully represented by the byte
     # column and can change within a macro expansion (NUM=NUM-1). Only
     # relocatable symbols need link-time reevaluation.
@@ -135,7 +148,7 @@ def _verify_module(image: LoadedImage, listing: Listing, link: LinkMap):
         if not row.bytes or row.segment is None:
             continue
         piece = link.contributions[(listing.path.stem.upper(), row.segment)]
-        off = piece.address + row.offset
+        off = piece.address + row.offset - origin
         expected = list(row.bytes)
         for initial in row.initializers:
             expression = initial.expression.replace("`", "")
@@ -147,14 +160,23 @@ def _verify_module(image: LoadedImage, listing: Listing, link: LinkMap):
             if not any(name.upper() in symbols for name in names):
                 continue
             try:
-                value = _expression(expression, values, segvalues,
-                                    off - link.segments[row.segment][0] + initial.offset)
+                location = (off - link.segments[row.segment][0] if image.is_exe else off + origin) + initial.offset
+                repeat = re.fullmatch(r"(.+)\s+DUP\s*\(([^()]*)\)", expression, re.I)
+                if repeat and not image.is_exe:
+                    count = _expression(repeat[1], values, segvalues, location)
+                    value = _expression(repeat[2], values, segvalues, location)
+                    if count < 0 or initial.offset + count * initial.width != row.byte_count:
+                        raise ValueError("DUP count disagrees with listing allocation")
+                    for i in range(initial.offset, len(expected)):
+                        expected[i] = (value >> (8 * ((i - initial.offset) % initial.width))) & 255
+                    continue
+                value = _expression(expression, values, segvalues, location)
             except (KeyError, SyntaxError, TypeError, ValueError) as exc:
                 raise LayoutError(f"{listing.path}:{row.lineno}: cannot resolve linked data {expression!r}: {exc}") from exc
             for i in range(initial.width):
                 if initial.offset + i < len(expected):
                     expected[initial.offset + i] = (value >> (8 * i)) & 255
-        if any(b is not None for b in expected) and off + len(expected) > len(image.data):
+        if any(b is not None for b in expected) and (off < 0 or off + len(expected) > len(image.data)):
             raise LayoutError(f"{listing.path}:{row.lineno}: initialized bytes outside load module")
         for index, byte in enumerate(expected):
             # MASM ORG can deliberately overwrite an earlier DB, e.g. the
@@ -191,19 +213,26 @@ def _verify_module(image: LoadedImage, listing: Listing, link: LinkMap):
 
 
 def build_linked_layout(image: LoadedImage, listings, map_path: str | Path) -> Layout:
-    if not image.is_exe:
-        raise LayoutError("a link map requires an MZ executable")
     link = parse_map(map_path)
-    parsed = [parse_listing(path, linked=True) for path in listings]
+    origin = 0 if image.is_exe else 0x100
+    if not image.is_exe:
+        entry = re.search(r"Entry point address:\s*([\da-fA-F]{4}):([\da-fA-F]{4})", link.path.read_text())
+        groups = {group for _, _, _, group in link.segments.values()}
+        if (entry is None or int(entry[1], 16) * 16 + int(entry[2], 16) != origin
+                or len(groups) != 1 or "AUTO" in groups
+                or min(address for address, _, _, _ in link.segments.values()) != 0
+                or any(address + size > 0x10000 for address, size, _, _ in link.segments.values())):
+            raise LayoutError(f"{link.path}: require one flat COM group with entry at PSP:0100h")
+    parsed = [parse_listing(path, linked=True, flat=not image.is_exe) for path in listings]
     modules = [listing.path.stem.upper() for listing in parsed]
     expected_modules = {module for module, _ in link.contributions}
     if len(set(modules)) != len(modules) or set(modules) != expected_modules:
         raise LayoutError(f"{link.path}: listings must cover each module exactly once; "
                           f"missing {sorted(expected_modules - set(modules))}, extra {sorted(set(modules) - expected_modules)}")
-    segments = {name: Segment(name, kind in ("CODE", "CODESG"), size,
+    segments = {name: Segment(name, not image.is_exe or kind in ("CODE", "CODESG"), size,
                               None if group == "AUTO" else group, size)
                 for name, (address, size, kind, group) in link.segments.items()}
-    bases = {name: address for name, (address, _, _, _) in link.segments.items()}
+    bases = {name: address - origin for name, (address, _, _, _) in link.segments.items()}
     merged = Listing(link.path, [], segments, {}, {})
     normalized = []
     for listing in parsed:
@@ -217,13 +246,13 @@ def build_linked_layout(image: LoadedImage, listings, map_path: str | Path) -> L
             if row.segment is None or row.offset is None:
                 return row
             piece = link.contributions[(module, row.segment)]
-            return replace(row, offset=piece.address - bases[row.segment] + row.offset,
+            return replace(row, offset=piece.address - origin - bases[row.segment] + row.offset,
                            procedure=f"{module}::{row.procedure}" if row.procedure else None)
         merged.lines.extend(placed(row) for row in listing.lines)
         normalized.extend(placed(row) for row in _normalized_rows(listing))
         for name, label in listing.labels.items():
             piece = link.contributions[(module, label.segment)]
-            merged.labels[f"{module}::{name}"] = replace(label, offset=piece.address - bases[label.segment] + label.offset)
+            merged.labels[f"{module}::{name}"] = replace(label, offset=piece.address - origin - bases[label.segment] + label.offset)
     decoder = Cs(CS_ARCH_X86, CS_MODE_16)
     decoder.detail = True
     instructions = []
@@ -254,6 +283,11 @@ def build_linked_layout(image: LoadedImage, listings, map_path: str | Path) -> L
             record.return_skip = return_skips.get(frame + ((record.insn.operands[0].imm - frame) & 0xffff), 0)
     _decode_static_successors(image, merged, bases, decoder, instructions,
                               allow_data_overlaps=True, return_skips=return_skips)
+    labels = {name: bases[label.segment] + label.offset for name, label in merged.labels.items()}
+    variant_writers = {}
+    if not image.is_exe:
+        from .vz import prove_macro_variants
+        variant_writers = prove_macro_variants(image, instructions, labels, decoder)
     # Direct CS-relative stores in the sources reveal patched operand fields.
     # Keep the opcode and instruction boundaries static; read only those
     # immediate bytes live. Patches that change the instruction itself fail.
@@ -263,12 +297,14 @@ def build_linked_layout(image: LoadedImage, listings, map_path: str | Path) -> L
             if (operand.type != X86_OP_MEM or not operand.access & 2
                     or operand.mem.segment != X86_REG_CS or operand.mem.base or operand.mem.index):
                 continue
-            start = bases[writer.line.segment] + (operand.mem.disp & 0xffff)
+            start = (bases[writer.line.segment] if image.is_exe else -origin) + (operand.mem.disp & 0xffff)
             for target in instructions:
                 changed = set(range(start, start + operand.size)) & set(range(target.off, target.off + target.insn.size))
                 if not changed:
                     continue
-                if target.insn.mnemonic in ("ljmp", "lcall") and target.insn.operands[0].type == X86_OP_IMM:
+                if variant_writers.get(target.off) == writer.off:
+                    allowed = set(range(target.off, target.off + target.insn.size))
+                elif target.insn.mnemonic in ("ljmp", "lcall") and target.insn.operands[0].type == X86_OP_IMM:
                     allowed = set(range(target.off + target.insn.size - 4, target.off + target.insn.size))
                 else:
                     allowed = set(range(target.off + target.insn.imm_offset,
@@ -286,7 +322,6 @@ def build_linked_layout(image: LoadedImage, listings, map_path: str | Path) -> L
             chunks.append(Chunk(f"linked_{record.off:x}", index=len(chunks)))
         record.chunk = chunks[-1]
         record.chunk.instructions.append(record)
-    labels = {name: bases[label.segment] + label.offset for name, label in merged.labels.items()}
     layout = Layout(image, merged, instructions, chunks, bases, labels, {})
     layout.linked = True
     layout.mutable_offsets = tuple(sorted(mutable))

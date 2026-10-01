@@ -127,6 +127,40 @@ mutation tests show that freezing either the DS immediate or a saved ISR
 pointer is detected. Arbitrary user-created code (CALL/USR or POKE changing
 opcodes) remains outside the ahead-of-time translation contract.
 
+## Linked VZ Editor COM modules
+
+`make vz` reproduces the vendored VZ Editor 1.6 US COM byte-for-byte. Its
+29 module listings use the same `--map` path as GW-BASIC. The COM path
+requires one group, a map entry at PSP:0100h and an address range below
+64 KiB; file offsets are the map's linear addresses minus 100h. Both public
+and private data fixups resolve in that common group, not each segment's
+individual paragraph frame.
+
+VZ deliberately puts instructions in WORK, BASE, EXEC, HARD and INIT as well
+as CODE. For linked COMs the entire group is eligible for source instruction
+rows, with the same full byte-coverage checks; declared DB/DW data is not
+linear-disassembled. Inactive segment declarations have no listing address
+and are ignored. PROC names retain their entry address, not ENDP's address.
+VZ's symbolic DUP alignment is accepted only when its count agrees exactly
+with the allocation shown by the listing.
+
+There are 23,159 executable starts. The one source-created instruction is
+MACRO.ASM's `&i` call: it writes either `CD nn` (INT nn) or `EB 22` (a fixed
+jump to its far-call trampoline) into `opcode DW 0`. `translator/vz.py`
+proves the complete selection/store/register-load byte sequence and both
+successor labels. The emitter checks those two fixed templates and invokes
+their ordinary translated semantics; any other bytes fault. Only this
+two-byte slot is mutable. The original zero DW is not an executable third
+form, and arbitrary macro-provided far machine code still requires an
+existing translation.
+
+The Unicorn gate covers every VZ instruction and both guarded macro forms,
+including randomized live interrupt numbers. The new DAS instruction also
+has a focused 1,024-random-state check. Source-proof corruption and an
+unpatched macro word are rejected by dedicated tests. No runtime decoder is
+introduced, and regeneration leaves VC's, GW-BASIC's and bootLogo's five
+established C files byte-identical.
+
 ## Necessary JWasm listing normalization
 
 The original `make images` recipes are unchanged. Their listings omit

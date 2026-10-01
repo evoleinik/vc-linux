@@ -6,6 +6,12 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isMainThread, parentPort, Worker } from 'node:worker_threads';
 
+function exitAfterOutput(code) {
+  // Worker and main-thread stdout can both be asynchronous when CI captures
+  // them. Do not discard the final PASS line or failure diagnostics on exit.
+  process.stdout.write('', () => process.stderr.write('', () => process.exit(code)));
+}
+
 const timeout = Number(process.env.WEB_SMOKE_TIMEOUT || 10000);
 if (isMainThread) {
   // A missing Asyncify yield freezes the guest's JS event loop, including
@@ -16,13 +22,13 @@ if (isMainThread) {
     clearTimeout(deadline);
     deadline = setTimeout(() => {
       console.error(`FAIL: guest event loop stalled while waiting for ${description}`);
-      worker.terminate().then(() => process.exit(1));
+      worker.terminate().then(() => exitAfterOutput(1));
     }, timeout + 1000);
   };
   arm('startup');
   worker.on('message', arm);
-  worker.on('error', (error) => { console.error(error); process.exit(1); });
-  worker.on('exit', (code) => { clearTimeout(deadline); process.exit(code); });
+  worker.on('error', (error) => { console.error(error); exitAfterOutput(1); });
+  worker.on('exit', (code) => { clearTimeout(deadline); exitAfterOutput(code); });
   await new Promise(() => {});
 }
 
@@ -159,6 +165,22 @@ async function selectFile(name) {
   }
   assert.fail(`${name} was not reachable in the active panel`);
 }
+
+function fail(error) {
+  let log = '';
+  try {
+    screen = vc.FS.readFile(screenPath, { encoding: 'utf8' });
+    log = vc.FS.readFile('/var/vc/cache/vc-linux/vc.log', { encoding: 'utf8' });
+  } catch { /* A startup failure may precede the screen/log. */ }
+  console.error(`FAIL [${stage}]: ${error?.stack || error}\n${screen}\n--- VC log ---\n${log}`);
+  console.error(`Speaker events in current stage: ${JSON.stringify(speakerEvents)}`);
+  exitAfterOutput(1);
+}
+
+// An Asyncify rewind runs from a timer, outside the async test's try/catch.
+// Preserve the same stage/screen/log diagnostics for guest runtime traps.
+process.on('uncaughtException', fail);
+process.on('unhandledRejection', fail);
 
 try {
   await createVC({
@@ -516,7 +538,97 @@ try {
   await until('H: root panel after Rogue Enter launch', isPanel);
   console.log('PASS 23: Enter on H:\\GAMES\\ROGUE.EXE plays and returns to VC');
 
-  stage = '24 quit and exit hook';
+  stage = '24 F4 VZ edit, save, and quit';
+  assert.ok(vc.FS.analyzePath('/home/vc/VZ.COM').exists,
+    'the translated VZ.COM must be installed on H: before F4 can edit');
+  assert.deepEqual(vc.FS.readFile('/home/vc/VZ.COM'),
+    new Uint8Array(readFileSync(new URL('../third_party/vzeditor/VZ-IBM/US/VZUS.COM', import.meta.url))),
+    'VZ.COM is the real byte-identical US DOS file on H:');
+  for (const [installed, source] of [['VZ.DEF', 'VZIBM.DEF'], ['VZFLE.DEF', 'VZFLE.DEF'],
+    ['HELPE.DEF', 'HELPE.DEF']]) {
+    assert.ok(vc.FS.analyzePath(`/home/vc/${installed}`).exists, `${installed} must be installed on H:`);
+    const definition = readFileSync(new URL(`../third_party/vzeditor/VZ-IBM/${source}`, import.meta.url));
+    if (installed === 'VZ.DEF') {
+      const option = definition.indexOf('\r\nEb-');
+      assert.ok(option >= 0, 'the vendored default is unchanged');
+      definition[option + 4] = '+'.charCodeAt(0);
+    }
+    assert.deepEqual(vc.FS.readFile(`/home/vc/${installed}`),
+      new Uint8Array(definition),
+      `${installed} contains the English VZ definitions with backups enabled by default`);
+  }
+  await selectFile('README.TXT');
+  const originalReadme = vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' });
+  send('\x1bOS');
+  await until('VZ showing the original README first line after F4', (text) =>
+    !hasPanels(text) && text.includes(firstLine) && text.includes('File'));
+  const editorRow = screen.split('\n').findIndex((line) => line.includes(firstLine));
+  const editorLine = 'Edited with VZ in the browser.';
+  for (let start = 0; start < editorLine.length; start += 8) {
+    send(editorLine.slice(start, start + 8));
+    await until(`VZ input echo through character ${start + 8}`, (text) =>
+      text.includes(editorLine.slice(0, start + 8)));
+  }
+  send('\r');
+  await until('the new VZ line above the untouched README first line', (text) => {
+    const lines = text.split('\n');
+    return lines[editorRow].includes(editorLine) && lines[editorRow + 1].includes(firstLine);
+  });
+  // The original US DEF binds Alt-S (also Esc, S) to Save As. Submit the
+  // prefilled path; VZ itself, not the JS harness, must change MEMFS.
+  send('\x1bs');
+  await until('VZ English Save As dialog', (text) => text.includes('Save As:'));
+  send('\r');
+  const editedReadme = editorLine + '\r\n' + originalReadme + '\x1a';
+  await until('VZ has saved the actual README bytes to MEMFS', (text) =>
+    !text.includes('Save As:')
+    && vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' }) === editedReadme);
+  const readmeBackup = vc.FS.readdir('/home/vc').find((name) => name.toUpperCase() === 'README.BAK');
+  assert.ok(readmeBackup, 'an F4 save must leave the previous README in README.BAK');
+  assert.equal(vc.FS.readFile(`/home/vc/${readmeBackup}`, { encoding: 'utf8' }), originalReadme);
+  send('\x1bq');
+  await until('VZ English quit confirmation', (text) => text.includes('Quit from editor? (Y/N)'));
+  send('Y');
+  await until('VC panels return after VZ exits', isPanel);
+  assert.equal(vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' }), editedReadme);
+  assert.equal(exitCalls, 0, 'VZ exits only its own DOS process');
+  console.log('PASS 24: F4 opens README in VZ; Alt-S saves MEMFS bytes with a backup and Alt-Q restores VC');
+
+  stage = '25 typed VZ new file';
+  send('vz NEW.TXT\r');
+  await until('VZ asks to create the typed new filename', (text) =>
+    text.includes('not found. New file? (Y/N)'));
+  send('Y');
+  await until('VZ new-file editing window', (text) =>
+    !hasPanels(text) && text.toUpperCase().includes('NEW.TXT') && !text.includes('(Y/N)'));
+  assert.ok(!vc.FS.readdir('/home/vc').some((name) => name.toUpperCase() === 'NEW.TXT'),
+    'opening is not yet saving');
+  send('New VZ.');
+  await until('VZ echoes new-file text', (text) => text.includes('New VZ.'));
+  const newRow = screen.split('\n').findIndex((line) => line.includes('New VZ.'));
+  const beforeEnter = screen.split('\n')[newRow];
+  send('\r');
+  // With the shipped Dc+/De+ options, Enter replaces this row's EOF
+  // marker with a CR marker and moves EOF to the next row. Observe that
+  // change before sending Alt-S: VZ flushes queued control keys.
+  await until('VZ inserts the new-file line ending', (text) =>
+    text.split('\n')[newRow] !== beforeEnter);
+  send('\x1bs');
+  await until('Save As for NEW.TXT', (text) => text.includes('Save As:'));
+  send('\r');
+  // Dp+ in the original DEF lowercases VZ's path on the case-sensitive
+  // host filesystem; DOS still resolves the typed NEW.TXT to this file.
+  await until('VZ creates NEW.TXT in MEMFS', (text) =>
+    !text.includes('Save As:') && vc.FS.analyzePath('/home/vc/new.txt').exists);
+  assert.equal(vc.FS.readFile('/home/vc/new.txt', { encoding: 'utf8' }), 'New VZ.\r\n\x1a');
+  send('\x1bq');
+  await until('VZ quit confirmation after the new file is saved', (text) =>
+    text.includes('Quit from editor? (Y/N)'));
+  send('Y');
+  await until('VC panels after the second VZ child', isPanel);
+  console.log('PASS 25: typed vz NEW.TXT creates and saves a real H: file');
+
+  stage = '26 quit and exit hook';
   send('\x1b[21~');
   await until('the quit confirmation', (text) =>
     text.includes('Do you want to quit the Volkov Commander?') && text.includes('Yes'));
@@ -524,15 +636,9 @@ try {
   await until('the JavaScript exit hook', () => exitCalls > 0);
   assert.equal(exitCalls, 1, 'the exit hook fires exactly once');
   assert.equal(exitCode, 0, 'VC exits successfully');
-  console.log('PASS 24: F10, Enter quits and fires the exit hook');
-  console.log('web smoke: all 24 checks passed');
-  process.exit(0);
+  console.log('PASS 26: F10, Enter quits and fires the exit hook');
+  console.log('web smoke: all 26 checks passed');
+  exitAfterOutput(0);
 } catch (error) {
-  let log = '';
-  try {
-    log = vc.FS.readFile('/var/vc/cache/vc-linux/vc.log', { encoding: 'utf8' });
-  } catch { /* A startup failure may precede the log. */ }
-  console.error(`FAIL [${stage}]: ${error.stack || error}\n${screen}\n--- VC log ---\n${log}`);
-  console.error(`Speaker events in current stage: ${JSON.stringify(speakerEvents)}`);
-  process.exit(1);
+  fail(error);
 }

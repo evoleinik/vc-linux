@@ -18,7 +18,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("listing", type=Path, nargs="*")
-    parser.add_argument("--map", type=Path, help="JWlink verbose map for a multi-module EXE")
+    parser.add_argument("--map", type=Path, help="linker map for a multi-module EXE or flat COM")
     parser.add_argument("--format", choices=("jwasm", "nasm", "watcom"), default="jwasm",
                         help="listing dialect (NASM requires -LefFt and a flat COM)")
     parser.add_argument("--watcom", type=Path, help="OpenWatcom root (otherwise WATCOM)")

@@ -79,11 +79,34 @@ typedef struct BirthTime {
     struct BirthTime *next;
 } BirthTime;
 
+/* A lease is deliberately sparse: just the components of one selected
+ * canonical path, not a cache of the root drive's short-name assignments.
+ * Component offsets refer to the two immutable absolute spellings below. */
+typedef struct {
+    uint16_t parent_end, host_start, host_end, dos_start;
+    uint8_t dos_length;
+    dev_t dev, entry_dev;
+    ino_t ino, entry_ino;
+    mode_t type, entry_type;
+} LeasePart;
+
+struct DosPathLease {
+    struct DosPathLease *next;
+    int fd; /* Hold the selected inode until release or an owner rename. */
+    uint16_t psp;
+    bool bound;
+    bool recreate; /* Owner moved the leaf; retain only its pathname reservation. */
+    unsigned count;
+    char dos[128], host[PATH_MAX];
+    LeasePart parts[64];
+};
+
 static DosDrive drives[DOS_DRIVES] = {[DRIVE_C] = {"/", "/"}};
 static unsigned current_drive = DRIVE_C;
 static DosHandle handles[DOS_HANDLES];
 static Search searches[SEARCH_SLOTS];
 static BirthTime *birth_times;
+static DosPathLease *path_leases;
 static uint16_t dta_seg, dta_off = 0x80;
 static uint16_t last_error;
 static uint32_t search_generation;
@@ -326,6 +349,161 @@ static bool valid_short(const char *name, char out[13])
     return true;
 }
 
+static void lease_alias(const DosPathLease *lease, const LeasePart *part, char out[13])
+{
+    memcpy(out, lease->dos + part->dos_start, part->dos_length);
+    out[part->dos_length] = 0;
+}
+
+static bool lease_host_name(const DosPathLease *lease, const LeasePart *part,
+                            const char *name)
+{
+    size_t n = part->host_end - part->host_start;
+    return strlen(name) == n && !memcmp(lease->host + part->host_start, name, n);
+}
+
+static int lease_identity(const DosPathLease *lease, const LeasePart *part)
+{
+    char path[PATH_MAX];
+    memcpy(path, lease->host, part->host_end);
+    path[part->host_end] = 0;
+    struct stat st, entry;
+    if (lstat(path, &entry)) {
+        /* Only the owner can deliberately make its reserved basename vacant.
+         * An external deletion still cannot recreate a stale literal alias. */
+        return errno == ENOENT && part->type == S_IFREG && lease->recreate ? 0 : 5;
+    }
+    if (stat(path, &st) || (st.st_mode & S_IFMT) != part->type ||
+        (entry.st_mode & S_IFMT) != part->entry_type) return 5;
+    /* Directories and symlink entries must stay attached to their own identity.
+     * A regular file, however, is a saved pathname: editors, git and sync tools
+     * may replace its inode without changing which file the user is editing. */
+    if ((part->type == S_IFDIR && (st.st_dev != part->dev || st.st_ino != part->ino)) ||
+        ((part->type == S_IFDIR || part->entry_type == S_IFLNK) &&
+         (entry.st_dev != part->entry_dev || entry.st_ino != part->entry_ino))) return 5;
+    return 0;
+}
+
+static int lease_alias_conflict(const DosPathLease *lease, const LeasePart *part)
+{
+    char parent[PATH_MAX], alias[13];
+    memcpy(parent, lease->host, part->parent_end);
+    parent[part->parent_end] = 0;
+    lease_alias(lease, part, alias);
+    DIR *dp = opendir(parent);
+    if (!dp) return 5;
+    int error = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(dp);
+        if (!de) { if (errno) error = 5; break; }
+        if (lease_host_name(lease, part, de->d_name)) continue;
+        char cp[DOS_NAME_MAX + 1], short_name[13];
+        if (utf8_to_cp(de->d_name, cp, sizeof(cp)) && valid_short(cp, short_name) &&
+            cp_equal(short_name, alias)) { error = 5; break; }
+    }
+    closedir(dp);
+    return error;
+}
+
+/* A directory lookup validates only that prefix. A moved, replaced or missing
+ * descendant must not prevent unrelated opens, backup lookup or Save As. */
+static int lease_validate(const DosPathLease *lease, unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i)
+        if (lease_identity(lease, lease->parts + i) ||
+            lease_alias_conflict(lease, lease->parts + i)) return 5;
+    return 0;
+}
+
+void dos_fs_release_path(DosPathLease *lease)
+{
+    DosPathLease **p = &path_leases;
+    while (*p && *p != lease) p = &(*p)->next;
+    if (!*p) return;
+    *p = lease->next;
+    if (lease->fd >= 0) close(lease->fd);
+    free(lease);
+}
+
+void dos_fs_bind_path(DosPathLease *lease, uint16_t psp)
+{
+    if (lease) { lease->psp = psp; lease->bound = true; }
+}
+
+static bool active_lease(const DosPathLease *lease)
+{
+    return lease->bound && lease->psp == fcb_process;
+}
+
+static bool lease_parent(const DosPathLease *lease, const LeasePart *part, const char *dir)
+{
+    return strlen(dir) == part->parent_end && !memcmp(dir, lease->host, part->parent_end);
+}
+
+/* Consult leases before exact native lookup: a newly created literal 8.3
+ * name must cause refusal, not steal the selected file's saved spelling. */
+static int resolve_leased_name(const char *dir, const char *name, char out[PATH_MAX],
+                               bool *claimed)
+{
+    *claimed = false;
+    for (DosPathLease *lease = path_leases; lease; lease = lease->next) {
+        if (!active_lease(lease)) continue;
+        for (unsigned i = 0; i < lease->count; ++i) {
+            const LeasePart *part = lease->parts + i;
+            if (!lease_parent(lease, part, dir)) continue;
+            char alias[13];
+            lease_alias(lease, part, alias);
+            if (!cp_equal(alias, name)) continue;
+            if (lease_validate(lease, i + 1)) return 5;
+            if (*claimed && (strlen(out) != part->host_end ||
+                             memcmp(out, lease->host, part->host_end))) return 5;
+            memcpy(out, lease->host, part->host_end);
+            out[part->host_end] = 0;
+            *claimed = true;
+        }
+    }
+    return 0;
+}
+
+static int reserve_leased_aliases(const char *dir, Entry *entries, size_t count)
+{
+    for (DosPathLease *lease = path_leases; lease; lease = lease->next) {
+        if (!active_lease(lease)) continue;
+        for (unsigned i = 0; i < lease->count; ++i) {
+            const LeasePart *part = lease->parts + i;
+            if (!lease_parent(lease, part, dir)) continue;
+            /* Reserve the leaf's spelling even if it is currently missing or
+             * unsafe to open. Its own identity cannot poison this directory's
+             * other entries; opening the leaf validates it separately. */
+            if (lease_validate(lease, i) || lease_alias_conflict(lease, part) ||
+                (part->type == S_IFDIR && lease_identity(lease, part))) return 5;
+            char alias[13];
+            lease_alias(lease, part, alias);
+            size_t index;
+            for (index = 0; index < count; ++index)
+                if (lease_host_name(lease, part, entries[index].host)) break;
+            if (index == count) continue;
+            if (*entries[index].alias && strcmp(entries[index].alias, alias)) return 5;
+            for (size_t j = 0; j < count; ++j)
+                if (j != index && !strcmp(entries[j].alias, alias)) return 5;
+            strcpy(entries[index].alias, alias);
+        }
+    }
+    return 0;
+}
+
+static int leased_host(const char *path, DosPathLease **out)
+{
+    *out = NULL;
+    for (DosPathLease *lease = path_leases; lease; lease = lease->next) {
+        if (!active_lease(lease) || strcmp(lease->host, path)) continue;
+        if (lease_validate(lease, lease->count)) return 5;
+        *out = lease;
+    }
+    return 0;
+}
+
 static void alias_parts(const char *name, char base[256], char ext[4])
 {
     const char *start = name;
@@ -361,11 +539,42 @@ static void numbered_alias(const char *name, unsigned number, char out[13])
     out[pos] = 0;
 }
 
-static bool alias_used(const Entry *entries, size_t count, const char *alias)
+static bool reserved_alias(const char *dir, const char *alias)
+{
+    for (DosPathLease *lease = path_leases; lease; lease = lease->next) {
+        if (!active_lease(lease)) continue;
+        for (unsigned i = 0; i < lease->count; ++i) {
+            const LeasePart *part = lease->parts + i;
+            char reserved[13];
+            if (!lease_parent(lease, part, dir)) continue;
+            lease_alias(lease, part, reserved);
+            if (cp_equal(alias, reserved)) return true;
+        }
+    }
+    return false;
+}
+
+static bool reserved_host_alias(const char *dir, const char *host, char out[13])
+{
+    for (DosPathLease *lease = path_leases; lease; lease = lease->next) {
+        if (!active_lease(lease)) continue;
+        for (unsigned i = 0; i < lease->count; ++i) {
+            const LeasePart *part = lease->parts + i;
+            if (!lease_parent(lease, part, dir) || !lease_host_name(lease, part, host)) continue;
+            lease_alias(lease, part, out);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool alias_used(const char *dir, const Entry *entries, size_t count, const char *alias)
 {
     for (size_t i = 0; i < count; ++i)
         if (*entries[i].alias && !strcmp(entries[i].alias, alias)) return true;
-    return false;
+    /* A vacant owner-renamed leaf has no Entry, but its spelling must not be
+     * handed to a neighbor before VZ recreates the selected long host name. */
+    return reserved_alias(dir, alias);
 }
 
 static void hashed_name(const char *host, const char *name, char out[DOS_NAME_MAX + 1])
@@ -503,11 +712,14 @@ static int list_directory(const char *dir, Entry **out, size_t *out_count)
     if (error) { free_entries(entries, count); return error; }
     if (count) qsort(entries, count, sizeof(*entries), entry_cmp);
     assign_dos_names(entries, count);
+    error = reserve_leased_aliases(dir, entries, count);
+    if (error) { free_entries(entries, count); return error; }
     /* Reserve every real 8.3 name first, including lexically later names.
      * Case-colliding native short names after the first also need an alias. */
     for (size_t i = 0; i < count; ++i) {
+        if (*entries[i].alias) continue;
         char candidate[13];
-        if (valid_short(entries[i].dos, candidate) && !alias_used(entries, count, candidate))
+        if (valid_short(entries[i].dos, candidate) && !alias_used(dir, entries, count, candidate))
             strcpy(entries[i].alias, candidate);
     }
     for (size_t i = 0; i < count; ++i) {
@@ -516,7 +728,7 @@ static int list_directory(const char *dir, Entry **out, size_t *out_count)
         unsigned n;
         for (n = 1; n <= 9999999; ++n) {
             numbered_alias(entries[i].dos, n, candidate);
-            if (!alias_used(entries, count, candidate)) break;
+            if (!alias_used(dir, entries, count, candidate)) break;
         }
         if (n > 9999999) { free_entries(entries, count); return 4; }
         strcpy(entries[i].alias, candidate);
@@ -588,7 +800,10 @@ static int resolve_name(const char *dir, const char *name, char *out, bool allow
 {
     char utf8[4 * (DOS_NAME_MAX + 1)], exact[PATH_MAX];
     if (strlen(name) > DOS_NAME_MAX) return 3;
-    int error = cp_to_utf8(name, utf8, sizeof(utf8));
+    bool claimed;
+    int error = resolve_leased_name(dir, name, out, &claimed);
+    if (error || claimed) return error;
+    error = cp_to_utf8(name, utf8, sizeof(utf8));
     if (error || (error = join_path(dir, utf8, exact, sizeof(exact)))) return error;
     /* A name that exists exactly as spelled is always that entry: real names
      * take priority over every generated alias and collision suffix. This
@@ -657,6 +872,84 @@ static int resolve_path(const char *dos, char out[PATH_MAX], bool allow_missing)
     return 0;
 }
 
+int dos_fs_pin_path(const char *dos, const char *host, DosPathLease **out)
+{
+    if (!out) return 5;
+    *out = NULL;
+    if (!dos || !host || strlen(dos) >= 128 || strlen(host) >= PATH_MAX ||
+        strlen(dos) < 4 || dos[1] != ':' || (dos[2] != '\\' && dos[2] != '/') ||
+        *host != '/') return 5;
+    const char *input = dos;
+    unsigned drive;
+    if (path_drive(&input, &drive) || !path_below(host, drives[drive].root) ||
+        !strcmp(host, drives[drive].root)) return 5;
+    char resolved[PATH_MAX];
+    if (resolve_path(dos, resolved, false) || strcmp(resolved, host)) return 5;
+    DosPathLease *lease = calloc(1, sizeof(*lease));
+    if (!lease) return 8;
+    lease->fd = -1;
+    strcpy(lease->host, host);
+    for (size_t i = 0; dos[i]; ++i)
+        lease->dos[i] = dos[i] == '/' ? '\\' : (char)cp866_upper((uint8_t)dos[i]);
+    size_t d = 3, parent = strlen(drives[drive].root);
+    size_t h = parent + (host[parent - 1] != '/');
+    int error = 0;
+    while (lease->dos[d] && host[h]) {
+        if (lease->count == sizeof(lease->parts) / sizeof(*lease->parts)) { error = 5; break; }
+        size_t dend = d, hend = h;
+        while (lease->dos[dend] && lease->dos[dend] != '\\') ++dend;
+        while (host[hend] && host[hend] != '/') ++hend;
+        char name[13], candidate[13];
+        size_t n = dend - d;
+        if (!n || n >= sizeof(name)) { error = 5; break; }
+        memcpy(name, lease->dos + d, n); name[n] = 0;
+        if (!valid_short(name, candidate) || !strcmp(name, ".") || !strcmp(name, "..")) {
+            error = 5; break;
+        }
+        lease->parts[lease->count++] = (LeasePart){
+            .parent_end = (uint16_t)parent, .host_start = (uint16_t)h,
+            .host_end = (uint16_t)hend, .dos_start = (uint16_t)d, .dos_length = (uint8_t)n};
+        parent = hend;
+        d = dend + !!lease->dos[dend];
+        h = hend + !!host[hend];
+    }
+    if (lease->dos[d] || host[h] || !lease->count) error = 5;
+    struct stat st, entry;
+    for (unsigned i = 0; !error && i < lease->count; ++i) {
+        LeasePart *part = lease->parts + i;
+        memcpy(resolved, host, part->host_end);
+        resolved[part->host_end] = 0;
+        if (stat(resolved, &st) || lstat(resolved, &entry) ||
+            (i + 1 < lease->count ? !S_ISDIR(st.st_mode) :
+             (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)))) { error = 5; break; }
+        part->dev = st.st_dev; part->ino = st.st_ino;
+        part->entry_dev = entry.st_dev; part->entry_ino = entry.st_ino;
+        part->type = st.st_mode & S_IFMT;
+        part->entry_type = entry.st_mode & S_IFMT;
+    }
+    if (!error) {
+        do { lease->fd = open(host, O_RDONLY | O_NONBLOCK | O_CLOEXEC); }
+        while (lease->fd < 0 && errno == EINTR);
+        if (lease->fd < 0 || fstat(lease->fd, &st) || lstat(host, &entry) ||
+            (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) error = 5;
+    }
+    if (!error) {
+        const LeasePart *leaf = lease->parts + lease->count - 1;
+        if (st.st_dev != leaf->dev || st.st_ino != leaf->ino ||
+            entry.st_dev != leaf->entry_dev || entry.st_ino != leaf->entry_ino) error = 5;
+        else error = lease_validate(lease, lease->count);
+    }
+    if (error) {
+        if (lease->fd >= 0) close(lease->fd);
+        free(lease);
+        return error;
+    }
+    lease->next = path_leases;
+    path_leases = lease;
+    *out = lease;
+    return 0;
+}
+
 static int memory_path(uint16_t seg, uint16_t off, char out[PATH_MAX], bool allow_missing)
 {
     char dos[DOS_PATH_MAX];
@@ -709,13 +1002,14 @@ static int host_to_dos_on_drive(const char *host, unsigned drive, bool short_nam
             for (size_t i = 0; i < count; ++i) if (!strcmp(entries[i].host, part)) {
                 strcpy(dos, short_names ? entries[i].alias : entries[i].dos); found = true; break;
             }
+            if (!found && short_names) found = reserved_host_alias(dir, part, dos);
             if (!found && short_names) {
                 char candidate[13];
-                if (!valid_short(dos, candidate) || alias_used(entries, count, candidate)) {
+                if (!valid_short(dos, candidate) || alias_used(dir, entries, count, candidate)) {
                     unsigned i;
                     for (i = 1; i <= 9999999; ++i) {
                         numbered_alias(dos, i, candidate);
-                        if (!alias_used(entries, count, candidate)) break;
+                        if (!alias_used(dir, entries, count, candidate)) break;
                     }
                     if (i > 9999999) { free_entries(entries, count); return 4; }
                 }
@@ -1155,6 +1449,17 @@ void dos_fs_close_process(uint16_t psp)
 {
     for (unsigned i = 0; i < DOS_HANDLES; i++)
         if (handles[i].fcb_id && handles[i].fcb_owner == psp) close_handle(i);
+    dos_fs_release_process_paths(psp);
+}
+
+void dos_fs_release_process_paths(uint16_t psp)
+{
+    DosPathLease *lease = path_leases;
+    while (lease) {
+        DosPathLease *next = lease->next;
+        if (lease->bound && lease->psp == psp) dos_fs_release_path(lease);
+        lease = next;
+    }
 }
 
 static void forget_birth(const struct stat *st)
@@ -1208,8 +1513,12 @@ static int open_path(const char *path, unsigned drive, unsigned mode,
     if (!valid_access(mode)) return 12;
     if ((action & ~0x13u) || (action & 15) > 2) return 12;
     if (attributes & ATTR_VOLUME) return 5;
+    DosPathLease *lease;
+    int error = leased_host(path, &lease);
+    if (error) return error;
     struct stat st;
-    int error = file_stat(path, &st);
+    error = file_stat(path, &st);
+    if (lease && error && !(error == 2 && lease->recreate)) return 5;
     if (error && error != 2) return error;
     bool exists = !error;
     unsigned if_exists = action & 15, if_missing = (action >> 4) & 15;
@@ -1221,13 +1530,33 @@ static int open_path(const char *path, unsigned drive, unsigned mode,
     int slot = unused_handle();
     if (slot < 0) return 4;
     int flags = (mode & 3) == 0 ? O_RDONLY : (mode & 3) == 1 ? O_WRONLY : O_RDWR;
+    if (lease && if_exists == 2 && (mode & 3) == 0) flags = O_RDWR;
     flags |= O_CLOEXEC;
+    if (lease) {
+        flags |= O_NONBLOCK;
+        if (lease->parts[lease->count - 1].entry_type != S_IFLNK) flags |= O_NOFOLLOW;
+    }
     if (!exists) flags |= O_CREAT | O_EXCL;
-    if (exists && if_exists == 2) flags |= O_TRUNC;
+    if (exists && if_exists == 2 && !lease) flags |= O_TRUNC;
     int fd;
     do { fd = open(path, flags, 0666); } while (fd < 0 && errno == EINTR);
-    if (fd < 0) return dos_errno(errno);
+    if (fd < 0) return lease ? 5 : dos_errno(errno);
     if (fstat(fd, &st) < 0) { error = dos_errno(errno); close(fd); return error; }
+    /* Check the opened descriptor against the pathname as it exists now,
+     * not the original inode: external atomic replacement is legitimate.
+     * Keep truncation deferred until type, path components and aliases pass. */
+    if (lease) {
+        struct stat current;
+        if (lease_validate(lease, lease->count) || stat(path, &current) ||
+            !S_ISREG(st.st_mode) || st.st_dev != current.st_dev || st.st_ino != current.st_ino ||
+            (!(st.st_mode & S_IWUSR) && ((mode & 3) != 0 || if_exists == 2))) {
+            close(fd); return 5;
+        }
+        if ((error = check_sharing(&st, mode, if_exists == 2))) { close(fd); return error; }
+    }
+    if (lease && if_exists == 2 && ftruncate(fd, 0)) {
+        error = dos_errno(errno); close(fd); return error;
+    }
     if (!exists) forget_birth(&st); /* an inode may have been recycled */
     if ((!exists || if_exists == 2) && (attributes & ATTR_RO) &&
         fchmod(fd, st.st_mode & ~(S_IWUSR | S_IWGRP | S_IWOTH)) < 0) {
@@ -1237,6 +1566,7 @@ static int open_path(const char *path, unsigned drive, unsigned mode,
     h->fd = fd; h->device = DEV_NONE; h->access = mode & 3; h->mode = mode;
     h->drive = drive;
     strcpy(h->path, path);
+    if (lease) lease->recreate = false;
     cpu.a.x = (uint16_t)slot;
     cpu.c.x = !exists ? 2 : if_exists == 2 ? 3 : 1;
     return 0;
@@ -1897,6 +2227,18 @@ static int rename_file(void)
 #else
     if (renameat2(AT_FDCWD, old, AT_FDCWD, target, RENAME_NOREPLACE) < 0) return dos_errno(errno);
 #endif
+    for (DosPathLease *lease = path_leases; lease; lease = lease->next) {
+        if (!active_lease(lease) || strcmp(lease->host, old)) continue;
+        LeasePart *leaf = lease->parts + lease->count - 1;
+        if (leaf->type != S_IFREG) continue;
+        /* VZ makes its backup by rename, then recreates the old pathname.
+         * Drop the inode lease, not the short-to-long basename reservation:
+         * otherwise an alias can move to a neighbor during that vacancy. */
+        if (lease->fd >= 0) close(lease->fd);
+        lease->fd = -1;
+        lease->recreate = true;
+        leaf->entry_type = S_IFREG;
+    }
     for (unsigned i = 0; i < DOS_DRIVES; ++i) {
         if (!drive_present(i)) continue;
         rebase_path(drives[i].cwd, old, target);
@@ -2046,6 +2388,7 @@ void dos_casemap_upper(void)
 
 void dos_fs_init(void)
 {
+    while (path_leases) dos_fs_release_path(path_leases);
     if (initialized) {
         for (unsigned i = 0; i < DOS_HANDLES; ++i) if (get_handle(i)) close_handle(i);
         for (unsigned i = 0; i < SEARCH_SLOTS; ++i) release_search(searches + i);
@@ -2400,13 +2743,18 @@ static int generate_shortname(void)
     unsigned matches = matching_entry(entries, count, leaf, &found);
     if (matches > 1) { free_entries(entries, count); return 2; }
     if (matches == 1) strcpy(alias, entries[found].alias);
-    else if (!valid_short(leaf, alias) || alias_used(entries, count, alias)) {
-        unsigned n;
-        for (n = 1; n <= 9999999; ++n) {
-            numbered_alias(leaf, n, alias);
-            if (!alias_used(entries, count, alias)) break;
+    else {
+        char host[4 * (DOS_NAME_MAX + 1)];
+        bool reserved = !cp_to_utf8(leaf, host, sizeof(host)) && reserved_host_alias(dir, host, alias);
+        if (!reserved && valid_short(leaf, alias)) reserved = reserved_alias(dir, alias);
+        if (!reserved && (!valid_short(leaf, alias) || alias_used(dir, entries, count, alias))) {
+            unsigned n;
+            for (n = 1; n <= 9999999; ++n) {
+                numbered_alias(leaf, n, alias);
+                if (!alias_used(dir, entries, count, alias)) break;
+            }
+            if (n > 9999999) { free_entries(entries, count); return 4; }
         }
-        if (n > 9999999) { free_entries(entries, count); return 4; }
     }
     free_entries(entries, count);
     if (format == 1) error = write_string(cpu.es, cpu.di, alias, 13);

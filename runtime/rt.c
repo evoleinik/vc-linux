@@ -306,8 +306,8 @@ struct Known {
     int ndeltas;
 };
 
-/* Five shipped images now include Rogue; leave room for the compiled-C
- * programs using the same loader next. Entries survive child termination. */
+/* VC's two parts plus BASIC, Logo, Rogue and VZ need six entries, which
+ * survive child termination. Leave two slots for further compiled-C images. */
 #define MAX_KNOWN 8
 static Known known[MAX_KNOWN];
 static int nknown;
@@ -403,9 +403,9 @@ static void restore_known_image(Known *saved) {
 static int code_matches(const Known *k, uint32_t off, uint32_t L, uint32_t n) {
     if (off + n > k->img->size || L + n > MEM_SIZE) return 0;
     if (!memcmp(&mem[L], &k->snap[off], n)) return 1;
-    /* Listings identify the few immediate operands patched by the program.
-     * Ignore only those declared bytes, never an opcode or a whole image.
-     * The emitted instruction reads each such operand from guest memory. */
+    /* Ignore only declared mutable bytes, never a whole image. Emitted code
+     * reads patched operands from guest memory; VZ's source-proved two-byte
+     * opcode slot additionally checks its finite variants before executing. */
     for (uint32_t j = 0; j < n; ++j) {
         if (mem[L + j] == k->snap[off + j]) continue;
         uint32_t low = 0, high = k->img->nmutable;

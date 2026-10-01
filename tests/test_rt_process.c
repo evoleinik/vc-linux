@@ -55,6 +55,7 @@ const Image image_gwbasic = {
 };
 const Image image_bootlogo = {.name = "LOGO.COM"}; /* Not executed by this fixture. */
 const Image image_rogue = {.name = "ROGUE.EXE"}; /* Not executed by this fixture. */
+const Image image_vz = {.name = "VZ.COM"}; /* Not executed by this fixture. */
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file},

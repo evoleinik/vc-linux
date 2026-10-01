@@ -1,9 +1,10 @@
 """Emit native C statements, not a bytecode interpreter, for listing instructions.
 
-The only instruction decoder runs here, at build time.  The generated helpers
-implement arithmetic and memory primitives; neither they nor the dispatcher
-inspect guest instruction bytes.  An isolated-instruction entry point uses the
-same emitter as the complete image, but returns instead of following a goto.
+The only instruction decoder runs here, at build time. Generated helpers
+implement arithmetic and memory primitives. Source-proved mutable operands
+and finite instruction variants may read guest bytes, but never decode them.
+An isolated-instruction entry point uses the same emitter as the complete
+image, but returns instead of following a goto.
 """
 
 from __future__ import annotations
@@ -588,7 +589,8 @@ class _InstructionEmitter:
         if op in ("int", "int3", "into", "int1"):
             number = {"int3": 3, "into": 4, "int1": 1}.get(op)
             if number is None:
-                number = self.ops[0].imm & 0xff
+                number = (self.read(0) if self.insn.imm_offset in getattr(self.record, "mutable_offsets", ())
+                          else self.ops[0].imm & 0xff)
             code = [f"cpu_int({number}, {_ip(self.off + len(self.raw))});", "return 0;"]
             if op == "into":
                 return ["if (cpu.of) {"] + ["    " + line for line in code] + ["}"], False
@@ -612,6 +614,15 @@ class _InstructionEmitter:
                     (("cf", 0), ("pf", 2), ("af", 4), ("zf", 6), ("sf", 7))], False
         if op == "salc":
             return ["cpu.a.l = cpu.cf ? 0xffu : 0;"], False
+        if op == "das":
+            return ["uint8_t old_al = cpu.a.l, old_cf = cpu.cf;", "cpu.cf = 0;",
+                    "if ((old_al & 15u) > 9u || cpu.af) {",
+                    "    cpu.a.l = (uint8_t)(cpu.a.l - 6u);",
+                    "    cpu.cf = old_cf || old_al < 6u;", "    cpu.af = 1;",
+                    "} else { cpu.af = 0; }",
+                    "if (old_al > 0x99u || old_cf) {",
+                    "    cpu.a.l = (uint8_t)(cpu.a.l - 0x60u);", "    cpu.cf = 1;", "}",
+                    "tr_szp(cpu.a.l, 8);"], False
         if op in ("aam", "aad"):
             radix = self.raw[-1]
             if op == "aam":
@@ -630,6 +641,18 @@ class _InstructionEmitter:
         raise UnsupportedInstruction(f"unsupported instruction {self.insn.mnemonic} {self.insn.op_str}")
 
     def emit(self) -> list[str]:
+        if getattr(self.record, "variants", ()):
+            code = []
+            for variant in self.record.variants:
+                fixed = [(index, byte) for index, byte in enumerate(variant.insn.bytes)
+                         if index not in variant.mutable_offsets]
+                condition = " && ".join(f"rd8(cpu.cs, {_ip(self.off + index)}) == 0x{byte:02x}u"
+                                        for index, byte in fixed)
+                code.append(f"if ({condition}) {{")
+                emitted = _InstructionEmitter(variant, (self.off + at for at in self.relocations), self.targets).emit()
+                code.extend("    " + line for line in emitted)
+                code.append("}")
+            return code + self.fault("unsupported bytes in source-proved instruction variant")
         try:
             statements, terminal = self.semantics()
         except UnsupportedInstruction as exc:

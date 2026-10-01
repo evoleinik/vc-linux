@@ -212,10 +212,16 @@ def _metadata(text: str) -> tuple[dict[str, Segment], dict[str, Label], dict[str
     return segments, labels, constants
 
 
-def parse_listing(path: str | Path, *, linked: bool = False) -> Listing:
+def parse_listing(path: str | Path, *, linked: bool = False, flat: bool = False) -> Listing:
     path = Path(path)
     text = path.read_text(encoding="utf-8", errors="replace")
     segments, labels, constants = _metadata(text)
+    if flat:
+        # A flat COM may put executable source in WORK/BASE/INIT as well as
+        # CODE. Treat the whole address space as eligible, but still take
+        # instruction starts exclusively from active source listing rows.
+        for segment in segments.values():
+            segment.is_code = True
     external_segments = {}
     if linked:
         # GW-BASIC's historical segment class is CODESG, not MASM's newer
@@ -257,6 +263,11 @@ def parse_listing(path: str | Path, *, linked: bool = False) -> Listing:
             continue
         address = re.match(r"^([0-9A-F]{4,8}) ", raw)
         offset = int(address[1], 16) if address else None
+        if flat and mnemonic in ("SEGMENT", "ENDS") and offset is None:
+            # -Sa also prints inactive IFDEF branches. Their declarations
+            # have no listing address and must not change the active segment.
+            rows.append(ListingLine(lineno, None, None, (), 0, source))
+            continue
         byte_values, fixups = (), ()
         if address:
             field = raw[address.end():28].strip()
@@ -309,7 +320,8 @@ def parse_listing(path: str | Path, *, linked: bool = False) -> Listing:
             used_regs = tuple(uses[1].split()) if uses else ()
             procedures[label] = Procedure(label, segment, offset, far="FAR" in operands.upper(), uses=used_regs)
             active_procs[segment] = proc = label
-        if label and segment and mnemonic not in {"EQU", "=", "SEGMENT", "ENDS"}:
+        if (label and segment and mnemonic not in {"EQU", "=", "SEGMENT", "ENDS"}
+                and not (flat and mnemonic == "ENDP")):
             if offset is not None:
                 key = f"{proc}::{label}" if label.startswith("@@") and proc else label
                 labels[key] = Label(label, segment, offset, proc)

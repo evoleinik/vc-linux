@@ -1,0 +1,3 @@
+STRING.ASM(134) : Error A2209: Syntax error: dd
+ GDATA(1)[vz.inc]: Macro called from
+  STRING.ASM(134): Main line code

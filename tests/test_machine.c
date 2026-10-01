@@ -436,24 +436,25 @@ static void cga_color_port(void) {
     CHECK(bios_cga_color(3) == 15);
 }
 
+enum { CATALOG_IMAGES = 6 };
 static unsigned catalog_calls;
 static int catalog_run(uint32_t off, uint16_t loadseg) {
     if (off) return -1;
-    CHECK(loadseg == 0x2000 + (catalog_calls % 5) * 0x100);
-    CHECK(mem[lin(loadseg, 0)] == 0x90 + catalog_calls % 5);
-    if (++catalog_calls == 10) rt_exited = 1;
-    else cpu.cs = (uint16_t)(0x2000 + (catalog_calls % 5) * 0x100);
+    CHECK(loadseg == 0x2000 + (catalog_calls % CATALOG_IMAGES) * 0x100);
+    CHECK(mem[lin(loadseg, 0)] == 0x90 + catalog_calls % CATALOG_IMAGES);
+    if (++catalog_calls == 2 * CATALOG_IMAGES) rt_exited = 1;
+    else cpu.cs = (uint16_t)(0x2000 + (catalog_calls % CATALOG_IMAGES) * 0x100);
     return 0;
 }
 
-static void five_program_catalog(void) {
-    /* VC, its overlay, BASIC, Logo and Rogue must coexist even after their
+static void six_program_catalog(void) {
+    /* VC, its overlay, BASIC, Logo, Rogue and VZ must coexist even after their
      * child sessions return. Revisit each entry to check none was evicted. */
-    static const uint8_t bytes[5][8] = {{0x90}, {0x91}, {0x92}, {0x93}, {0x94}};
-    Image images[5];
+    static const uint8_t bytes[CATALOG_IMAGES][8] = {{0x90}, {0x91}, {0x92}, {0x93}, {0x94}, {0x95}};
+    Image images[CATALOG_IMAGES];
     memset(&cpu, 0, sizeof cpu);
     memset(images, 0, sizeof images);
-    for (unsigned i = 0; i < 5; ++i) {
+    for (unsigned i = 0; i < CATALOG_IMAGES; ++i) {
         images[i].name = "CATALOG.EXE";
         images[i].bytes = bytes[i];
         images[i].size = sizeof bytes[i];
@@ -466,7 +467,7 @@ static void five_program_catalog(void) {
     cpu.ss = 0x8000;
     cpu.sp = 0xf000;
     rt_run();
-    CHECK(catalog_calls == 10);
+    CHECK(catalog_calls == 2 * CATALOG_IMAGES);
 }
 
 static uint16_t resumed_loadseg;
@@ -540,6 +541,26 @@ static void same_image_forced_return(void) { same_image_return(1, 0); }
 static void same_image_changed_parent_refused(void) { same_image_return(0, 1); }
 static void same_image_forced_changed_parent_refused(void) { same_image_return(1, 1); }
 
+static void all_shipped_images(void) {
+    static const uint8_t code[] = {0x90};
+    static const Image programs[] = {
+        {.name = "VC.COM", .bytes = code, .size = sizeof code},
+        {.name = "VC.OVL", .bytes = code, .size = sizeof code},
+        {.name = "GWBASIC.EXE", .bytes = code, .size = sizeof code},
+        {.name = "BOOTLOGO.COM", .bytes = code, .size = sizeof code},
+        {.name = "ROGUE.EXE", .bytes = code, .size = sizeof code},
+        {.name = "VZ.COM", .bytes = code, .size = sizeof code},
+    };
+    /* The browser smoke launches every bundled program in one VC session.
+     * Exited images remain registered for their possible relocated code. */
+    for (unsigned pass = 0; pass < 2; ++pass)
+        for (unsigned i = 0; i < sizeof programs / sizeof programs[0]; ++i) {
+            uint16_t segment = (uint16_t)(0x2000 + i * 0x100);
+            memcpy(mem + lin(segment, 0), code, sizeof code);
+            rt_register_image(&programs[i], segment);
+        }
+}
+
 static int run_test(const char *name, Test test, int expected_status) {
     fflush(NULL);
     pid_t child = fork();
@@ -583,11 +604,12 @@ int main(void) {
     failed += run_test("copied listing-proved supplement", copied_image_supplement, 0);
     failed += run_test("changed supplement bytes refused", changed_supplement_refused, 70);
     failed += run_test("supplement scoped to its image", wrong_image_supplement_refused, 70);
-    failed += run_test("all five translated programs remain callable", five_program_catalog, 0);
+    failed += run_test("all six translated programs remain callable", six_program_catalog, 0);
     failed += run_test("same-image EXEC restores parent registration", same_image_normal_return, 0);
     failed += run_test("same-image forced exit restores parent registration", same_image_forced_return, 0);
     failed += run_test("same-image return refuses changed parent bytes", same_image_changed_parent_refused, 70);
     failed += run_test("same-image forced return refuses changed parent bytes", same_image_forced_changed_parent_refused, 70);
-    printf("test_machine: 27 cases, %d failures\n", failed);
+    failed += run_test("every shipped image in one session", all_shipped_images, 0);
+    printf("test_machine: 28 cases, %d failures\n", failed);
     return failed ? 1 : 0;
 }

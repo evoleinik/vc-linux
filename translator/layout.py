@@ -39,6 +39,7 @@ class Instruction:
     return_skip: int = 0
     linked: bool = False
     mutable_offsets: tuple[int, ...] = ()
+    variants: tuple["Instruction", ...] = ()
 
 
 @dataclass

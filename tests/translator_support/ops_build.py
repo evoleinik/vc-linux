@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import hashlib
 import json
@@ -69,6 +69,7 @@ def load_cases() -> tuple[InstructionCase, ...]:
     from translator.supplement import build_gwbasic_graphics_layout
     from translator.compiled import build_compiled_layout
     from tools.build_gwbasic import modules
+    from tools.build_vz import modules as vz_modules
 
     # Stock listings omit assembler-generated prologue/epilogue boundaries.
     # Always ask make to check dependencies so direct pytest runs cannot test
@@ -78,7 +79,7 @@ def load_cases() -> tuple[InstructionCase, ...]:
     assert generated.returncode == 0, generated.stdout
     result = []
     seen = set()
-    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM", "ROGUE.EXE"):
+    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM", "ROGUE.EXE", "VZ.COM"):
         if name == "ROGUE.EXE":
             directory = ROOT / "build" / "rogue"
             loaded = load_image(directory / name)
@@ -94,16 +95,30 @@ def load_cases() -> tuple[InstructionCase, ...]:
             directory = ROOT / "build" / "bootlogo"
             loaded = load_image(directory / name)
             layout = build_nasm_layout(loaded, parse_nasm_listing(directory / "LOGO.lst"))
+        elif name == "VZ.COM":
+            directory = ROOT / "build" / "vz"
+            loaded = load_image(directory / name)
+            layout = build_linked_layout(loaded, [directory / (module + ".lst") for module in vz_modules()],
+                                         directory / "VZ.MAP")
         else:
             loaded = load_image(ROOT / "build" / name)
             layout = build_layout(loaded, parse_listing(ROOT / "build" / "gen" / f"{name}.lst"))
         relocations = tuple(loaded.relocations)
+        forms = []
         for record in layout.instructions:
+            if record.variants:
+                # Test both permitted byte templates through the production
+                # guarded dispatcher, not merely their inner semantics.
+                forms.extend(replace(variant, variants=record.variants) for variant in record.variants)
+            else:
+                forms.append(record)
+        for record in forms:
             raw = bytes(record.insn.bytes)
             local_relocations = tuple(at - record.off for at in relocations
                                       if record.off <= at < record.off + len(raw))
             # Preserve distinct relocation meanings even if bytes/offset match.
-            key = (raw, record.off, local_relocations, getattr(record, "mutable_offsets", ()))
+            key = (raw, record.off, local_relocations, getattr(record, "mutable_offsets", ()),
+                   tuple(bytes(variant.insn.bytes) for variant in record.variants))
             if key in seen:
                 continue
             seen.add(key)

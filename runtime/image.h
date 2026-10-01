@@ -36,6 +36,7 @@ extern const Image image_vc_ovl;
 extern const Image image_gwbasic;
 extern const Image image_bootlogo;
 extern const Image image_rogue;
+extern const Image image_vz;
 /* Additional source-listed indirect DRAW entries; the original generated
  * GW-BASIC Image and its bytes remain unchanged. */
 int run_gwbasic_graphics(uint32_t off, uint16_t loadseg);
