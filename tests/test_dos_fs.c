@@ -2948,6 +2948,376 @@ static void test_home_drive_initialization(void)
     check_drive_cwd(1, 8, "");
 }
 
+static void door_write(uint16_t handle, unsigned count, unsigned expected_error, const char *why)
+{
+    begin(0x4000); cpu.b.x = handle; cpu.c.x = (uint16_t)count; cpu.d.x = DATA;
+    if (expected_error) error(expected_error, why);
+    else if (ok(why)) CHECK(cpu.a.x == count, "%s: exact byte count", why);
+}
+
+static void test_door_filesystem(void)
+{
+    enum { LIMIT = 8 * 1024 * 1024, FCB = 0x4000 };
+    char root[PATH_MAX], path[PATH_MAX], outside[PATH_MAX], resolved[PATH_MAX];
+    struct stat st;
+    host_path(root, sizeof root, "door");
+    host_require(mkdir(root, 0700) == 0, "private door root");
+    host_file("door/seed.txt", "seed", 0600);
+    host_path(path, sizeof path, "door/sub");
+    host_require(mkdir(path, 0700) == 0, "door nested directory");
+    host_file("door/sub/child.txt", "child", 0600);
+    CHECK(dos_fs_init_door(root, LIMIT) == 0, "initialize H-only door filesystem");
+    check_current_drive(7, "door starts on H regardless of host cwd or HOME");
+    check_drive_cwd(0, 0, "");
+    check_drive_cwd(1, 8, "");
+    check_host_resolution("H:\\..\\..\\seed.txt", strcat(strcpy(path, root), "/seed.txt"));
+    check_host_resolution("/seed.txt", path);
+    check_host_resolution("H:\\sub\\..\\..\\seed.txt", path);
+    check_host_resolution("H:\\", root);
+    for (unsigned drive = 0; drive < 26; ++drive) {
+        if (drive == 7) continue;
+        begin(0x0e00); cpu.d.l = (uint8_t)drive; error(15, "door rejects every other drive");
+        check_current_drive(7, "failed drive selection retains H");
+    }
+    const char *forbidden[] = {"C:\\", "C:\\etc\\passwd", "Z:\\NEW.TXT", "H:\\C:\\etc"};
+    for (unsigned i = 0; i < sizeof forbidden / sizeof forbidden[0]; ++i) {
+        putstr(DS, ARG, forbidden[i]);
+        CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) < 0,
+              "door public resolution rejects %s", forbidden[i]);
+    }
+    path_begin(0x3d00, "C:\\etc\\passwd"); error(15, "door refuses C handle open");
+    path_begin(0x7139, "C:\\new"); error(15, "door refuses C mkdir");
+    begin(0x4700); cpu.d.l = 3; error(15, "door refuses C current directory");
+    begin(0x3600); cpu.d.l = 3; sentinel(0xffff, 0xffff, "door C disk query is absent");
+    path_begin(0x7303, "C:\\"); cpu.c.x = 44; error(15, "door C extended disk query is absent");
+    fcb_name(FCB, "C:SEED.TXT", 0, 0xff);
+
+    /* Absolute, relative and alias lookups all refuse symlinks, including
+     * a symlinked parent and a missing leaf below it. Metadata is protected too. */
+    host_path(outside, sizeof outside, "plain.txt");
+    host_path(path, sizeof path, "door/link.txt");
+    host_require(symlink(outside, path) == 0, "door outside file symlink");
+    host_path(path, sizeof path, "door/outdir");
+    host_require(symlink(fixture, path) == 0, "door outside directory symlink");
+    host_path(path, sizeof path, "door/hard.txt");
+    host_require(link(outside, path) == 0, "door outside hardlink");
+    host_path(path, sizeof path, "door/pipe");
+    host_require(mkfifo(path, 0600) == 0, "door FIFO");
+    const char *escapes[] = {"H:\\link.txt", "H:\\LINK.TXT", "H:\\outdir\\plain.txt",
+                             "H:\\outdir\\new.txt", "H:\\hard.txt", "H:\\pipe"};
+    for (unsigned i = 0; i < sizeof escapes / sizeof escapes[0]; ++i) {
+        path_begin(0x3d00, escapes[i]); error(5, "door refuses link/special-file open");
+        path_begin(0x3c00, escapes[i]); error(5, "door refuses link/special-file create");
+        path_begin(0x4300, escapes[i]); error(5, "door refuses escaped metadata");
+        putstr(DS, ARG, escapes[i]);
+        CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) < 0 && errno == EACCES,
+              "door public resolver rejects unsafe path %s", escapes[i]);
+    }
+    path_begin(0x3b00, "H:\\outdir"); error(5, "door refuses symlink chdir");
+    path_begin(0x7139, "H:\\outdir\\newdir"); error(5, "door refuses symlink parent mkdir");
+    path_begin(0x4301, "H:\\link.txt"); cpu.c.x = A_RO; error(5, "door refuses outside chmod");
+    uint16_t seed = open_file("H:\\seed.txt", 2);
+    read_equals(seed, "seed", "door seed remains available");
+    close_file(seed);
+    /* Executable matching reopens a resolved host spelling. Replacing its
+     * final component after DOS resolution must not make that open follow
+     * a host symlink outside H:. */
+    char kept[PATH_MAX];
+    host_path(path, sizeof path, "door/seed.txt");
+    host_path(kept, sizeof kept, "door/seed.old");
+    putstr(DS, ARG, "H:\\seed.txt");
+    CHECK(dos_fs_to_host(DS, ARG, resolved, sizeof resolved) == 0, "resolve executable lookup spelling");
+    host_require(rename(path, kept) == 0 && symlink(outside, path) == 0, "replace resolved leaf by outside symlink");
+    CHECK(dos_fs_open_readonly(resolved) < 0 && errno == EACCES,
+          "actual executable open refuses a symlink introduced after resolution");
+    host_require(unlink(path) == 0 && rename(kept, path) == 0, "restore private resolved leaf");
+    CHECK(dos_fs_open_readonly(outside) < 0 && errno == EACCES, "executable open refuses arbitrary host paths");
+    int fd = dos_fs_open_readonly(path);
+    char bytes[4];
+    CHECK(fd >= 0 && read(fd, bytes, sizeof bytes) == 4 && !memcmp(bytes, "seed", 4),
+          "executable open can read the confined seed");
+    if (fd >= 0) close(fd);
+
+    path_begin(0x3c00, "H:\\REMOVE.TMP");
+    seed = ok("create runtime temporary file") ? cpu.a.x : 0xffff;
+    wr8(DS, DATA, 'x'); door_write(seed, 1, 0, "temporary bytes enter quota");
+    close_file(seed);
+    path_begin(0x4301, "H:\\REMOVE.TMP"); cpu.c.x = A_RO; ok("make temporary read-only");
+    Cpu saved_cpu = cpu;
+    CHECK(dos_fs_remove_temporary("H:\\REMOVE.TMP") == 0, "owned cleanup removes read-only temporary file");
+    CHECK(!memcmp(&cpu, &saved_cpu, sizeof cpu), "owned cleanup preserves all DOS registers and flags");
+    CHECK(dos_fs_remove_temporary("H:\\") == 5, "owned cleanup cannot remove H root");
+    CHECK(dos_fs_remove_temporary("H:\\link.txt") == 5, "owned cleanup refuses symlink escape");
+    CHECK(dos_fs_remove_temporary("C:\\tmp") == 15, "owned cleanup cannot access C");
+    host_require(chdir(home_root) == 0, "change host cwd after door initialization");
+    check_host_resolution("seed.txt", strcat(strcpy(path, root), "/seed.txt"));
+    host_require(chdir(fixture) == 0, "restore fixture host cwd");
+
+    /* The exact cap counts each file's logical size rounded up to whole
+     * pages, as tmpfs allocates it: the two small seeds take one page each.
+     * Sparse seeks do not let either DOS handle or FCB writes avoid it. */
+    long system_page = sysconf(_SC_PAGESIZE);
+    const uint32_t PAGE = system_page > 4096 ? (uint32_t)system_page : 4096;
+    const uint32_t ALLOWED = LIMIT - 2 * PAGE;
+    begin(0x3600); cpu.d.l = 8;
+    if (ok("door free space")) {
+        CHECK((uint64_t)cpu.a.x * cpu.c.x * cpu.d.x == LIMIT, "door reports its 8 MiB capacity");
+        CHECK((uint64_t)cpu.a.x * cpu.c.x * cpu.b.x == ALLOWED,
+              "door free space charges each nested seed a whole page");
+    }
+    path_begin(0x3c00, "H:\\LARGE.BIN");
+    uint16_t big = ok("create door quota fixture") ? cpu.a.x : 0xffff;
+    CHECK(seek_file(big, 0, ALLOWED - 1) == ALLOWED - 1, "seek to final allowed byte");
+    wr8(DS, DATA, '!');
+    door_write(big, 1, 0, "write reaches exact door quota");
+    door_write(big, 1, 39, "write beyond door quota returns DOS disk full");
+    CHECK(host_stat("door/LARGE.BIN", &st) == 0 && st.st_size == ALLOWED,
+          "failed quota write leaves exact allowed size");
+    begin(0x5900); ok("door quota extended error");
+    CHECK(cpu.a.x == 39, "door keeps DOS disk-full extended error");
+    begin(0x3600); cpu.d.l = 8;
+    if (ok("full door free space")) CHECK(cpu.b.x == 0, "full H has zero free clusters");
+    path_begin(0x7303, "H:\\"); cpu.c.x = 44;
+    if (ok("full door extended space")) {
+        CHECK(get32(ES, OUT + 12) == 0, "full H extended query has zero free clusters");
+        CHECK((uint64_t)get32(ES, OUT + 16) * get32(ES, OUT + 4) * get32(ES, OUT + 8) == LIMIT,
+              "extended H query hides host capacity");
+    }
+    CHECK(seek_file(big, 0, LIMIT + 1) == LIMIT + 1, "a seek itself allocates no bytes");
+    door_write(big, 0, 39, "zero-length DOS write cannot extend past quota");
+    seed = open_file("H:\\seed.txt", 2);
+    putstr(DS, DATA, "SEED"); door_write(seed, 4, 0, "overwriting existing bytes at quota remains allowed");
+    close_file(seed);
+    fcb_name(FCB, "H:FCB.DAT", 0, 0);
+    fcb_op(0x16, FCB, 0, 0);
+    set_dta(DATA);
+    fcb_random(FCB, 0); fcb_op(0x22, FCB, 0, 1);
+    CHECK(get32(DS, FCB + 16) == 0, "FCB disk-full write keeps size zero");
+    fcb_random(FCB, LIMIT / 128 + 1); fcb_op(0x28, FCB, 0, 1);
+    CHECK(get32(DS, FCB + 16) == 0, "FCB zero-count truncate cannot bypass cap");
+    seek_file(big, 0, ALLOWED - PAGE);
+    door_write(big, 0, 0, "truncating a whole page frees quota");
+    fcb_random(FCB, 0); fcb_op(0x22, FCB, 0, 0);
+    CHECK(get32(DS, FCB + 16) == 128, "FCB can consume the page freed by handle truncation");
+    fcb_random(FCB, PAGE / 128 - 1); fcb_op(0x22, FCB, 0, 0);
+    CHECK(get32(DS, FCB + 16) == PAGE, "FCB fills the rest of its own page without new quota");
+    fcb_random(FCB, PAGE / 128); fcb_op(0x22, FCB, 0, 1);
+    CHECK(get32(DS, FCB + 16) == PAGE, "FCB record on a second page is disk full");
+    fcb_random(FCB, 0); fcb_op(0x28, FCB, 0, 0);
+    CHECK(get32(DS, FCB + 16) == 0, "FCB truncation frees its own bytes");
+    seek_file(big, 0, ALLOWED - 1); door_write(big, 1, 0, "handle reuses quota freed by FCB");
+    fcb_op(0x10, FCB, 0, 0);
+    fcb_op(0x13, FCB, 0, 0);
+
+    /* Deleted-but-open files keep their allocation until the final descriptor
+     * (including a path lease) is released. Duplicates must not double-free it. */
+    DosPathLease *lease = NULL;
+    host_path(path, sizeof path, "door/LARGE.BIN");
+    CHECK(dos_fs_pin_path("H:\\LARGE.BIN", path, &lease) == 0, "door quota pins a file");
+    begin(0x4500); cpu.b.x = big;
+    uint16_t duplicate = ok("duplicate door handle") ? cpu.a.x : 0xffff;
+    path_begin(0x4100, "H:\\LARGE.BIN"); ok("unlink open door file");
+    path_begin(0x3c00, "H:\\NEXT.DAT");
+    uint16_t next = ok("create zero-byte file on full door") ? cpu.a.x : 0xffff;
+    door_write(next, 1, 39, "unlinked open bytes still count towards quota");
+    close_file(big); close_file(duplicate);
+    door_write(next, 1, 39, "lease alone retains deleted file allocation");
+    dos_fs_release_path(lease);
+    door_write(next, 1, 0, "last descriptor release frees unlinked allocation");
+    close_file(next);
+
+    /* Reinitialization rejects over-cap seed content and never re-exposes C
+     * on error. Ordinary initialization then restores the old mappings. */
+    CHECK(dos_fs_init_door(root, 1) == 39, "oversized initial tree returns disk full");
+    path_begin(0x3d00, "C:\\etc\\passwd"); error(15, "failed door init keeps C absent");
+    path_begin(0x3d00, "H:\\seed.txt"); error(15, "failed door init keeps H absent");
+    CHECK(dos_fs_init_door("/", LIMIT) == 5, "door cannot map filesystem root");
+    dos_fs_init();
+    check_current_drive(2, "normal reinitialization restores original current drive");
+    check_host_resolution("C:\\", "/");
+    seed = open_file("link.txt", 0);
+    read_equals(seed, "plain-data", "normal mode still follows ordinary host symlinks");
+    close_file(seed);
+}
+
+static void door_entry_full(const char *name, const char *why)
+{
+    path_begin(0x3c00, name);
+    if (!error(39, why) && !cpu.cf) close_file(cpu.a.x);
+}
+
+static void test_door_entry_quota(void)
+{
+    enum { LIMIT = 4096, GROUPS = 64, INITIAL = 3, BYTE_LIMIT = 8 * 1024 * 1024 };
+    char root[PATH_MAX], path[PATH_MAX], dos[80];
+    host_path(root, sizeof root, "door-entries");
+    host_require(mkdir(root, 0700) == 0, "entry quota root");
+    host_path(path, sizeof path, "door-entries/SEED");
+    host_require(mkdir(path, 0700) == 0, "entry quota seeded directory");
+    host_file("door-entries/SEED/ONE.DAT", "", 0600);
+    host_file("door-entries/SEED.TXT", "", 0600);
+    CHECK(dos_fs_init_door(root, BYTE_LIMIT) == 0, "initialize entry quota including nested seeds");
+
+    /* Keep each directory small so this 4096-entry boundary test exercises
+     * the public DOS calls without quadratic alias scans in one directory. */
+    for (unsigned i = 0; i < GROUPS; ++i) {
+        snprintf(dos, sizeof dos, "H:\\P%02u", i);
+        path_begin(0x3900, dos);
+        if (!ok("entry quota parent mkdir")) goto done;
+    }
+    for (unsigned i = 0; i < LIMIT - GROUPS - INITIAL; ++i) {
+        snprintf(dos, sizeof dos, "H:\\P%02u\\%c%02u", i / GROUPS, i % 2 ? 'F' : 'D', i % GROUPS);
+        path_begin(i % 2 ? 0x3c00 : 0x7139, dos);
+        if (!ok(i % 2 ? "zero-byte create consumes one entry" : "LFN mkdir consumes one entry")) goto done;
+        if (i % 2) close_file(cpu.a.x);
+    }
+    door_entry_full("H:\\FULL.DAT", "4097th entry returns DOS disk full, including seeded entries");
+    path_begin(0x3900, "H:\\FULLDIR"); error(39, "classic mkdir past entry limit returns disk full");
+    path_begin(0x7139, "H:\\FULLLFN"); error(39, "LFN mkdir past entry limit returns disk full");
+    path_begin(0x5b00, "H:\\NEWONLY");
+    if (!error(39, "create-new past entry limit returns disk full") && !cpu.cf) close_file(cpu.a.x);
+    path_begin(0x716c, "H:\\LONGNEW"); cpu.b.x = 2; cpu.d.x = 0x10;
+    if (!error(39, "extended create past entry limit returns disk full") && !cpu.cf) close_file(cpu.a.x);
+    path_begin(0x5a00, "H:\\");
+    if (!error(39, "temporary create past entry limit returns disk full") && !cpu.cf) close_file(cpu.a.x);
+    fcb_name(0x4000, "H:FCBFULL.DAT", 0, 0);
+    fcb_op(0x16, 0x4000, 0, 0xff);
+
+    /* Reopening/truncating an existing entry consumes no inode. Failed
+     * creates, mkdirs and renames cannot silently free one either. */
+    path_begin(0x3c00, "H:\\SEED.TXT");
+    if (ok("truncate existing file at entry cap")) close_file(cpu.a.x);
+    path_begin(0x3900, "H:\\SEED"); error(5, "mkdir existing directory at cap preserves existing error");
+    path_begin(0x5b00, "H:\\SEED.TXT"); error(80, "create-new existing file at cap preserves existing error");
+    path_begin(0x5600, "H:\\P00\\D00"); putstr(ES, OUT, "H:\\P00\\RENAMED");
+    ok("directory rename at cap consumes no entry");
+    path_begin(0x5600, "H:\\P00\\D02"); putstr(ES, OUT, "H:\\P00\\RENAMED");
+    error(80, "failed rename at cap preserves entry count");
+    door_entry_full("H:\\STILLFUL", "existing opens and failed mutations leave quota full");
+
+    DosPathLease *backup_lease = NULL;
+    host_path(path, sizeof path, "door-entries/SEED.TXT");
+    CHECK(dos_fs_pin_path("H:\\SEED.TXT", path, &backup_lease) == 0, "pin quota-limited editor pathname");
+    dos_fs_bind_path(backup_lease, 0);
+    path_begin(0x5600, "H:\\SEED.TXT"); putstr(ES, OUT, "H:\\BACKUP");
+    ok("owner backup rename at full entry cap");
+    door_entry_full("H:\\SEED.TXT", "leased recreation preserves DOS disk-full error");
+    path_begin(0x5600, "H:\\BACKUP"); putstr(ES, OUT, "H:\\SEED.TXT");
+    ok("restore owner backup without consuming an entry");
+    dos_fs_release_path(backup_lease);
+
+    path_begin(0x3a00, "H:\\P00\\RENAMED"); ok("rmdir releases one entry");
+    path_begin(0x3c00, "H:\\REUSED");
+    if (ok("file create reuses removed directory entry")) close_file(cpu.a.x);
+    door_entry_full("H:\\TOOMANY", "reclaimed directory entry is charged exactly once");
+    path_begin(0x4100, "H:\\REUSED"); ok("closed file deletion releases one entry");
+    path_begin(0x3900, "H:\\REUSEDIR"); ok("mkdir reuses removed file entry");
+    door_entry_full("H:\\TOOMUCH", "reclaimed file entry is charged exactly once");
+    CHECK(dos_fs_remove_temporary("H:\\REUSEDIR") == 0, "owned directory cleanup releases its entry");
+    path_begin(0x3c00, "H:\\OWNED");
+    if (ok("create reuses runtime-owned directory entry")) close_file(cpu.a.x);
+    CHECK(dos_fs_remove_temporary("H:\\OWNED") == 0, "owned file cleanup releases its entry");
+    path_begin(0x3900, "H:\\OWNEDDIR"); ok("mkdir reuses runtime-owned file entry");
+
+    uint16_t held = open_file("H:\\SEED\\ONE.DAT", 2);
+    begin(0x4500); cpu.b.x = held;
+    uint16_t duplicate = ok("duplicate zero-byte quota inode") ? cpu.a.x : 0xffff;
+    DosPathLease *lease = NULL;
+    host_path(path, sizeof path, "door-entries/SEED/ONE.DAT");
+    CHECK(dos_fs_pin_path("H:\\SEED\\ONE.DAT", path, &lease) == 0, "pin zero-byte quota inode");
+    path_begin(0x4100, "H:\\SEED\\ONE.DAT"); ok("unlink held zero-byte inode");
+    door_entry_full("H:\\UNLINKED", "unlinked open inode still consumes an entry");
+    close_file(held);
+    door_entry_full("H:\\DUPHELD", "duplicate handle keeps unlinked inode charged");
+    close_file(duplicate);
+    door_entry_full("H:\\LEASED", "path lease alone keeps unlinked inode charged");
+    dos_fs_release_path(lease);
+    path_begin(0x3c00, "H:\\FINAL");
+    if (ok("final inode release frees exactly one entry")) close_file(cpu.a.x);
+    door_entry_full("H:\\NOEXTRA", "duplicate and lease releases do not double-free entry quota");
+
+    lease = NULL;
+    host_path(path, sizeof path, "door-entries/SEED");
+    CHECK(dos_fs_pin_path("H:\\SEED", path, &lease) == 0, "pin empty directory inode");
+    path_begin(0x3a00, "H:\\SEED"); ok("remove directory whose inode has a path lease");
+    door_entry_full("H:\\DIRHELD", "unlinked directory lease retains its inode charge");
+    dos_fs_release_path(lease);
+    path_begin(0x3900, "H:\\SEED"); ok("released directory lease frees one entry");
+    held = open_file("H:\\FINAL", 2);
+    wr8(DS, DATA, 'x');
+    door_write(held, 1, 0, "directory inode release never subtracts uncharged directory bytes");
+    close_file(held);
+
+    path_begin(0x3b00, "H:\\P00"); ok("select FCB deletion quota directory");
+    fcb_name(0x4000, "F01", 0, 0); fcb_op(0x13, 0x4000, 0, 0);
+    path_begin(0x3b00, "H:\\"); ok("restore H root after FCB deletion");
+    path_begin(0x3900, "H:\\FCBREUSE"); ok("FCB deletion releases one entry");
+    door_entry_full("H:\\FCBLIMIT", "FCB-reclaimed entry cannot be allocated twice");
+
+    /* A full seeded tree must also be counted after reinitialization. Its
+     * extra host-created entry simulates an oversized build-time demo. */
+    CHECK(dos_fs_init_door(root, BYTE_LIMIT) == 0, "exactly full seeded tree initializes");
+    host_file("door-entries/OVERSEED", "", 0600);
+    CHECK(dos_fs_init_door(root, BYTE_LIMIT) == 39, "4097-entry seeded tree is rejected as disk full");
+    path_begin(0x3d00, "C:\\etc\\passwd"); error(15, "entry scan failure keeps C absent");
+    path_begin(0x3d00, "H:\\SEED.TXT"); error(15, "entry scan failure keeps H absent");
+done:
+    dos_fs_init();
+}
+
+static uint64_t page_allocation;
+
+static int count_allocation(const char *path, const struct stat *st, int type, struct FTW *walk)
+{
+    (void)path; (void)walk;
+    if (type == FTW_F && S_ISREG(st->st_mode)) page_allocation += (uint64_t)st->st_blocks * 512;
+    return 0;
+}
+
+/* tmpfs gives every non-empty file at least one whole page. 4096 one-byte
+ * files would be 4 KiB of quota but 16 MiB of real memory, so the quota must
+ * count pages: disk full has to come well before 8 MiB is really in use. */
+static void test_door_tiny_files_page_quota(void)
+{
+    enum { LIMIT = 8 * 1024 * 1024, GROUPS = 64, PER_GROUP = 63 };
+    long system_page = sysconf(_SC_PAGESIZE);
+    const uint64_t page = system_page > 4096 ? (uint64_t)system_page : 4096;
+    char root[PATH_MAX], dos[80];
+    host_path(root, sizeof root, "door-pages");
+    host_require(mkdir(root, 0700) == 0, "page quota root");
+    CHECK(dos_fs_init_door(root, LIMIT) == 0, "initialize page quota door");
+    unsigned written = 0, full = 0;
+    for (unsigned group = 0; group < GROUPS && !full; ++group) {
+        snprintf(dos, sizeof dos, "H:\P%02u", group);
+        path_begin(0x3900, dos);
+        if (!ok("page quota group mkdir")) goto done;
+        for (unsigned i = 0; i < PER_GROUP; ++i) {
+            snprintf(dos, sizeof dos, "H:\P%02u\T%02u", group, i);
+            path_begin(0x3c00, dos);
+            if (!ok("tiny file create")) goto done;
+            uint16_t handle = cpu.a.x;
+            wr8(DS, DATA, 'x');
+            begin(0x4000); cpu.b.x = handle; cpu.c.x = 1; cpu.d.x = DATA;
+            int handled = dos_fs_int21();
+            int refused = handled && cpu.cf && cpu.a.x == 39;
+            CHECK(handled && (refused || (!cpu.cf && cpu.a.x == 1)),
+                  "one-byte write either succeeds or is DOS disk full");
+            close_file(handle);
+            if (refused) { full = 1; break; }
+            ++written;
+        }
+    }
+    CHECK(full, "4096 one-byte files reach DOS disk full");
+    CHECK(written == LIMIT / page, "exactly %llu one-byte files fit, got %u",
+          (unsigned long long)(LIMIT / page), written);
+    page_allocation = 0;
+    host_require(nftw(root, count_allocation, 16, FTW_PHYS) == 0, "measure page allocation");
+    CHECK(page_allocation <= LIMIT, "files really allocate %llu bytes, at most 8 MiB",
+          (unsigned long long)page_allocation);
+done:
+    dos_fs_init();
+}
+
 static int remove_fixture_entry(const char *path, const struct stat *st, int type, struct FTW *walk)
 {
     (void)st; (void)walk;
@@ -3028,6 +3398,9 @@ int main(void)
     test_home_drive_cwd_rebases();
     test_home_drive_queries();
     test_home_drive_initialization();
+    test_door_filesystem();
+    test_door_entry_quota();
+    test_door_tiny_files_page_quota();
     test_function_coverage();
     /* Reinitialization also exercises releasing live classic-search state. */
     dos_fs_init();

@@ -4,11 +4,40 @@
 
 #include <stdint.h>
 
+#define DOS_DOOR_ENTRY_LIMIT 4096u
+
 /* dos_fs_init() maps C: to / and, when HOME is an absolute directory other
  * than /, H: to realpath(HOME). Each drive has its own cwd; startup selects
  * H: only when the host cwd is at or below its root. DOS chdir does not
  * select a drive or change the host cwd. H: parents stop at its root;
  * symlinks retain normal host-filesystem behavior. */
+
+/* Reset the filesystem for a door session. Only H: exists, rooted at the
+ * supplied private directory; DOS cannot traverse symlinks or open special
+ * files. quota bounds the total logical bytes of files, including sparse
+ * extents and files still held open after deletion. At most 4096 entries may
+ * be allocated, including seeded directories/files and unlinked inodes held
+ * by DOS handles or path leases. Returns a DOS error code, or zero. A failure
+ * leaves no drive accessible. dos_fs_init() restores the
+ * ordinary mappings. Populate root before calling this function. */
+int dos_fs_init_door(const char *root, uint64_t quota);
+
+/* Open a resolved absolute host spelling for executable-byte matching.
+ * In door mode the actual open is anchored beneath H:, with no symlinks.
+ * Returns a read-only CLOEXEC descriptor, or -1 with errno set. */
+int dos_fs_open_readonly(const char *absolute_host);
+
+/* Door-only cleanup of an exact runtime-owned temporary file or empty
+ * directory, using an absolute DOS path. Ignore the guest read-only bit but
+ * retain confinement and quota accounting. Close any orphaned DOS handles to
+ * that owned file. Roots and symlinks are refused; no DOS registers or memory
+ * change. Returns a DOS error code. */
+int dos_fs_remove_temporary(const char *absolute_dos);
+
+/* Door-only creation of an exact runtime-owned private directory (mode 0700)
+ * from an absolute DOS path, charged as one entry like any DOS mkdir. Returns
+ * a DOS error code: 80 if the name exists, 39 if the session is full. */
+int dos_fs_make_temporary(const char *absolute_dos);
 
 /* Body of the runtime's far-callable F000:0100 country case-map stub.
  * Only AL changes, and only extended CP866 letters are uppercased. */

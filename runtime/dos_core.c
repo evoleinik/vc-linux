@@ -18,6 +18,7 @@
 
 #include "cp866.h"
 #include "dos_fs.h"
+#include "guest_mem.h"
 #include "hle.h"
 #include "rt.h"
 
@@ -37,6 +38,9 @@ static uint16_t cur_psp;
 static uint8_t alloc_strategy;
 static uint16_t last_retcode;
 static uint8_t break_flag;
+static int door_mode;
+
+void dos_core_set_door(int enabled) { door_mode = !!enabled; }
 
 typedef struct {
     uint16_t child;    /* PSP of the running child */
@@ -63,17 +67,25 @@ static void mcb_set(uint16_t m, uint8_t type, uint16_t owner, uint16_t size) {
 }
 static int mcb_ok(uint16_t m) { uint8_t t = mcb_type(m); return t == 'M' || t == 'Z'; }
 static uint16_t mcb_next(uint16_t m) { return (uint16_t)(m + 1 + mcb_size(m)); }
+/* Where a block ends, without 16-bit wrap. Past FFFFh the chain is broken. */
+static uint32_t mcb_end(uint16_t m) { return (uint32_t)m + 1 + mcb_size(m); }
 
-/* Merge runs of free blocks. Returns 0, or 7 if the chain is broken. */
+/* Merge runs of free blocks. Returns 0, or 7 if the chain is broken.
+ * A guest can forge any header. A block, or two blocks merged, that ends
+ * past FFFFh would wrap the 16-bit segment back into the chain: that is a
+ * broken chain, never a cycle the native walk follows forever. Each step
+ * moves m up or extends its end, so the walk is bounded, and a successful
+ * merge proves the chain from first_mcb() ascends to a 'Z' inside 64 KiB
+ * paragraphs. The later walks in mem_alloc and mem_resize rely on that. */
 static int mcb_merge(void) {
     uint16_t m = first_mcb();
     for (;;) {
-        if (!mcb_ok(m)) return 7;
+        if (!mcb_ok(m) || mcb_end(m) > 0xFFFF) return 7;
         if (mcb_type(m) == 'Z') return 0;
-        uint16_t n = mcb_next(m);
-        if (!mcb_ok(n)) return 7;
+        uint16_t n = (uint16_t)mcb_end(m);
+        if (!mcb_ok(n) || mcb_end(n) > 0xFFFF) return 7;
         if (mcb_owner(m) == 0 && mcb_owner(n) == 0) {
-            mcb_set(m, mcb_type(n), 0, (uint16_t)(mcb_size(m) + 1 + mcb_size(n)));
+            mcb_set(m, mcb_type(n), 0, (uint16_t)(mcb_end(n) - m - 1));
             continue;
         }
         m = n;
@@ -158,10 +170,10 @@ static int mem_resize(uint16_t seg, uint16_t paras, uint16_t *maxp) {
 
 static void mem_free_owned(uint16_t psp) {
     uint16_t m = first_mcb();
-    while (mcb_ok(m)) {
+    while (mcb_ok(m) && mcb_end(m) <= 0xFFFF) { /* forged wrap: see mcb_merge */
         if (mcb_owner(m) == psp) wr16(m, 1, 0);
         if (mcb_type(m) == 'Z') break;
-        m = mcb_next(m);
+        m = (uint16_t)mcb_end(m);
     }
     mcb_merge();
 }
@@ -223,31 +235,35 @@ static uint16_t make_env(const char *strings, size_t slen, const char *prog, uin
     uint16_t seg, largest;
     if (mem_alloc((uint16_t)((total + 15) / 16), owner, &seg, &largest)) return 0;
     uint32_t a = (uint32_t)seg << 4;
-    memcpy(&mem[a], strings, slen);
-    mem[a + slen] = 0;
-    mem[a + slen + 1] = 1;
-    mem[a + slen + 2] = 0;
-    memcpy(&mem[a + slen + 3], prog, plen);
+    static const uint8_t separator[3] = {0, 1, 0};
+    /* A forged MCB chain can place the block anywhere: check it whole. */
+    if (!guest_span(a, total) || guest_write(a, strings, slen) ||
+        guest_write(a + slen, separator, sizeof separator) ||
+        guest_write(a + slen + 3, prog, plen)) {
+        mem_free(seg);
+        return 0;
+    }
     return seg;
 }
 
 /* The strings part of an existing environment, up to and without the final NUL. */
 static size_t env_strings(uint16_t env, char *out, size_t cap) {
-    uint32_t a = (uint32_t)env << 4;
+    const uint8_t *s = guest_span((uint32_t)env << 4, 32768);
     size_t n = 0;
+    if (!s) return 0;
     while (n + 1 < cap && n < 32768) {
-        if (mem[a + n] == 0 && (n == 0 || mem[a + n - 1] == 0)) break;
-        out[n] = (char)mem[a + n];
+        if (s[n] == 0 && (n == 0 || s[n - 1] == 0)) break;
+        out[n] = (char)s[n];
         n++;
     }
     if (n == 0) return 0;
     return n; /* ends with the NUL of the last string */
 }
 
-static void build_psp(uint16_t psp, uint16_t end_seg, uint16_t env, uint16_t parent,
-                      uint16_t term_cs, uint16_t term_ip, const uint8_t *tail) {
+static int build_psp(uint16_t psp, uint16_t end_seg, uint16_t env, uint16_t parent,
+                     uint16_t term_cs, uint16_t term_ip, const uint8_t *tail) {
     uint32_t a = (uint32_t)psp << 4;
-    memset(&mem[a], 0, 256);
+    if (!guest_span(a, 256) || guest_fill(a, 0, 256)) return 8;
     wr8(psp, 0x00, 0xCD);
     wr8(psp, 0x01, 0x20);
     wr16(psp, 0x02, end_seg);
@@ -272,8 +288,9 @@ static void build_psp(uint16_t psp, uint16_t end_seg, uint16_t env, uint16_t par
     wr8(psp, 0x51, 0x21);
     wr8(psp, 0x52, 0xCB);
     for (int i = 0; i < 11; i++) { wr8(psp, (uint16_t)(0x5D + i), ' '); wr8(psp, (uint16_t)(0x6D + i), ' '); }
-    if (tail) memcpy(&mem[a + 0x80], tail, 128);
-    else wr8(psp, 0x81, 0x0D);
+    if (tail) return guest_write(a + 0x80, tail, 128) ? 8 : 0;
+    wr8(psp, 0x81, 0x0D);
+    return 0;
 }
 
 /* ---- loading a translated image -------------------------------------------- */
@@ -300,10 +317,21 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
     if (err == 8 && largest >= need) err = mem_alloc(largest, 0xFFFF, &psp, &largest);
     if (err) { mem_free(env); return err; }
     uint16_t block = mcb_size((uint16_t)(psp - 1));
+    uint16_t loadseg = (uint16_t)(psp + 0x10);
+    /* The caller can forge a free MCB just below 1 MiB + 64 KiB. Refuse an
+     * image whose segments would wrap, or that would end past guest memory,
+     * before writing anything. */
+    if ((uint32_t)psp + 0x10 + img_paras > 0x10000u ||
+        !guest_span((uint32_t)psp << 4, 0x100u + img->size)) {
+        mem_free(psp);
+        mem_free(env);
+        return 8;
+    }
     wr16((uint16_t)(psp - 1), 1, psp);
     wr16((uint16_t)(env - 1), 1, psp);
 
-    build_psp(psp, (uint16_t)(psp + block), env, parent ? parent : psp, term_cs, term_ip, tail);
+    err = build_psp(psp, (uint16_t)(psp + block), env, parent ? parent : psp, term_cs, term_ip, tail);
+    if (err) { mem_free(psp); mem_free(env); return err; }
     const char *base = strrchr(dos_prog, '\\');
     base = base ? base + 1 : dos_prog;
     for (int i = 0; i < 8; i++) {
@@ -312,15 +340,21 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
         wr8((uint16_t)(psp - 1), (uint16_t)(8 + i), (uint8_t)c);
     }
 
-    uint16_t loadseg = (uint16_t)(psp + 0x10);
-    memcpy(&mem[(uint32_t)loadseg << 4], img->bytes, img->size);
+    if (guest_write((uint32_t)loadseg << 4, img->bytes, img->size)) {
+        mem_free(psp);
+        mem_free(env);
+        return 8;
+    }
     if (img->is_exe)
         for (uint32_t i = 0; i < img->nrelocs; i++) {
-            uint32_t at = ((uint32_t)loadseg << 4) + img->relocs[i];
-            uint16_t v = (uint16_t)(mem[at] | mem[at + 1] << 8);
+            /* Trusted image data, but still checked against MEM_SIZE. */
+            uint8_t *at = img->relocs[i] + 2u <= img->size ?
+                guest_span(((uint32_t)loadseg << 4) + img->relocs[i], 2) : NULL;
+            if (!at) rt_fault("%s: relocation %u outside its image", img->name, (unsigned)i);
+            uint16_t v = (uint16_t)(at[0] | at[1] << 8);
             v = (uint16_t)(v + loadseg);
-            mem[at] = (uint8_t)v;
-            mem[at + 1] = (uint8_t)(v >> 8);
+            at[0] = (uint8_t)v;
+            at[1] = (uint8_t)(v >> 8);
         }
     rt_register_image(img, loadseg);
 
@@ -383,7 +417,7 @@ static int known_image(const char *host, const Image **out) {
     *out = NULL;
     /* An executable must be an ordinary file. Open nonblocking before the
      * type check so EXEC of a FIFO cannot hang while waiting for a writer. */
-    int fd = open(host, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    int fd = dos_fs_open_readonly(host);
     if (fd < 0) return file_error();
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); return 5; }
@@ -453,6 +487,14 @@ static int host_cwd(char *out, size_t cap) {
  * the script: they go in as positional arguments ($0, $1), which the shell
  * does not parse. */
 static int host_run(const char *script, const char *arg0, const char *arg1) {
+    /* This is the last shared boundary for COMSPEC, INT 2Eh, direct host
+     * commands, and editor launch. No door path may reach fork/exec. */
+    if (door_mode) {
+        static const char message[] = "Bad command or file name\r\n";
+        con_write((const uint8_t *)message, sizeof message - 1);
+        term_render();
+        return 127;
+    }
 #ifdef __EMSCRIPTEN__
     (void)script;
     (void)arg0;
@@ -548,8 +590,11 @@ static int internal_cd(const char *cmd) {
         if (strpbrk(word, ";&|<>`$(){}*?\"' \t")) return -1;
     }
     char path[2048];
-    const char *home = getenv("HOME");
-    if (!word[0]) snprintf(path, sizeof path, "%s", home ? home : "/");
+    const char *home = door_mode ? NULL : getenv("HOME");
+    if (door_mode && (!word[0] || (word[0] == '~' && (!word[1] || word[1] == '/'))))
+        snprintf(path, sizeof path, "H:\\%s", word[0] ? word + 1 : "");
+    else if (door_mode && word[0] == '/') snprintf(path, sizeof path, "H:%s", word);
+    else if (!word[0]) snprintf(path, sizeof path, "%s", home ? home : "/");
     else if (word[0] == '~' && (!word[1] || word[1] == '/'))
         snprintf(path, sizeof path, "%s%s", home ? home : "", word + 1);
     else snprintf(path, sizeof path, "%s", word);
@@ -590,6 +635,7 @@ static int internal_cd(const char *cmd) {
     if (failed) {
         static const char msg[] = "Invalid directory\r\n";
         con_write((const uint8_t *)msg, sizeof msg - 1);
+        if (door_mode) term_render();
     }
     rt_log("cd %s: %s", path, failed ? "failed" : "ok");
     return failed;
@@ -628,11 +674,11 @@ static int short_dos_path(const char *path, char out[128]) {
 static void environment_value(const char *name, char *out, size_t cap) {
     out[0] = 0;
     uint16_t env = rd16(cur_psp, 0x2C);
-    uint32_t start = (uint32_t)env << 4;
+    const uint8_t *block = guest_span((uint32_t)env << 4, 32768);
     size_t key = strlen(name);
-    if (!env || start + 32768 >= MEM_SIZE) return;
-    for (size_t at = 0; at < 32768 && mem[start + at];) {
-        const uint8_t *s = mem + start + at;
+    if (!env || !block) return;
+    for (size_t at = 0; at < 32768 && block[at];) {
+        const uint8_t *s = block + at;
         const uint8_t *end = memchr(s, 0, 32768 - at);
         if (!end) return;
         size_t n = (size_t)(end - s);
@@ -671,7 +717,8 @@ static int program_candidate(const char *path, char *host, size_t cap) {
 /* COMMAND.COM searches the current directory first, then each DOS PATH
  * entry, choosing .COM before .EXE within each directory. An explicit path
  * or drive never causes a search in an unrelated PATH directory. */
-static int find_program(const char *word, char *dos, size_t dcap, char *host, size_t hcap) {
+static int find_program_path(const char *word, const char *path,
+                             char *dos, size_t dcap, char *host, size_t hcap) {
     const char *base = word;
     int explicit_path = 0;
     for (const char *p = word; *p; p++)
@@ -679,8 +726,6 @@ static int find_program(const char *word, char *dos, size_t dcap, char *host, si
     const char *dot = strrchr(base, '.');
     if (dot && strcasecmp(dot, ".COM") && strcasecmp(dot, ".EXE")) return 0;
     const char *suffix[] = {dot ? "" : ".COM", dot ? NULL : ".EXE", NULL};
-    char path[2048];
-    environment_value("PATH", path, sizeof path);
     const char *entry = path;
     size_t dlen = 0;
     for (;;) {
@@ -699,6 +744,12 @@ static int find_program(const char *word, char *dos, size_t dcap, char *host, si
         dlen = strcspn(entry, ";");
         if (!dlen && !*entry) return 0;
     }
+}
+
+static int find_program(const char *word, char *dos, size_t dcap, char *host, size_t hcap) {
+    char path[2048];
+    environment_value("PATH", path, sizeof path);
+    return find_program_path(word, path, dos, dcap, host, hcap);
 }
 
 /* Shipped associations of the form "ext: program [literal args] !.!" are DOS-only. This
@@ -927,7 +978,7 @@ static int run_dos_command(const uint8_t *cmd, size_t len) {
         }
 #ifndef __EMSCRIPTEN__
         const char *editor = getenv("EDITOR");
-        if (editor && *editor) return host_run("exec $EDITOR \"$1\"", "vc-edit", host);
+        if (!door_mode && editor && *editor) return host_run("exec $EDITOR \"$1\"", "vc-edit", host);
 #endif
         return edit_in_vz(host);
     }
@@ -983,11 +1034,28 @@ static int vz_environment(char *env, size_t *length, size_t cap, Proc *p) {
         }
         at += n;
     }
-    strcpy(p->temp_dir, "/tmp/vXXXXXX"); /* Seven-character, native 8.3 basename. */
-    if (!mkdtemp(p->temp_dir)) { p->temp_dir[0] = 0; return 5; }
+    if (door_mode) {
+        /* Create it through H:'s accounting: it is one of the session's 4096
+         * entries, and a full session refuses the EXEC with disk full. */
+        static unsigned sequence;
+        int err = 80;
+        for (unsigned attempt = 0; attempt < 64 && err == 80; ++attempt) {
+            unsigned salt = (unsigned)time(NULL) ^ ((unsigned)getpid() << 8) ^ (++sequence * 2654435761u);
+            snprintf(p->temp_dir, sizeof p->temp_dir, "v%06x", salt & 0xffffffu);
+            char dos[32];
+            snprintf(dos, sizeof dos, "H:\\%s", p->temp_dir);
+            err = dos_fs_make_temporary(dos);
+        }
+        if (err) { p->temp_dir[0] = 0; return err == 39 ? 39 : 5; }
+    } else {
+        strcpy(p->temp_dir, "/tmp/vXXXXXX");
+        if (!mkdtemp(p->temp_dir)) { p->temp_dir[0] = 0; return 5; }
+    }
     const char *names[] = {"TMP", "TEMP"};
     for (unsigned i = 0; i < sizeof names / sizeof names[0]; ++i) {
-        int n = snprintf(env + used, cap - used, "%s=C:\\tmp\\%s", names[i], p->temp_dir + 5);
+        int n = snprintf(env + used, cap - used, "%s=%s%s", names[i],
+                         door_mode ? "H:\\" : "C:\\tmp\\",
+                         p->temp_dir + (door_mode ? 0 : 5));
         if (n < 0 || (size_t)n >= cap - used) return 8;
         used += (size_t)n + 1;
     }
@@ -1002,10 +1070,20 @@ static void remove_vz_temp(Proc *p) {
     const char *names[] = {"VZTEMP.$$$", "vztemp.$$$", "FILES.$$$", "files.$$$"};
     char path[64];
     for (unsigned i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        if (door_mode) {
+            snprintf(path, sizeof path, "H:\\%s\\%s", p->temp_dir, names[i]);
+            int err = dos_fs_remove_temporary(path);
+            if (err && err != 2) rt_log("cannot remove VZ swap %s: DOS error %d", path, err);
+            continue;
+        }
         snprintf(path, sizeof path, "%s/%s", p->temp_dir, names[i]);
         if (unlink(path) && errno != ENOENT) rt_log("cannot remove VZ swap %s: %s", path, strerror(errno));
     }
-    if (rmdir(p->temp_dir)) rt_log("cannot remove VZ temp %s: %s", p->temp_dir, strerror(errno));
+    if (door_mode) {
+        snprintf(path, sizeof path, "H:\\%s", p->temp_dir);
+        int err = dos_fs_remove_temporary(path);
+        if (err) rt_log("cannot remove VZ temp %s: DOS error %d", path, err);
+    } else if (rmdir(p->temp_dir)) rt_log("cannot remove VZ temp %s: %s", p->temp_dir, strerror(errno));
     p->temp_dir[0] = 0;
 }
 
@@ -1219,7 +1297,7 @@ static void do_exec(void) {
     char command_path[260];
     for (size_t i = 0; i <= strlen(dos_prog); i++)
         command_path[i] = dos_prog[i] == '/' ? '\\' : dos_prog[i];
-    if (!strcasecmp(command_path, "C:\\bin\\sh")) {
+    if (!strcasecmp(command_path, door_mode ? "H:\\COMMAND.COM" : "C:\\bin\\sh")) {
         int status = exec_host("/bin/sh", tail);
         if (hle_redirect) return; /* the command has loaded a DOS child */
         last_retcode = (uint16_t)(status & 0xFF);
@@ -1284,6 +1362,8 @@ static void terminate(uint8_t code, int tsr, uint16_t keep) {
     cpu.ip = term_ip;
 #ifdef __EMSCRIPTEN__
     if (term_cs == STUB_SEG && term_ip == STUB_EXIT) rt_exit_code = code;
+#else
+    if (door_mode && term_cs == STUB_SEG && term_ip == STUB_EXIT) rt_exit_code = code;
 #endif
     hle_redirect = 1;
 }
@@ -1338,7 +1418,7 @@ int dos_abort_break(void) {
 
 static void init_dos_data(void) {
     uint32_t a = (uint32_t)DOS_SEG << 4;
-    memset(&mem[a], 0, 0x800);
+    (void)guest_fill(a, 0, 0x800); /* constant, always inside guest memory */
     wr16(DOS_SEG, LOL_OFF - 2, FIRST_MCB);
     for (int i = 0; i < 0x16; i += 2) wr16(DOS_SEG, (uint16_t)(LOL_OFF + i), 0xFFFF); /* DPB, SFT, devices, buffers: none */
     wr16(DOS_SEG, LOL_OFF + 0x10, 512);
@@ -1353,7 +1433,7 @@ static void init_dos_data(void) {
     wr16(DOS_SEG, nul, 0xFFFF);
     wr16(DOS_SEG, (uint16_t)(nul + 2), 0xFFFF);
     wr16(DOS_SEG, (uint16_t)(nul + 4), 0x8004);
-    memcpy(&mem[a + nul + 10], "NUL     ", 8);
+    (void)guest_write(a + nul + 10, "NUL     ", 8);
     /* CDS: A: and B: invalid, C: a physical drive at C:\ */
     for (int d = 0; d < 8; d++) {
         uint16_t e = (uint16_t)(CDS_OFF + d * 0x58);
@@ -1367,9 +1447,9 @@ static void init_dos_data(void) {
 }
 
 void dos_core_init(void) {
-    memset(mem, 0, MEM_SIZE);
+    (void)guest_fill(0, 0, MEM_SIZE);
     for (int n = 0; n < 256; n++) set_vec((uint8_t)n, STUB_SEG, (uint16_t)n);
-    memset(&mem[(uint32_t)STUB_SEG << 4], 0xCF, STUB_END); /* IRET bytes, for anyone who looks */
+    (void)guest_fill((uint32_t)STUB_SEG << 4, 0xCF, STUB_END); /* IRET bytes, for anyone who looks */
     mem[0xFFFFE] = 0xFC;                                  /* machine model: AT */
     init_dos_data();
     wr16(0x40, 0x13, 640);                                /* base memory in KB */
@@ -1396,7 +1476,7 @@ int dos_core_int21(void) {
     case 0x26:
         /* DOS 1.x Create PSP, used when GW-BASIC moves its data segment.
          * Unlike AH=55h this does not change the current process. */
-        memmove(&mem[(uint32_t)cpu.d.x << 4], &mem[(uint32_t)cur_psp << 4], 256);
+        if (guest_move((uint32_t)cpu.d.x << 4, (uint32_t)cur_psp << 4, 256)) { fail(8); return 1; }
         wr16(cpu.d.x, 0x16, cur_psp);
         return 1;
     case 0x35: cpu.es = vec_seg(cpu.a.l); cpu.b.x = vec_off(cpu.a.l); return 1;
@@ -1434,7 +1514,8 @@ int dos_core_int21(void) {
     case 0x51: case 0x62: cpu.b.x = cur_psp; return 1;
     case 0x52: cpu.es = DOS_SEG; cpu.b.x = LOL_OFF; return 1;
     case 0x55:
-        memcpy(&mem[(uint32_t)cpu.d.x << 4], &mem[(uint32_t)cur_psp << 4], 256);
+        /* The new PSP may overlap the current one: memmove, never memcpy. */
+        if (guest_move((uint32_t)cpu.d.x << 4, (uint32_t)cur_psp << 4, 256)) { fail(8); return 1; }
         wr16(cpu.d.x, 0x16, cur_psp);
         wr16(cpu.d.x, 0x02, cpu.si);
         cur_psp = cpu.d.x;
@@ -1520,24 +1601,18 @@ static void mark_valid_drives(void) {
     }
 }
 
-void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
+static int start_first(const Image *image, const char *dos_prog,
+                       const uint8_t *tail, int tail_len) {
     mark_valid_drives();
-    uint8_t dos_prog[128];
-    if (utf8_to_dos(host_prog, dos_prog, sizeof dos_prog)) {
-        /* A user error, not a crash: say what to change. */
-        term_shutdown();
-        fprintf(stderr, "vc: %s: DOS needs this path under 128 bytes in code page 866;"
-                        " set XDG_CONFIG_HOME to a shorter directory\n", host_prog);
-        exit(1);
-    }
-
     char env[2048];
     size_t n = 0;
     char tmpdos[160] = "C:\\tmp";
-    const char *tmp = getenv("TMPDIR");
+    const char *tmp = door_mode ? NULL : getenv("TMPDIR");
     uint8_t conv[128];
     if (tmp && tmp[0] == '/' && !utf8_to_dos(tmp, conv, sizeof conv)) snprintf(tmpdos, sizeof tmpdos, "%s", conv);
-    const char *vars[] = {"COMSPEC=C:\\bin\\sh", "PROMPT=$P$G", NULL};
+    if (door_mode) strcpy(tmpdos, "H:\\");
+    const char *vars[] = {door_mode ? "COMSPEC=H:\\COMMAND.COM" : "COMSPEC=C:\\bin\\sh",
+                          "PROMPT=$P$G", NULL};
     for (int i = 0; vars[i]; i++) n += (size_t)snprintf(env + n, sizeof env - n, "%s", vars[i]) + 1;
     char program_dir[128];
     snprintf(program_dir, sizeof program_dir, "%s", dos_prog);
@@ -1547,7 +1622,9 @@ void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
 #ifdef __EMSCRIPTEN__
     n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\GAMES;%s;C:\\", program_dir) + 1;
 #else
-    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=%s;C:\\", program_dir) + 1;
+    if (door_mode)
+        n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\GAMES;H:\\.VC") + 1;
+    else n += (size_t)snprintf(env + n, sizeof env - n, "PATH=%s;C:\\", program_dir) + 1;
 #endif
     n += (size_t)snprintf(env + n, sizeof env - n, "TEMP=%s", tmpdos) + 1;
     n += (size_t)snprintf(env + n, sizeof env - n, "TMP=%s", tmpdos) + 1;
@@ -1557,6 +1634,34 @@ void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
     t[0] = (uint8_t)tail_len;
     memcpy(t + 1, tail, (size_t)tail_len);
     t[1 + tail_len] = 0x0D;
-    if (load_image(&image_vc_com, env, n, t, (const char *)dos_prog, 0, STUB_SEG, STUB_EXIT))
+    return load_image(image, env, n, t, dos_prog, 0, STUB_SEG, STUB_EXIT);
+}
+
+void dos_start(const char *host_prog, const uint8_t *tail, int tail_len) {
+    uint8_t dos_prog[128];
+    if (utf8_to_dos(host_prog, dos_prog, sizeof dos_prog)) {
+        /* A user error, not a crash: say what to change. */
+        term_shutdown();
+        fprintf(stderr, "vc: %s: DOS needs this path under 128 bytes in code page 866;"
+                        " set XDG_CONFIG_HOME to a shorter directory\n", host_prog);
+        exit(1);
+    }
+    if (start_first(&image_vc_com, (const char *)dos_prog, tail, tail_len))
         rt_fault("cannot load VC.COM");
+}
+
+int dos_door_start(const char *program) {
+    if (!door_mode) return 5;
+    const Image *image = &image_vc_com;
+    char dos_prog[256] = "H:\\.VC\\VC.COM", host[4096];
+    static const uint8_t vc_tail[] = " /std /notsr";
+    if (program) {
+        int found = find_program_path(program, "H:\\;H:\\GAMES", dos_prog, sizeof dos_prog,
+                                      host, sizeof host);
+        if (found <= 0) return found < 0 ? -found : 2;
+        int err = known_image(host, &image);
+        if (err) return err;
+    }
+    return start_first(image, dos_prog, program ? (const uint8_t *)"" : vc_tail,
+                       program ? 0 : (int)sizeof vc_tail - 1);
 }

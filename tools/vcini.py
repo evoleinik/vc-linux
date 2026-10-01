@@ -65,6 +65,8 @@ class VcIni:
         return 3 + 2 * self.wcb + self.sym[field]
 
     def panel_offset(self, panel: int, field: str) -> int:
+        if panel not in (0, 1):
+            raise ValueError("panel must be 0 (left) or 1 (right)")
         return 3 + panel * self.wcb + self.sym[field]
 
     def main(self, field: str) -> int:
@@ -75,6 +77,25 @@ class VcIni:
 
     def set_main(self, field: str, value: int) -> None:
         self.data[self.main_offset(field)] = value
+        self.fix_checksum()
+
+    def set_panel(self, panel: int, field: str, value: int) -> None:
+        self.data[self.panel_offset(panel, field)] = value
+        self.fix_checksum()
+
+    def panel_path(self, panel: int) -> str:
+        start = self.panel_offset(panel, "WinShortPath")
+        value = bytes(self.data[start:start + self.sym["LenPath"]])
+        return value.split(b"\0", 1)[0].decode("cp866")
+
+    def set_panel_path(self, panel: int, path: str) -> None:
+        """Set the panel's saved DOS path; both offset and capacity are listed."""
+        start = self.panel_offset(panel, "WinShortPath")
+        capacity = self.sym["LenPath"]
+        value = path.encode("cp866")
+        if b"\0" in value or len(value) >= capacity:
+            raise ValueError("panel path must fit LenPath including its NUL terminator")
+        self.data[start:start + capacity] = value.ljust(capacity, b"\0")
         self.fix_checksum()
 
 

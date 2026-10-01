@@ -564,11 +564,28 @@ static void test_bounds(void) {
     CHECK(state == MODEM_TRANSPORT_CLOSED && modem_port_in(COM + 5) == 0x60);
 }
 
+static void test_door(void) {
+    silent();
+    modem_set_door(1);
+    command("ATDT555-1992\r"); expect("\r\nNO ANSWER\r\n");
+    CHECK(dials == 0);
+    command("ATDT000\r"); expect("\r\nNO ANSWER\r\n");
+    CHECK(dials == 0);
+    /* A guest ATZ must not restore the original phone book. */
+    command("ATZ\r");
+    command("ATE0\r");
+    command("ATDP5551992\r"); expect("\r\nNO ANSWER\r\n");
+    CHECK(dials == 0);
+    modem_set_door(0);
+    command("ATDT555-1992\r");
+    CHECK(dials == 1); /* Normal mode retains the existing endpoint. */
+}
+
 int main(int argc, char **argv) {
     static const struct { const char *name; void (*run)(void); } tests[] = {
         {"uart", test_uart}, {"bios", test_bios}, {"hayes", test_hayes},
         {"escape", test_escape}, {"telnet", test_telnet},
-        {"pacing", test_pacing}, {"bounds", test_bounds},
+        {"pacing", test_pacing}, {"bounds", test_bounds}, {"door", test_door},
     };
     unsigned ran = 0;
     for (size_t i = 0; i < sizeof tests / sizeof *tests; ++i) {

@@ -16,6 +16,9 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#ifndef __EMSCRIPTEN__
+#include <sys/syscall.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -115,6 +118,9 @@ static uint32_t fcb_sequence;
 static uint16_t fcb_process;
 static struct timespec clock_delta;
 static bool initialized;
+static int door_root_fd = -1;
+static uint64_t door_quota, door_bytes, door_page = 4096;
+static unsigned door_entries;
 
 static int disk_space(bool extended);
 static int filesystem_info(void);
@@ -123,6 +129,9 @@ static int handle_info(void);
 static int convert_filetime(void);
 static int generate_shortname(void);
 static void forget_birth(const struct stat *st);
+static int quota_truncate(int fd, off_t size);
+static void quota_release_entry(const struct stat *st);
+static bool inode_is_open(const struct stat *st);
 
 static bool drive_present(unsigned drive)
 {
@@ -142,6 +151,311 @@ static bool path_below(const char *path, const char *root)
     size_t n = strlen(root);
     return n && (!strcmp(root, "/") ||
                  (!strncmp(path, root, n) && (!path[n] || path[n] == '/')));
+}
+
+/* Door operations use directory descriptors, not a checked path followed by
+ * an ordinary host open. Every parent is opened beneath the held H: root with
+ * O_NOFOLLOW, so replacing a component with a symlink cannot escape H: between
+ * resolution and a mutation. Guest-created entries are never symlinks. */
+static int door_parent(const char *path, char leaf[NAME_MAX + 1])
+{
+    const char *root = drives[DRIVE_H].root;
+    if (!path_below(path, root)) { errno = EACCES; return -1; }
+    char relative[PATH_MAX];
+    size_t used = 0;
+    const char *p = path + strlen(root);
+    while (*p) {
+        while (*p == '/') ++p;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != '/') ++p;
+        size_t n = (size_t)(p - start);
+        if (n == 1 && start[0] == '.') continue;
+        if (n == 2 && start[0] == '.' && start[1] == '.') {
+            while (used && relative[used - 1] != '/') --used;
+            if (used) --used;
+            continue;
+        }
+        if (n > NAME_MAX || used + n + 1 >= sizeof(relative)) { errno = ENAMETOOLONG; return -1; }
+        if (used) relative[used++] = '/';
+        memcpy(relative + used, start, n);
+        used += n;
+    }
+    relative[used] = 0;
+    int fd = openat(door_root_fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char *part = relative, *slash;
+    while ((slash = strchr(part, '/'))) {
+        *slash = 0;
+        int next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int saved = errno;
+        close(fd);
+        if (next < 0) { errno = saved == ELOOP ? EACCES : saved; return -1; }
+        fd = next;
+        part = slash + 1;
+    }
+    strcpy(leaf, *part ? part : ".");
+    return fd;
+}
+
+static bool door_file_type(const struct stat *st)
+{
+    /* A hardlink could name an inode outside H: even though its path is below
+     * the root. DOS cannot create either kind of link; refuse them both. */
+    return S_ISDIR(st->st_mode) || (S_ISREG(st->st_mode) && st->st_nlink <= 1);
+}
+
+static int fs_stat(const char *path, struct stat *st, bool nofollow)
+{
+    if (door_root_fd < 0) return nofollow ? lstat(path, st) : stat(path, st);
+    char leaf[NAME_MAX + 1];
+    int parent = door_parent(path, leaf);
+    if (parent < 0) return -1;
+    int result = fstatat(parent, leaf, st, AT_SYMLINK_NOFOLLOW);
+    int saved = errno;
+    close(parent);
+    if (!result && !door_file_type(st)) { result = -1; saved = EACCES; }
+    errno = saved;
+    return result;
+}
+
+static int fs_open(const char *path, int flags, mode_t mode)
+{
+    if (door_root_fd < 0) return open(path, flags, mode);
+    char leaf[NAME_MAX + 1];
+    int parent = door_parent(path, leaf);
+    if (parent < 0) return -1;
+    struct stat st;
+    int probe = fstatat(parent, leaf, &st, AT_SYMLINK_NOFOLLOW);
+    if ((!probe && !door_file_type(&st)) || (probe && errno != ENOENT)) {
+        int saved = !probe ? EACCES : errno;
+        close(parent); errno = saved; return -1;
+    }
+    /* Defer truncation until the opened inode has passed the type check too. */
+    int open_flags = (flags & ~O_TRUNC) | O_NOFOLLOW | O_NONBLOCK;
+    bool creating = (flags & O_CREAT) && probe;
+    if (flags & O_CREAT) {
+        if (!probe && (flags & O_EXCL)) {
+            close(parent); errno = EEXIST; return -1;
+        }
+        if (creating) {
+            if (door_entries >= DOS_DOOR_ENTRY_LIMIT) {
+                close(parent); errno = EDQUOT; return -1;
+            }
+            /* Only an atomic new allocation may charge a new entry. */
+            open_flags |= O_EXCL;
+        } else {
+            /* If an external actor removes an existing file after the probe,
+             * do not recreate an unaccounted inode through the same open. */
+            open_flags &= ~O_CREAT;
+        }
+    }
+    if ((flags & O_TRUNC) && (flags & O_ACCMODE) == O_RDONLY)
+        open_flags = (open_flags & ~O_ACCMODE) | O_RDWR;
+    int fd = openat(parent, leaf, open_flags, mode);
+    int saved = errno;
+    close(parent);
+    if (fd < 0) { errno = saved == ELOOP ? EACCES : saved; return -1; }
+    if (creating) ++door_entries;
+    int checked = fstat(fd, &st);
+    if (checked || !door_file_type(&st) ||
+        ((flags & O_TRUNC) && quota_truncate(fd, 0))) {
+        saved = !checked && !door_file_type(&st) ? EACCES : errno;
+        close(fd); errno = saved; return -1;
+    }
+    return fd;
+}
+
+static DIR *fs_opendir(const char *path)
+{
+    if (door_root_fd < 0) return opendir(path);
+    int fd = fs_open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0) return NULL;
+    DIR *dp = fdopendir(fd);
+    if (!dp) { int saved = errno; close(fd); errno = saved; }
+    return dp;
+}
+
+int dos_fs_open_readonly(const char *host)
+{
+    if (!initialized) dos_fs_init();
+    if (!host || *host != '/') { errno = EACCES; return -1; }
+    return fs_open(host, O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0);
+}
+
+static int fs_mkdir(const char *path, mode_t mode)
+{
+    if (door_root_fd < 0) return mkdir(path, mode);
+    char leaf[NAME_MAX + 1];
+    int parent = door_parent(path, leaf);
+    if (parent < 0) return -1;
+    if (door_entries >= DOS_DOOR_ENTRY_LIMIT) {
+        struct stat st;
+        int probe = fstatat(parent, leaf, &st, AT_SYMLINK_NOFOLLOW);
+        int saved = !probe ? EEXIST : errno == ENOENT ? EDQUOT : errno;
+        close(parent); errno = saved; return -1;
+    }
+    int result = mkdirat(parent, leaf, mode), saved = errno;
+    if (!result) ++door_entries;
+    close(parent); errno = saved;
+    return result;
+}
+
+static int fs_unlink(const char *path, bool directory)
+{
+    if (door_root_fd < 0) return directory ? rmdir(path) : unlink(path);
+    char leaf[NAME_MAX + 1];
+    int parent = door_parent(path, leaf);
+    if (parent < 0) return -1;
+    struct stat st;
+    if (fstatat(parent, leaf, &st, AT_SYMLINK_NOFOLLOW)) {
+        int saved = errno; close(parent); errno = saved; return -1;
+    }
+    int result = unlinkat(parent, leaf, directory ? AT_REMOVEDIR : 0), saved = errno;
+    /* Removed-but-open inodes still occupy memory and an inode on tmpfs.
+     * Their last tracked descriptor release owns the eventual reclamation. */
+    if (!result && !inode_is_open(&st)) quota_release_entry(&st);
+    close(parent); errno = saved;
+    return result;
+}
+
+static int fs_chmod(const char *path, mode_t mode)
+{
+    if (door_root_fd < 0) return chmod(path, mode);
+    int fd = fs_open(path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    int result = fchmod(fd, mode), saved = errno;
+    close(fd); errno = saved;
+    return result;
+}
+
+static int fs_utimens(const char *path, const struct timespec times[2])
+{
+    if (door_root_fd < 0) return utimensat(AT_FDCWD, path, times, 0);
+    int fd = fs_open(path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    int result = futimens(fd, times), saved = errno;
+    close(fd); errno = saved;
+    return result;
+}
+
+#ifndef __EMSCRIPTEN__
+static int fs_rename(const char *old, const char *target)
+{
+    int old_parent = AT_FDCWD, target_parent = AT_FDCWD;
+    char old_leaf[NAME_MAX + 1], target_leaf[NAME_MAX + 1];
+    if (door_root_fd >= 0) {
+        old_parent = door_parent(old, old_leaf);
+        if (old_parent < 0) return -1;
+        target_parent = door_parent(target, target_leaf);
+        if (target_parent < 0) { int saved = errno; close(old_parent); errno = saved; return -1; }
+        old = old_leaf; target = target_leaf;
+    }
+    /* musl exposes the Linux syscall but not glibc's renameat2 wrapper. */
+    int result = (int)syscall(SYS_renameat2, old_parent, old, target_parent, target, 1u);
+    int saved = errno; /* Linux RENAME_NOREPLACE = 1. */
+    if (old_parent != AT_FDCWD) close(old_parent);
+    if (target_parent != AT_FDCWD) close(target_parent);
+    errno = saved;
+    return result;
+}
+#endif
+
+/* The private tree is populated before initialization. DOS is its only writer
+ * afterwards, so accounting changes at the actual write/truncate/unlink boundary
+ * is both exact and independent of the number of seeded files.
+ * The door's H: is tmpfs, which gives every non-empty file at least one whole
+ * page. Charge a file its logical size rounded up to whole pages, so the
+ * quota bounds the memory really used. Directories take no tmpfs pages. */
+static uint64_t quota_charge(off_t size)
+{
+    if (size <= 0) return 0;
+    return ((uint64_t)size + door_page - 1) / door_page * door_page;
+}
+
+static void quota_release_entry(const struct stat *st)
+{
+    if (S_ISREG(st->st_mode) && st->st_nlink <= 1)
+        door_bytes -= quota_charge(st->st_size);
+    --door_entries;
+}
+
+static int quota_prepare(int fd, uint64_t end, uint64_t *previous)
+{
+    if (door_root_fd < 0) { *previous = 0; return 0; }
+    struct stat st;
+    if (fstat(fd, &st)) return -1;
+    if (!S_ISREG(st.st_mode) || !door_file_type(&st)) { errno = EACCES; return -1; }
+    *previous = quota_charge(st.st_size);
+    uint64_t charge = end > INT64_MAX ? UINT64_MAX : quota_charge((off_t)end);
+    if (charge > *previous && (door_bytes > door_quota || charge - *previous > door_quota - door_bytes)) {
+        errno = EDQUOT;
+        return -1;
+    }
+    return 0;
+}
+
+static void quota_changed(int fd, uint64_t previous)
+{
+    if (door_root_fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st)) return;
+    door_bytes = door_bytes - previous + quota_charge(st.st_size);
+}
+
+static int quota_truncate(int fd, off_t size)
+{
+    uint64_t previous;
+    if (size < 0) { errno = EINVAL; return -1; }
+    if (quota_prepare(fd, (uint64_t)size, &previous)) return -1;
+    int result = ftruncate(fd, size);
+    if (!result) quota_changed(fd, previous);
+    return result;
+}
+
+static ssize_t quota_write(int fd, const void *bytes, size_t count, off_t position, bool positioned)
+{
+    uint64_t previous = 0;
+    if (door_root_fd >= 0) {
+        if (!positioned) position = lseek(fd, 0, SEEK_CUR);
+        if (position < 0 || quota_prepare(fd, (uint64_t)position + count, &previous)) return -1;
+    }
+    ssize_t result = positioned ? pwrite(fd, bytes, count, position) : write(fd, bytes, count);
+    if (result >= 0) quota_changed(fd, previous);
+    return result;
+}
+
+static int quota_scan(int fd, unsigned depth)
+{
+    if (depth > 128) return 3;
+    int copy = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (copy < 0) return 5;
+    DIR *dp = fdopendir(copy);
+    if (!dp) { close(copy); return 5; }
+    int error = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(dp);
+        if (!de) { if (errno) error = 5; break; }
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (door_entries >= DOS_DOOR_ENTRY_LIMIT) { error = 39; break; }
+        ++door_entries;
+        struct stat st;
+        if (fstatat(fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW)) { error = 5; break; }
+        if (S_ISREG(st.st_mode)) {
+            uint64_t size = quota_charge(st.st_size);
+            if (size > door_quota - door_bytes) { error = 39; break; }
+            door_bytes += size;
+        } else if (S_ISDIR(st.st_mode)) {
+            int child = openat(fd, de->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (child < 0) { error = 5; break; }
+            error = quota_scan(child, depth + 1);
+            close(child);
+            if (error) break;
+        }
+    }
+    closedir(dp);
+    return error;
 }
 
 static unsigned host_drive(const char *path)
@@ -368,12 +682,12 @@ static int lease_identity(const DosPathLease *lease, const LeasePart *part)
     memcpy(path, lease->host, part->host_end);
     path[part->host_end] = 0;
     struct stat st, entry;
-    if (lstat(path, &entry)) {
+    if (fs_stat(path, &entry, true)) {
         /* Only the owner can deliberately make its reserved basename vacant.
          * An external deletion still cannot recreate a stale literal alias. */
         return errno == ENOENT && part->type == S_IFREG && lease->recreate ? 0 : 5;
     }
-    if (stat(path, &st) || (st.st_mode & S_IFMT) != part->type ||
+    if (fs_stat(path, &st, false) || (st.st_mode & S_IFMT) != part->type ||
         (entry.st_mode & S_IFMT) != part->entry_type) return 5;
     /* Directories and symlink entries must stay attached to their own identity.
      * A regular file, however, is a saved pathname: editors, git and sync tools
@@ -390,7 +704,7 @@ static int lease_alias_conflict(const DosPathLease *lease, const LeasePart *part
     memcpy(parent, lease->host, part->parent_end);
     parent[part->parent_end] = 0;
     lease_alias(lease, part, alias);
-    DIR *dp = opendir(parent);
+    DIR *dp = fs_opendir(parent);
     if (!dp) return 5;
     int error = 0;
     for (;;) {
@@ -422,7 +736,11 @@ void dos_fs_release_path(DosPathLease *lease)
     while (*p && *p != lease) p = &(*p)->next;
     if (!*p) return;
     *p = lease->next;
+    struct stat st;
+    bool unlinked = door_root_fd >= 0 && lease->fd >= 0 &&
+                    !fstat(lease->fd, &st) && !st.st_nlink;
     if (lease->fd >= 0) close(lease->fd);
+    if (unlinked && !inode_is_open(&st)) quota_release_entry(&st);
     free(lease);
 }
 
@@ -685,7 +1003,7 @@ static int join_path(const char *dir, const char *name, char *out, size_t cap)
 
 static int list_directory(const char *dir, Entry **out, size_t *out_count)
 {
-    DIR *dp = opendir(dir);
+    DIR *dp = fs_opendir(dir);
     if (!dp) return errno == ENOENT ? 3 : dos_errno(errno);
     Entry *entries = NULL;
     size_t count = 0, cap = 0;
@@ -750,9 +1068,9 @@ static unsigned file_attr(const char *path, const struct stat *st)
 
 static int file_stat(const char *path, struct stat *st)
 {
-    if (stat(path, st) == 0) return 0;
+    if (fs_stat(path, st, false) == 0) return 0;
     int saved = errno;
-    if ((saved == ENOENT || saved == ENOTDIR) && lstat(path, st) == 0 && S_ISLNK(st->st_mode)) {
+    if ((saved == ENOENT || saved == ENOTDIR) && fs_stat(path, st, true) == 0 && S_ISLNK(st->st_mode)) {
         st->st_mode = (st->st_mode & 07777) | S_IFREG;
         st->st_size = 0;
         return 0;
@@ -766,8 +1084,15 @@ static struct timespec birth_time(const char *path, int fd, const struct stat *s
         if (b->dev == st->st_dev && b->ino == st->st_ino) return b->time;
 #ifndef __EMSCRIPTEN__
     struct statx sx;
+    int held = -1;
+    if (door_root_fd >= 0 && fd < 0) {
+        held = fs_open(path, O_RDONLY | O_CLOEXEC, 0);
+        if (held < 0) return st->st_ctim;
+        fd = held;
+    }
     int ok = fd >= 0 ? statx(fd, "", AT_EMPTY_PATH, STATX_BTIME, &sx) :
                       statx(AT_FDCWD, path, 0, STATX_BTIME, &sx);
+    if (held >= 0) close(held);
     if (!ok && (sx.stx_mask & STATX_BTIME))
         return (struct timespec){(time_t)sx.stx_btime.tv_sec, (long)sx.stx_btime.tv_nsec};
 #else
@@ -810,10 +1135,11 @@ static int resolve_name(const char *dir, const char *name, char *out, bool allow
      * skips listing the directory, which is slow in big ones and impossible
      * in execute-only ones. */
     struct stat exact_st;
-    if (lstat(exact, &exact_st) == 0) {
+    if (fs_stat(exact, &exact_st, true) == 0) {
         strcpy(out, exact);
         return 0;
     }
+    if (door_root_fd >= 0 && errno != ENOENT) return dos_errno(errno);
     Entry *entries;
     size_t count;
     error = list_directory(dir, &entries, &count);
@@ -843,6 +1169,11 @@ static int resolve_path(const char *dos, char out[PATH_MAX], bool allow_missing)
     if (error) return error;
     const DosDrive *d = drives + drive;
     strcpy(out, (*p == '/' || *p == '\\') ? d->root : d->cwd);
+    if (door_root_fd >= 0) {
+        struct stat st;
+        if (fs_stat(out, &st, false)) return dos_errno(errno);
+        if (!S_ISDIR(st.st_mode)) return 3;
+    }
     while (*p) {
         while (*p == '/' || *p == '\\') ++p;
         if (!*p) break;
@@ -861,11 +1192,12 @@ static int resolve_path(const char *dos, char out[PATH_MAX], bool allow_missing)
         char resolved[PATH_MAX];
         error = resolve_name(out, part, resolved, allow_missing && !*p);
         if (error) return error == 2 && *p ? 3 : error;
-        if (*p) {
+        if (*p || door_root_fd >= 0) {
             struct stat st;
             error = file_stat(resolved, &st);
+            if (error == 2 && allow_missing && !*p) { strcpy(out, resolved); break; }
             if (error) return error == 2 ? 3 : error;
-            if (!S_ISDIR(st.st_mode)) return 3;
+            if (*p && !S_ISDIR(st.st_mode)) return 3;
         }
         strcpy(out, resolved);
     }
@@ -919,7 +1251,7 @@ int dos_fs_pin_path(const char *dos, const char *host, DosPathLease **out)
         LeasePart *part = lease->parts + i;
         memcpy(resolved, host, part->host_end);
         resolved[part->host_end] = 0;
-        if (stat(resolved, &st) || lstat(resolved, &entry) ||
+        if (fs_stat(resolved, &st, false) || fs_stat(resolved, &entry, true) ||
             (i + 1 < lease->count ? !S_ISDIR(st.st_mode) :
              (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)))) { error = 5; break; }
         part->dev = st.st_dev; part->ino = st.st_ino;
@@ -928,9 +1260,9 @@ int dos_fs_pin_path(const char *dos, const char *host, DosPathLease **out)
         part->entry_type = entry.st_mode & S_IFMT;
     }
     if (!error) {
-        do { lease->fd = open(host, O_RDONLY | O_NONBLOCK | O_CLOEXEC); }
+        do { lease->fd = fs_open(host, O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0); }
         while (lease->fd < 0 && errno == EINTR);
-        if (lease->fd < 0 || fstat(lease->fd, &st) || lstat(host, &entry) ||
+        if (lease->fd < 0 || fstat(lease->fd, &st) || fs_stat(host, &entry, true) ||
             (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) error = 5;
     }
     if (!error) {
@@ -1240,7 +1572,8 @@ static int split_pattern(const char *dos, char dir[PATH_MAX], char pattern[DOS_N
 static bool links_to_ancestor(const char *dir_real, const char *path, const struct stat *st)
 {
     struct stat lst;
-    if (!S_ISDIR(st->st_mode) || lstat(path, &lst) != 0 || !S_ISLNK(lst.st_mode) || !dir_real)
+    if (door_root_fd >= 0 || !S_ISDIR(st->st_mode) || fs_stat(path, &lst, true) != 0 ||
+        !S_ISLNK(lst.st_mode) || !dir_real)
         return false;
     char *target = realpath(path, NULL);
     if (!target) return false;
@@ -1256,7 +1589,7 @@ static int snapshot(const char *dir, unsigned drive, Entry **entries, size_t *co
     int error = list_directory(dir, entries, count);
     if (error) return error;
     bool at_root = !strcmp(dir, drives[drive].root);
-    char *dir_real = realpath(dir, NULL);
+    char *dir_real = door_root_fd >= 0 ? NULL : realpath(dir, NULL);
     for (size_t i = 0; i < *count; ++i) {
         Entry *e = *entries + i;
         /* Do not even form an H-root/.. host path. The same directory can
@@ -1425,6 +1758,13 @@ static bool inode_is_open(const struct stat *st)
         if (h && !h->device && !fstat(h->fd, &held) &&
             held.st_dev == st->st_dev && held.st_ino == st->st_ino) return true;
     }
+    if (door_root_fd >= 0) {
+        for (DosPathLease *lease = path_leases; lease; lease = lease->next) {
+            struct stat held;
+            if (lease->fd >= 0 && !fstat(lease->fd, &held) &&
+                held.st_dev == st->st_dev && held.st_ino == st->st_ino) return true;
+        }
+    }
     return false;
 }
 
@@ -1436,7 +1776,10 @@ static int close_handle(unsigned n)
     bool unlinked = h->fd >= 0 && !fstat(h->fd, &st) && !st.st_nlink;
     int error = h->fd >= 0 && close(h->fd) < 0 ? dos_errno(errno) : 0;
     memset(h, 0, sizeof(*h)); h->fd = -1;
-    if (unlinked && !inode_is_open(&st)) forget_birth(&st);
+    if (unlinked && !inode_is_open(&st)) {
+        if (door_root_fd >= 0) quota_release_entry(&st);
+        forget_birth(&st);
+    }
     return error;
 }
 
@@ -1539,22 +1882,25 @@ static int open_path(const char *path, unsigned drive, unsigned mode,
     if (!exists) flags |= O_CREAT | O_EXCL;
     if (exists && if_exists == 2 && !lease) flags |= O_TRUNC;
     int fd;
-    do { fd = open(path, flags, 0666); } while (fd < 0 && errno == EINTR);
-    if (fd < 0) return lease ? 5 : dos_errno(errno);
+    do { fd = fs_open(path, flags, 0666); } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        error = dos_errno(errno);
+        return lease && error != 39 ? 5 : error;
+    }
     if (fstat(fd, &st) < 0) { error = dos_errno(errno); close(fd); return error; }
     /* Check the opened descriptor against the pathname as it exists now,
      * not the original inode: external atomic replacement is legitimate.
      * Keep truncation deferred until type, path components and aliases pass. */
     if (lease) {
         struct stat current;
-        if (lease_validate(lease, lease->count) || stat(path, &current) ||
+        if (lease_validate(lease, lease->count) || fs_stat(path, &current, false) ||
             !S_ISREG(st.st_mode) || st.st_dev != current.st_dev || st.st_ino != current.st_ino ||
             (!(st.st_mode & S_IWUSR) && ((mode & 3) != 0 || if_exists == 2))) {
             close(fd); return 5;
         }
         if ((error = check_sharing(&st, mode, if_exists == 2))) { close(fd); return error; }
     }
-    if (lease && if_exists == 2 && ftruncate(fd, 0)) {
+    if (lease && if_exists == 2 && quota_truncate(fd, 0)) {
         error = dos_errno(errno); close(fd); return error;
     }
     if (!exists) forget_birth(&st); /* an inode may have been recycled */
@@ -1710,7 +2056,7 @@ static uint8_t fcb_transfer(uint16_t seg, uint16_t off, uint8_t function, uint16
     if (write && h->access == 0) { *count = 0; return 1; }
     if (!requested) {
         *count = 0;
-        if (write && ftruncate(h->fd, (off_t)pos)) return 1;
+        if (write && quota_truncate(h->fd, (off_t)pos)) return 1;
         struct stat st;
         if (!fstat(h->fd, &st)) fcb_metadata(seg, off, &st);
         return 0;
@@ -1726,7 +2072,8 @@ static uint8_t fcb_transfer(uint16_t seg, uint16_t off, uint8_t function, uint16
             for (unsigned i = 0; i < size; i++) buffer[i] = rd8(dta_seg, (uint16_t)(dma + i));
         ssize_t n;
         do {
-            n = write ? pwrite(h->fd, buffer, size, (off_t)pos) : pread(h->fd, buffer, size, (off_t)pos);
+            n = write ? quota_write(h->fd, buffer, size, (off_t)pos, true) :
+                        pread(h->fd, buffer, size, (off_t)pos);
         } while (n < 0 && errno == EINTR);
         if (n < 0 || (write && n != size)) { status = 1; break; }
         if (!n) { status = 1; break; }
@@ -1826,7 +2173,7 @@ static void fcb_call(uint8_t function)
                 if (function == 0x23) {
                     uint16_t size = rd16(seg, (uint16_t)(off + 14));
                     if (size) { put32(seg, (uint16_t)(off + 33), (uint32_t)(((uint64_t)st.st_size + size - 1) / size)); status = 0; }
-                } else if ((st.st_mode & S_IWUSR) && !inode_is_open(&st) && !unlink(path)) {
+                } else if ((st.st_mode & S_IWUSR) && !inode_is_open(&st) && !fs_unlink(path, false)) {
                     forget_birth(&st);
                     status = 0;
                 }
@@ -1862,7 +2209,7 @@ static int write_file(void)
     if (!count) {
         if (h->device == DEV_NONE) {
             off_t pos = lseek(h->fd, 0, SEEK_CUR);
-            if (pos < 0 || ftruncate(h->fd, pos) < 0) return dos_errno(errno);
+            if (pos < 0 || quota_truncate(h->fd, pos) < 0) return dos_errno(errno);
             if ((h->mode & 0x4000) && fsync(h->fd) < 0) return dos_errno(errno);
         }
         cpu.a.x = 0;
@@ -1876,7 +2223,7 @@ static int write_file(void)
         return 0;
     }
     ssize_t n;
-    do { n = write(h->fd, buffer, count); } while (n < 0 && errno == EINTR);
+    do { n = quota_write(h->fd, buffer, count, 0, false); } while (n < 0 && errno == EINTR);
     if (n < 0) return dos_errno(errno);
     if ((h->mode & 0x4000) && fsync(h->fd) < 0) return dos_errno(errno);
     cpu.a.x = (uint16_t)n;
@@ -1965,7 +2312,7 @@ static int set_attributes(const char *path, const struct stat *st, unsigned attr
     mode_t mode = st->st_mode & 07777;
     if (attr & ATTR_RO) mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
     else mode |= S_IWUSR | S_IWGRP | S_IWOTH;
-    return chmod(path, mode) < 0 ? dos_errno(errno) : 0;
+    return fs_chmod(path, mode) < 0 ? dos_errno(errno) : 0;
 }
 
 static int attributes_call(unsigned sub, bool lfn)
@@ -1990,7 +2337,7 @@ static int attributes_call(unsigned sub, bool lfn)
         if (sub == 7) return set_birth(&st, ts);
         struct timespec times[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
         times[sub == 5 ? 0 : 1] = ts;
-        return utimensat(AT_FDCWD, path, times, 0) < 0 ? dos_errno(errno) : 0;
+        return fs_utimens(path, times) < 0 ? dos_errno(errno) : 0;
     }
     struct timespec ts = sub == 4 ? st.st_mtim : sub == 6 ? st.st_atim : birth_time(path, -1, &st);
     uint16_t tt, dt;
@@ -2028,7 +2375,7 @@ static int make_directory(void)
     while (n > 1 && (dos[n - 1] == '/' || dos[n - 1] == '\\') && dos[n - 2] != ':') dos[--n] = 0;
     error = resolve_path(dos, path, true);
     if (error) return error;
-    if (mkdir(path, 0777) < 0) return errno == EEXIST ? 5 : dos_errno(errno);
+    if (fs_mkdir(path, 0777) < 0) return errno == EEXIST ? 5 : dos_errno(errno);
     return 0;
 }
 
@@ -2042,14 +2389,14 @@ static int remove_directory(void)
     while (n > 1 && (dos[n - 1] == '/' || dos[n - 1] == '\\') && dos[n - 2] != ':') dos[--n] = 0;
     error = resolve_path(dos, path, false);
     if (error) return error == 2 ? 3 : error;
-    if (lstat(path, &link_st) < 0) return dos_errno(errno);
+    if (fs_stat(path, &link_st, true) < 0) return dos_errno(errno);
     if (S_ISLNK(link_st.st_mode)) {
-        if (stat(path, &st) < 0) {
+        if (fs_stat(path, &st, false) < 0) {
             if (errno != ENOENT && errno != ENOTDIR) return dos_errno(errno);
         } else if (!S_ISDIR(st.st_mode)) return 3;
         /* VC recurses after rmdir fails. Succeed by removing only the final
          * symlink, never by letting it enumerate and delete the target. */
-        if (unlink(path) < 0) return dos_errno(errno);
+        if (fs_unlink(path, false) < 0) return dos_errno(errno);
         if (link_st.st_nlink <= 1 && !inode_is_open(&link_st)) forget_birth(&link_st);
         return 0;
     }
@@ -2058,11 +2405,11 @@ static int remove_directory(void)
     for (unsigned i = 0; i < DOS_DRIVES; ++i) {
         if (!drive_present(i)) continue;
         const char *cwd = drives[i].cwd;
-        if (!strcmp(path, cwd) || (!stat(cwd, &cwd_st) &&
+        if (!strcmp(path, cwd) || (!fs_stat(cwd, &cwd_st, false) &&
             st.st_dev == cwd_st.st_dev && st.st_ino == cwd_st.st_ino)) return 16;
     }
     if (drive_root(path)) return 5;
-    if (rmdir(path) < 0) return dos_errno(errno);
+    if (fs_unlink(path, true) < 0) return dos_errno(errno);
     forget_birth(&st);
     return 0;
 }
@@ -2101,18 +2448,63 @@ static int get_directory(bool lfn)
     return error;
 }
 
-static int unlink_path(const char *path)
+static int unlink_path(const char *path, bool temporary)
 {
     struct stat link_st;
-    if (lstat(path, &link_st) < 0) return dos_errno(errno);
+    if (fs_stat(path, &link_st, true) < 0) return dos_errno(errno);
     /* A final symlink is the entry being deleted, regardless of its target's
      * type, permissions or existence. In particular, ancestor links are
      * deliberately listed as files and arrive here through 41h/7141h. */
     if (!S_ISLNK(link_st.st_mode) &&
-        (S_ISDIR(link_st.st_mode) || !(link_st.st_mode & S_IWUSR))) return 5;
-    if (unlink(path) < 0) return dos_errno(errno);
+        (S_ISDIR(link_st.st_mode) || (!temporary && !(link_st.st_mode & S_IWUSR)))) return 5;
+    if (fs_unlink(path, false) < 0) return dos_errno(errno);
     /* Removing a symlink never removes the followed target's inode. */
     if (link_st.st_nlink <= 1 && !inode_is_open(&link_st)) forget_birth(&link_st);
+    return 0;
+}
+
+int dos_fs_make_temporary(const char *dos)
+{
+    if (door_root_fd < 0 || !dos || strlen(dos) < 4 || dos[1] != ':' ||
+        (dos[2] != '\\' && dos[2] != '/')) return 5;
+    char path[PATH_MAX];
+    int error = resolve_path(dos, path, true);
+    if (error) return error;
+    if (drive_root(path) || drive_ancestor(path)) return 5;
+    /* fs_mkdir charges the one new entry; EEXIST lets the caller pick another
+     * name, and a full session is DOS disk full like any guest mkdir. */
+    if (fs_mkdir(path, 0700) < 0) return errno == EEXIST ? 80 : dos_errno(errno);
+    return 0;
+}
+
+int dos_fs_remove_temporary(const char *dos)
+{
+    if (door_root_fd < 0 || !dos || strlen(dos) < 3 || dos[1] != ':' ||
+        (dos[2] != '\\' && dos[2] != '/')) return 5;
+    char path[PATH_MAX];
+    int error = resolve_path(dos, path, false);
+    if (error) return error;
+    if (drive_ancestor(path)) return 5;
+    struct stat st;
+    if (fs_stat(path, &st, true)) return dos_errno(errno);
+    if (!S_ISDIR(st.st_mode)) {
+        error = unlink_path(path, true);
+        if (error) return error;
+        /* An aborted editor never gets to close its ordinary DOS handles.
+         * Only this runtime-owned temporary inode is being retired: generic
+         * process handles (and generic TSR handles) keep their old lifetime. */
+        for (unsigned i = 0; i < DOS_HANDLES; ++i) {
+            DosHandle *h = get_handle(i);
+            struct stat held;
+            if (!h || h->device || fstat(h->fd, &held) ||
+                held.st_dev != st.st_dev || held.st_ino != st.st_ino) continue;
+            int closed = close_handle(i);
+            if (!error) error = closed;
+        }
+        return error;
+    }
+    if (fs_unlink(path, true)) return dos_errno(errno);
+    forget_birth(&st);
     return 0;
 }
 
@@ -2124,7 +2516,7 @@ static int delete_file(bool lfn)
     if (error) return error;
     if (!lfn || !cpu.si) {
         error = resolve_path(dos, path, false);
-        return error ? error : unlink_path(path);
+        return error ? error : unlink_path(path, false);
     }
     char pattern[DOS_NAME_MAX + 1];
     const char *name = dos;
@@ -2158,7 +2550,7 @@ static int delete_file(bool lfn)
             !(long_match(pattern, e->dos) || long_match(pattern, e->alias))) continue;
         char file[PATH_MAX];
         error = join_path(path, e->host, file, sizeof(file));
-        if (!error) error = unlink_path(file);
+        if (!error) error = unlink_path(file, false);
         if (error) break;
         ++removed;
     }
@@ -2191,10 +2583,10 @@ static int rename_file(void)
     if (drive_ancestor(old)) return 5;
     if (S_ISDIR(st.st_mode)) {
         struct stat link_st;
-        if (lstat(old, &link_st) < 0) return dos_errno(errno);
+        if (fs_stat(old, &link_st, true) < 0) return dos_errno(errno);
         /* A symlinked parent may give the root another C: spelling. Moving
          * a final symlink itself is safe: its target stays where it was. */
-        if (!S_ISLNK(link_st.st_mode)) {
+        if (door_root_fd < 0 && !S_ISLNK(link_st.st_mode)) {
             char *real = realpath(old, NULL);
             if (!real) return dos_errno(errno);
             bool protected = drive_ancestor(real);
@@ -2225,7 +2617,7 @@ static int rename_file(void)
     if (errno != ENOENT) return dos_errno(errno);
     if (rename(old, target) < 0) return dos_errno(errno);
 #else
-    if (renameat2(AT_FDCWD, old, AT_FDCWD, target, RENAME_NOREPLACE) < 0) return dos_errno(errno);
+    if (fs_rename(old, target) < 0) return dos_errno(errno);
 #endif
     for (DosPathLease *lease = path_leases; lease; lease = lease->next) {
         if (!active_lease(lease) || strcmp(lease->host, old)) continue;
@@ -2393,6 +2785,10 @@ void dos_fs_init(void)
         for (unsigned i = 0; i < DOS_HANDLES; ++i) if (get_handle(i)) close_handle(i);
         for (unsigned i = 0; i < SEARCH_SLOTS; ++i) release_search(searches + i);
     }
+    if (door_root_fd >= 0) close(door_root_fd);
+    door_root_fd = -1;
+    door_quota = door_bytes = 0;
+    door_entries = 0;
     memset(handles, 0, sizeof(handles));
     for (unsigned i = 0; i < DOS_HANDLES; ++i) handles[i].fd = -1;
     handles[0].device = DEV_IN; handles[0].access = 0;
@@ -2427,6 +2823,36 @@ void dos_fs_init(void)
     fcb_process = 0;
     clock_delta = (struct timespec){0, 0};
     initialized = true;
+}
+
+int dos_fs_init_door(const char *root, uint64_t quota)
+{
+    dos_fs_init();
+    /* Fail closed even when an invalid root follows an ordinary session. */
+    memset(drives, 0, sizeof(drives));
+    current_drive = DRIVE_H;
+    if (!root || *root != '/' || !quota) return 5;
+    char canonical[PATH_MAX];
+    struct stat st;
+    if (lstat(root, &st) || !S_ISDIR(st.st_mode) ||
+        !realpath(root, canonical) || !strcmp(canonical, "/")) return 5;
+    int fd = open(canonical, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return dos_errno(errno);
+    strcpy(drives[DRIVE_H].root, canonical);
+    strcpy(drives[DRIVE_H].cwd, canonical);
+    door_root_fd = fd;
+    door_quota = quota;
+    long page = sysconf(_SC_PAGESIZE); /* auxv only: no file or syscall */
+    door_page = page > 4096 ? (uint64_t)page : 4096;
+    int error = quota_scan(fd, 0);
+    if (error) {
+        close(door_root_fd);
+        door_root_fd = -1;
+        door_quota = door_bytes = 0;
+        door_entries = 0;
+        memset(drives, 0, sizeof(drives));
+    }
+    return error;
 }
 
 static bool owns_function(uint16_t ax)
@@ -2593,14 +3019,23 @@ static int disk_space(bool extended)
         strcpy(path, drive->root);
     }
 
-    struct statvfs fs;
-    if (statvfs(path, &fs) != 0) return dos_errno(errno);
-    uint64_t block_bytes = fs.f_frsize ? fs.f_frsize : fs.f_bsize;
-    if (!block_bytes) block_bytes = 512;
-    uint64_t blocks = fs.f_blocks, available = fs.f_bavail;
-    if (available > blocks) available = blocks;
-    uint64_t total_bytes = blocks > UINT64_MAX / block_bytes ? UINT64_MAX : blocks * block_bytes;
-    uint64_t free_bytes = available > UINT64_MAX / block_bytes ? UINT64_MAX : available * block_bytes;
+    uint64_t block_bytes, blocks, available, total_bytes, free_bytes;
+    if (door_root_fd >= 0) {
+        block_bytes = 512;
+        total_bytes = door_quota;
+        free_bytes = door_bytes < door_quota ? door_quota - door_bytes : 0;
+        blocks = total_bytes / block_bytes;
+        available = free_bytes / block_bytes;
+    } else {
+        struct statvfs fs;
+        if (statvfs(path, &fs) != 0) return dos_errno(errno);
+        block_bytes = fs.f_frsize ? fs.f_frsize : fs.f_bsize;
+        if (!block_bytes) block_bytes = 512;
+        blocks = fs.f_blocks; available = fs.f_bavail;
+        if (available > blocks) available = blocks;
+        total_bytes = blocks > UINT64_MAX / block_bytes ? UINT64_MAX : blocks * block_bytes;
+        free_bytes = available > UINT64_MAX / block_bytes ? UINT64_MAX : available * block_bytes;
+    }
     uint64_t total_sectors = total_bytes / 512, free_sectors = free_bytes / 512;
     uint64_t sectors_per_cluster = block_bytes / 512;
     if (!sectors_per_cluster) sectors_per_cluster = 1;

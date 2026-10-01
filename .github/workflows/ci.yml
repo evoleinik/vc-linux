@@ -82,6 +82,13 @@ jobs:
           tools/fetch-openwatcom.sh build/openwatcom
           echo "WATCOM=$PWD/build/openwatcom" >> "$GITHUB_ENV"
       - run: make build/vc-static
+      - name: Static ARM64 door build with Zig 0.16.0
+        run: |
+          uv pip install ziglang==0.16.0
+          zig=$(.venv/bin/python -c 'import pathlib, ziglang; print(pathlib.Path(ziglang.__file__).parent / "zig")')
+          make build/vc-door-aarch64 ZIG="$zig"
+          file build/vc-door-aarch64 | grep -q 'ARM aarch64'
+          file build/vc-door-aarch64 | grep -q 'statically linked'
       - name: Smoke test the release binary
         run: |
           set -euo pipefail
@@ -95,5 +102,6 @@ jobs:
         run: |
           set -euo pipefail
           cp build/vc-static vc-linux-x86_64
+          cp build/vc-door-aarch64 vc-door-linux-aarch64
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" vc-linux-x86_64 --clobber
+          gh release upload "$GITHUB_REF_NAME" vc-linux-x86_64 vc-door-linux-aarch64 --clobber

@@ -22,6 +22,8 @@ extern int rt_exited;
 extern int rt_exit_code;
 
 void rt_log(const char *fmt, ...);
+/* Door sessions must not honor host log paths or write outside their drive. */
+void rt_set_logging(int enabled);
 void rt_update_clock(void);
 void rt_register_image(const Image *img, uint16_t loadseg);
 /* A separately generated set of listing-proved entry points may supplement
@@ -57,6 +59,11 @@ int dos_abort_break(void);
 int dos_int_other(uint8_t n);
 /* Load VC.COM as the first process. host_prog is where it lives on Linux. */
 void dos_start(const char *host_prog, const uint8_t *tail, int tail_len);
+/* Runtime-only policy: never changes the translated programs or normal DOS.
+ * Set after dos_core_init; a NULL program starts VC, otherwise byte-match a
+ * program on the private H: drive and use it as the first DOS process. */
+void dos_core_set_door(int enabled);
+int dos_door_start(const char *program);
 
 /* Default setup files and images embedded in the binary: build/gen/files.c */
 typedef struct { const char *name; const uint8_t *data; uint32_t size; } EmbeddedFile;

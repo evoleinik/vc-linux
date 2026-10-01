@@ -1,4 +1,4 @@
-"""Assemble the small, offline H: drive for the WebAssembly build.
+"""Assemble the shared, offline H: drive for the browser and native BBS doors.
 
 Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE KERMIT_EXE
 The original assembly lives only in asm/; this copies it at build time.
@@ -37,37 +37,40 @@ def history_text(readme: str) -> bytes:
     return ("History\n\n" + "\n\n".join(paragraphs) + "\n").encode("ascii")
 
 
-def main() -> None:
-    if len(sys.argv) != 8:
-        raise SystemExit(__doc__)
-    destination = Path(sys.argv[1])
+def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
+               vz: Path, kermit: Path) -> dict[str, bytes]:
+    """The sole content list/generator for both demo environments.
+
+    Keep pathnames as UTF-8 host names and DOS text in its original encoding.
+    Native doors embed this exact mapping, not a hand-maintained second list.
+    """
     files = {
         "README.TXT": (ROOT / "web/README.TXT").read_text(encoding="ascii").encode("ascii"),
         # Keep a readable UTF-8 source in git; only Russian has a complete
         # CP866 alphabet. Ukrainian remains on the Unicode browser page.
         "ПРОЧТИ.TXT": (ROOT / "web/README-RU.TXT").read_text(encoding="utf-8").replace("\n", "\r\n").encode("cp866"),
         "HISTORY.TXT": history_text((ROOT / "README.md").read_text(encoding="utf-8")),
-        "GWBASIC.EXE": Path(sys.argv[2]).read_bytes(),
+        "GWBASIC.EXE": gwbasic.read_bytes(),
         "GWBASIC.TXT": (ROOT / "third_party/gwbasic/LICENSE").read_bytes(),
-        "BOOTLOGO.COM": Path(sys.argv[4]).read_bytes(),
+        "BOOTLOGO.COM": bootlogo.read_bytes(),
         "BOOTLOGO.TXT": (ROOT / "web/BOOTLOGO.TXT").read_text(encoding="ascii").replace("\n", "\r\n").encode("ascii"),
         "LOGOLIC.TXT": (ROOT / "third_party/bootlogo/LICENSE").read_bytes(),
-        "VZ.COM": Path(sys.argv[6]).read_bytes(),
+        "VZ.COM": vz.read_bytes(),
         "VZ.DEF": installed_definition(),
         "VZLIC.TXT": (ROOT / "third_party/vzeditor/LICENSE").read_bytes(),
-        "KERMIT.EXE": Path(sys.argv[7]).read_bytes(),
+        "KERMIT.EXE": kermit.read_bytes(),
         "BBS.TAK": (ROOT / "data/BBS.TAK").read_bytes(),
         "KERMIT.TXT": (ROOT / "data/KERMIT.TXT").read_bytes(),
         "KERMLIC.TXT": (ROOT / "third_party/mskermit/LICENSE").read_bytes(),
         "GAMES/SPIRAL.BAS": (ROOT / "web/GAMES/SPIRAL.BAS").read_text(encoding="ascii").replace("\n", "\r\n").encode("ascii"),
-        "GAMES/ROGUE.EXE": Path(sys.argv[5]).read_bytes(),
+        "GAMES/ROGUE.EXE": rogue.read_bytes(),
         "GAMES/ROGUELIC.TXT": (ROOT / "third_party/rogue/LICENSE.TXT").read_bytes(),
         "GAMES/PDCLIC.TXT": (ROOT / "third_party/pdcurses/README.md").read_bytes(),
-        "GAMES/OWLIC.TXT": Path(sys.argv[5]).with_name("OWLIC.TXT").read_bytes(),
+        "GAMES/OWLIC.TXT": rogue.with_name("OWLIC.TXT").read_bytes(),
     }
     for name in ("VZFLE.DEF", "HELPE.DEF", "BLOCK.DEF", "PALET.DEF", "BW.DEF"):
         files[name] = (ROOT / "third_party/vzeditor/VZ-IBM" / name).read_bytes()
-    for path in sorted(Path(sys.argv[3]).iterdir()):
+    for path in sorted(games.iterdir()):
         files[f"GAMES/{path.name}"] = path.read_bytes()
     for name in ("VC.ASM", "VCOVL.ASM", "LICENSE.TXT"):
         files[f"SRC/{name}"] = (ROOT / "asm" / name).read_bytes()
@@ -77,7 +80,15 @@ def main() -> None:
     if legacy >= LEGACY_LIMIT:
         raise SystemExit(f"Pre-Kermit demo is {legacy:,} bytes; it must stay below {LEGACY_LIMIT:,}")
     if total >= LIMIT:
-        raise SystemExit(f"Web demo is {total:,} bytes; it must be below {LIMIT:,}")
+        raise SystemExit(f"Demo is {total:,} bytes; it must be below {LIMIT:,}")
+    return files
+
+
+def main() -> None:
+    if len(sys.argv) != 8:
+        raise SystemExit(__doc__)
+    destination = Path(sys.argv[1])
+    files = demo_files(*(Path(arg) for arg in sys.argv[2:]))
     # Do not accidentally embed stale files from an earlier version of the demo.
     extras = {
         path.relative_to(destination).as_posix()
@@ -105,7 +116,7 @@ def main() -> None:
         path = destination / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(contents)
-    print(f"Web demo: {len(files)} files, {total:,} bytes (limit {LIMIT:,})")
+    print(f"Web demo: {len(files)} files, {sum(map(len, files.values())):,} bytes (limit {LIMIT:,})")
 
 
 if __name__ == "__main__":

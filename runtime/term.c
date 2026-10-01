@@ -97,7 +97,7 @@ static const unsigned char vga_rgb[16][3] = {
 static TermOutput output_sink;
 static void *output_opaque;
 static int truecolor, initialized, exit_registered, handlers_installed;
-static volatile sig_atomic_t active, kitty_enabled, resize_pending;
+static volatile sig_atomic_t active, kitty_enabled, resize_pending, door_mode;
 static struct termios saved_termios;
 static uint8_t erase_byte = 0x7f; /* what this tty's Backspace sends */
 static unsigned host_columns, host_rows;
@@ -154,6 +154,8 @@ static struct sigaction saved_fatal[NSIG], saved_winch;
 static sigset_t installed_fatal;
 static const char leave_modes[] =
     "\033[>4m\033[?1006l\033[?1003l\033>\033[0m\033[?25h\033[?7h\033[?1049l";
+static const char leave_door_modes[] =
+    "\033>\033[0m\033[?25h\033[?7h\033[?1049l";
 
 static int is_fatal_signal(int number)
 {
@@ -243,6 +245,12 @@ void term_set_truecolor(int enabled)
 {
     truecolor = !!enabled;
     term_invalidate();
+}
+
+void term_set_door(int enabled)
+{
+    if (!initialized)
+        door_mode = !!enabled;
 }
 
 void term_bell(void)
@@ -422,6 +430,8 @@ static void read_host_size(void)
  * Tests compare it with what a terminal emulator shows. */
 static void dump_screen(unsigned graphics_width)
 {
+    if (door_mode)
+        return; /* Even inherited diagnostic paths must not write to the host. */
     const char *path = getenv("VC_SCREEN_DUMP");
     if (!path)
         return;
@@ -452,6 +462,8 @@ static void dump_screen(unsigned graphics_width)
  * Returning to text preserves the last graphics frame for inspection. */
 static void dump_frame(unsigned width)
 {
+    if (door_mode)
+        return;
     const char *path = getenv("VC_FRAME_DUMP");
     if (!width || !path)
         return;
@@ -616,7 +628,10 @@ static void fatal_signal(int number)
     if (active) {
         if (kitty_enabled)
             signal_write("\033[<u", 4);
-        signal_write(leave_modes, sizeof(leave_modes) - 1);
+        if (door_mode)
+            signal_write(leave_door_modes, sizeof(leave_door_modes) - 1);
+        else
+            signal_write(leave_modes, sizeof(leave_modes) - 1);
         while (tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios) < 0 &&
                errno == EINTR) {}
         active = 0;
@@ -694,8 +709,11 @@ static void acquire_terminal(void)
      * Ask kitty-protocol terminals what they support, and ask xterm-style
      * ones for modifyOtherKeys. Either one tells Ctrl-[ from Esc, Ctrl-I
      * from Tab and Ctrl-M from Enter, which VC binds to different jobs. */
-    emit_string("\033[?1049h\033[?7l\033=\033[?1003h\033[?1006h\033[?25l\033[?u"
-                "\033[>4;2m");
+    if (door_mode)
+        emit_string("\033[?1049h\033[?7l\033=\033[?25l");
+    else
+        emit_string("\033[?1049h\033[?7l\033=\033[?1003h\033[?1006h\033[?25l\033[?u"
+                    "\033[>4;2m");
     term_invalidate();
     sigprocmask(SIG_SETMASK, &previous, NULL);
 }
@@ -733,7 +751,10 @@ void term_suspend(void)
         emit_string("\033[<u");
         kitty_enabled = 0;
     }
-    emit(leave_modes, sizeof(leave_modes) - 1);
+    if (door_mode)
+        emit(leave_door_modes, sizeof(leave_door_modes) - 1);
+    else
+        emit(leave_modes, sizeof(leave_modes) - 1);
     tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
     active = 0;
     term_reset_input();
@@ -1175,11 +1196,12 @@ static void control_sequence(const uint8_t *bytes, size_t n, int ss3,
     if (!parse_parameters(bytes + 2, n - 3, &p))
         return;
     if (!ss3 && p.prefix == '<') {
-        mouse_sequence(&p, final);
+        if (!door_mode)
+            mouse_sequence(&p, final);
         return;
     }
     if (!ss3 && p.prefix == '?' && final == 'u' && p.count) {
-        if (!kitty_enabled) {
+        if (!door_mode && !kitty_enabled) {
             /* Negotiate, do not blindly enable a protocol on older ttys. */
             sigset_t previous;
             block_lifecycle_signals(&previous);
@@ -1219,6 +1241,17 @@ static void control_sequence(const uint8_t *bytes, size_t n, int ss3,
     case 'H': queue_navigation(NAV_HOME, modifiers); break;
     case 'F': queue_navigation(NAV_END, modifiers); break;
     case 'E': queue_navigation(NAV_BEGIN, modifiers); break;
+    /* ANSI/PC terminal aliases (ansi/scoansi terminfo). Keep these door-only:
+     * ordinary runs retain their existing input interpretation. */
+    case 'G':
+        if (door_mode && !ss3) queue_navigation(NAV_PGDN, modifiers);
+        break;
+    case 'I':
+        if (door_mode && !ss3) queue_navigation(NAV_PGUP, modifiers);
+        break;
+    case 'L':
+        if (door_mode && !ss3) queue_navigation(NAV_INSERT, modifiers);
+        break;
     case 'P': case 'Q': case 'R': case 'S':
         queue_function(final - 'P' + 1, modifiers);
         break;

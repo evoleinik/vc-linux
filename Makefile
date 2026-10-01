@@ -11,6 +11,7 @@ JFLAGS  := -q -Zg -Zne -DOFFICIAL
 PY      := .venv/bin/python
 B       := build
 CC      ?= gcc
+ZIG     ?= $(B)/zig/zig
 CFLAGS  ?= -O1 -g -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable
 ASM     := $(wildcard asm/*.ASM asm/*.INC)
 FONT_HEADERS := $(wildcard third_party/font8x8/*.h)
@@ -149,6 +150,9 @@ RT_SRC := runtime/rt.c runtime/dos_core.c runtime/main.c runtime/cpu.c runtime/d
           runtime/cp866.c runtime/bios.c runtime/term.c runtime/modem.c runtime/modem_transport.c
 GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/vz.c $(B)/gen/kermit.c $(B)/gen/files.c
 GEN_OBJ := $(patsubst $(B)/gen/%.c,$(B)/obj/%.o,$(GEN_SRC))
+NATIVE_RT_SRC := $(RT_SRC) runtime/door.c runtime/door_confinement.c
+NATIVE_GEN_SRC := $(GEN_SRC) $(B)/gen/door_demo.c
+NATIVE_GEN_OBJ := $(GEN_OBJ) $(B)/obj/door_demo.o
 
 $(B)/gen/files.c: $(B)/VC.COM $(B)/VC.OVL $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/rogue/OWLIC.TXT third_party/rogue/LICENSE.TXT third_party/pdcurses/README.md $(B)/vz/VZ.COM $(VZ_DATA) data/VC.INI data/VC.EXT data/VCEDIT.EXT data/VC.HLP tools/embed.py Makefile
 
@@ -164,19 +168,39 @@ $(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h
 	$(CC) $(CFLAGS) -Iruntime -c $< -o $@
 
 $(B)/obj/files.o: runtime/rt.h
+$(B)/obj/door_demo.o: runtime/door_demo.h runtime/rt.h
 
-$(B)/vc: $(RT_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(GEN_OBJ)
-	$(CC) $(CFLAGS) -std=gnu11 -pthread -Iruntime -o $@ $(RT_SRC) $(GEN_OBJ)
+$(B)/vc: $(NATIVE_RT_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(NATIVE_GEN_OBJ)
+	$(CC) $(CFLAGS) -std=gnu11 -pthread -Iruntime -o $@ $(NATIVE_RT_SRC) $(NATIVE_GEN_OBJ)
 
 # Supplemental no-network pty gate. This is never a production fallback and
 # does not replace the required real TCP loopback test.
-$(B)/vc-pipe-modem: $(RT_SRC) tests/serial_pipe_transport.c $(wildcard runtime/*.h) $(FONT_HEADERS) $(GEN_OBJ)
-	$(CC) $(CFLAGS) -std=gnu11 -Iruntime -o $@ $(filter-out runtime/modem_transport.c,$(RT_SRC)) tests/serial_pipe_transport.c $(GEN_OBJ)
+$(B)/vc-pipe-modem: $(NATIVE_RT_SRC) tests/serial_pipe_transport.c $(wildcard runtime/*.h) $(FONT_HEADERS) $(NATIVE_GEN_OBJ)
+	$(CC) $(CFLAGS) -std=gnu11 -Iruntime -o $@ $(filter-out runtime/modem_transport.c,$(NATIVE_RT_SRC)) tests/serial_pipe_transport.c $(NATIVE_GEN_OBJ)
 
 # The release binary: static and stripped, so it runs on any x86-64 Linux.
-$(B)/vc-static: $(RT_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(GEN_OBJ)
-	$(CC) -O2 -static -std=gnu11 -pthread -Iruntime -o $@ $(RT_SRC) $(GEN_OBJ)
+$(B)/vc-static: $(NATIVE_RT_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(NATIVE_GEN_OBJ)
+	$(CC) -O2 -static -std=gnu11 -pthread -Iruntime -o $@ $(NATIVE_RT_SRC) $(NATIVE_GEN_OBJ)
 	strip $@
+
+# Zig 0.16.0 cross-compiles the same unedited translations and native runtime.
+# Keep target objects and caches separate from gcc and Emscripten artifacts.
+DOOR_CFLAGS ?= -O2 -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable
+DOOR_ZIG_ENV := ZIG_GLOBAL_CACHE_DIR=$(abspath $(B)/zig-cache/global) ZIG_LOCAL_CACHE_DIR=$(abspath $(B)/zig-cache/local)
+DOOR_CC = $(DOOR_ZIG_ENV) $(ZIG) cc -target aarch64-linux-musl -static
+DOOR_GEN_OBJ := $(patsubst $(B)/gen/%.c,$(B)/obj-door-aarch64/gen/%.o,$(NATIVE_GEN_SRC))
+DOOR_RT_OBJ := $(patsubst runtime/%.c,$(B)/obj-door-aarch64/runtime/%.o,$(NATIVE_RT_SRC))
+
+$(B)/obj-door-aarch64/gen/%.o: $(B)/gen/%.c $(wildcard runtime/*.h) Makefile
+	@mkdir -p $(dir $@)
+	$(DOOR_CC) $(DOOR_CFLAGS) -std=gnu11 -Iruntime -c $< -o $@
+
+$(B)/obj-door-aarch64/runtime/%.o: runtime/%.c $(wildcard runtime/*.h) $(FONT_HEADERS) Makefile
+	@mkdir -p $(dir $@)
+	$(DOOR_CC) $(DOOR_CFLAGS) -std=gnu11 -pthread -Iruntime -c $< -o $@
+
+$(B)/vc-door-aarch64: $(DOOR_GEN_OBJ) $(DOOR_RT_OBJ)
+	$(DOOR_CC) -pthread -s -o $@ $(DOOR_GEN_OBJ) $(DOOR_RT_OBJ)
 
 BASIC_GAME_FILES := $(addprefix $(B)/games/,$(shell $(PY) tools/basic_games.py --names))
 $(BASIC_GAME_FILES) &: tools/basic_games.py $(wildcard third_party/basic-computer-games/*/*.bas) third_party/basic-computer-games/LICENSE
@@ -197,11 +221,48 @@ test: test-translator test-fs test-exec test-machine test-process test-term test
 test: test-kermit-build test-modem test-serial-machine test-modem-transport
 test: test-modem-transport-unit
 test: test-embed
+test: test-door-packaging
 
 test-embed:
 	$(PY) -m pytest -q tests/test_embed.py
 
 .PHONY: test-embed
+
+test-door-packaging: $(B)/gen/door_demo.c
+	$(PY) -m pytest -q tests/test_door_packaging.py
+
+# The deep-tree case builds its tree through the real DOS rename, so the DOS
+# file layer is linked; the linker drops the unused DOS/terminal entry points.
+$(B)/test_door_cleanup: tests/test_door_cleanup.c runtime/door.c runtime/dos_fs.c runtime/cp866.c $(wildcard runtime/*.h)
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -std=gnu11 -ffunction-sections -fdata-sections -Wl,--gc-sections -Iruntime $< runtime/dos_fs.c runtime/cp866.c -o $@
+
+# Test-only native syscall hooks behind VC_DOOR_TEST_HOOKS. Never released.
+$(B)/vc-door-confinement-test: $(NATIVE_RT_SRC) tests/test_door_confinement_hook.c $(wildcard runtime/*.h) $(FONT_HEADERS) $(NATIVE_GEN_OBJ)
+	$(CC) $(CFLAGS) -std=gnu11 -pthread -DVC_DOOR_TEST_HOOKS -Iruntime -o $@ $(NATIVE_RT_SRC) tests/test_door_confinement_hook.c $(NATIVE_GEN_OBJ)
+
+# Production DOS, BIOS, loader and modem code under ASan and UBSan; any report
+# aborts. The program stubs are the only fakes (tests/test_door_memory.c).
+DOOR_MEMORY_SRC := runtime/dos_core.c runtime/dos_fs.c runtime/bios.c runtime/modem.c runtime/cpu.c runtime/cp866.c
+$(B)/test_door_memory_sanitize: tests/test_door_memory.c runtime/rt.c $(DOOR_MEMORY_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS)
+	@mkdir -p $(B)
+	$(CC) -std=gnu11 -O1 -g -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -U_FORTIFY_SOURCE -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -Iruntime tests/test_door_memory.c $(DOOR_MEMORY_SRC) -o $@
+
+test-door-memory: $(B)/test_door_memory_sanitize
+	for t in --loader --overlap --cycle --merge-wrap --fuzz; do \
+		ASAN_OPTIONS=halt_on_error=1:abort_on_error=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+		./$(B)/test_door_memory_sanitize $$t || exit 1; done
+
+test-door-confinement: $(B)/vc-door-confinement-test
+	$(PY) -m pytest -q tests/test_door_confinement.py
+
+test-door: $(B)/vc $(B)/test_door_cleanup
+	./$(B)/test_door_cleanup
+	$(PY) -m pytest -q tests/test_door_e2e.py
+
+test: test-door test-door-confinement test-door-memory
+
+.PHONY: test-door-packaging test-door test-door-confinement test-door-memory
 
 $(B)/test_modem: runtime/modem.c runtime/modem.h tests/test_modem.c tests/fixtures/enigma-connect-2026-10-02.bin
 	@mkdir -p $(B)
@@ -277,6 +338,13 @@ WEB_BINARIES := $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm $(WEB_MODULES)
 WEB_SIDE_FLAGS := $(WEB_OPT) -sSIDE_MODULE=2 -std=gnu11 -Iruntime
 WEB_DEMO_INPUT := web/README.TXT web/README-RU.TXT web/BOOTLOGO.TXT web/GAMES/SPIRAL.BAS README.md asm/VC.ASM asm/VCOVL.ASM asm/LICENSE.TXT tools/web_demo.py tools/vz_defaults.py $(BASIC_GAME_FILES) $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/rogue/OWLIC.TXT third_party/rogue/LICENSE.TXT third_party/pdcurses/README.md $(B)/vz/VZ.COM $(VZ_DATA) third_party/gwbasic/LICENSE third_party/bootlogo/LICENSE
 WEB_DEMO_INPUT += $(B)/kermit/KERMIT.EXE $(KERMIT_DATA)
+
+# Native packaging calls the very same generator and uses the browser inputs.
+# It never invokes emcc and never embeds a separately curated demo file list.
+$(B)/gen/door_demo.c: $(WEB_DEMO_INPUT) tools/door_demo.py tools/embed.py tools/vcini.py runtime/door_demo.h data/VC.INI $(B)/gen/VC.OVL.lst
+	@mkdir -p $(B)/gen
+	$(PY) tools/door_demo.py $@ $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/vz/VZ.COM $(B)/kermit/KERMIT.EXE
+
 WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT ПРОЧТИ.TXT HISTORY.TXT SRC/VC.ASM SRC/VCOVL.ASM SRC/LICENSE.TXT GWBASIC.EXE GWBASIC.TXT BOOTLOGO.COM BOOTLOGO.TXT LOGOLIC.TXT GAMES/SPIRAL.BAS GAMES/ROGUE.EXE GAMES/ROGUELIC.TXT GAMES/PDCLIC.TXT GAMES/OWLIC.TXT VZ.COM VZ.DEF $(VZ_DEF_NAMES) VZLIC.TXT) $(patsubst $(B)/games/%,$(WEB_DEMO)/GAMES/%,$(BASIC_GAME_FILES))
 WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,KERMIT.EXE BBS.TAK KERMIT.TXT KERMLIC.TXT)
 # main.c already installs these exact files from gen/files.c. Do not embed

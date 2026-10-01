@@ -3,6 +3,7 @@
  * stand-ins: file identity and command parsing do not need generated code. */
 #include "rt.h"
 #include "hle.h"
+#include "dos_fs.h"
 
 #include <assert.h>
 #include <dirent.h>
@@ -660,6 +661,160 @@ static void test_vz_temp_environment(void) {
     }
 }
 
+static void test_door_vz_quota_cleanup(void) {
+    char root[256];
+    snprintf(root, sizeof root, "%s/doorquota", fixture);
+    CHECK(mkdir(root, 0700) == 0);
+    CHECK(chdir(root) == 0);
+    host_file("VZ.COM", vz_file, sizeof vz_file);
+    /* The quota charges whole pages: VZ.COM's own pages plus exactly one. */
+    long system_page = sysconf(_SC_PAGESIZE);
+    const uint32_t page = system_page > 4096 ? (uint32_t)system_page : 4096;
+    const uint32_t quota = ((uint32_t)sizeof vz_file + page - 1) / page * page + page;
+    for (unsigned fault = 0; fault < 2; ++fault) {
+        dos_core_set_door(0);
+        fresh_machine();
+        CHECK(dos_fs_init_door(root, quota) == 0);
+        dos_core_set_door(1);
+        path_env("H:\\");
+        exec_file("H:\\VZ.COM", "");
+        CHECK(registered == &image_vz && !host_runs);
+        const char *temporary = child_environment("TMP");
+        CHECK(temporary && !strncmp(temporary, "H:\\v", 4));
+        char dos_swap[64], host_temp[4096];
+        snprintf(dos_swap, sizeof dos_swap, "%s\\VZTEMP.$$$", temporary);
+        guest_string(0x3200, temporary);
+        CHECK(!dos_fs_to_host(parent_psp, 0x3200, host_temp, sizeof host_temp));
+        guest_string(0x3300, dos_swap);
+        Cpu child = cpu;
+        cpu.a.x = 0x3c00; cpu.ds = parent_psp; cpu.d.x = 0x3300; cpu.c.x = 0;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        uint16_t handle = cpu.a.x;
+        cpu.a.x = 0x4200; cpu.b.x = handle; cpu.c.x = 0;
+        cpu.d.x = (uint16_t)(page - 1); /* one byte fills the last free page */
+        CHECK(dos_fs_int21() && !cpu.cf);
+        cpu.a.x = 0x4000; cpu.b.x = handle; cpu.c.x = 1; cpu.d.x = 0x3300;
+        CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == 1);
+        if (!fault) {
+            cpu.a.x = 0x3e00; cpu.b.x = handle;
+            CHECK(dos_fs_int21() && !cpu.cf);
+        } else {
+            /* A crashed VZ has not closed its swap handle or a duplicate. */
+            cpu.a.x = 0x4500; cpu.b.x = handle;
+            CHECK(dos_fs_int21() && !cpu.cf);
+        }
+        /* Runtime-owned cleanup must also remove a read-only abandoned swap. */
+        cpu.a.x = 0x4301; cpu.d.x = 0x3300; cpu.c.x = 1;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        cpu = child;
+        if (fault) {
+            CHECK(dos_abort_untranslated());
+            CHECK(hle_redirect && cpu.cs == parent_psp && cpu.ip == 0x2345);
+        } else end_child();
+        CHECK(access(host_temp, F_OK) != 0 && errno == ENOENT);
+        guest_string(0x3400, "H:\\AFTER.DAT");
+        cpu.a.x = 0x3c00; cpu.ds = parent_psp; cpu.d.x = 0x3400; cpu.c.x = 0;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        handle = cpu.a.x;
+        cpu.a.x = 0x4000; cpu.b.x = handle; cpu.c.x = 1; cpu.d.x = 0x3400;
+        CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == 1);
+        cpu.a.x = 0x3e00; cpu.b.x = handle;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        cpu.a.x = 0x4100; cpu.d.x = 0x3400;
+        CHECK(dos_fs_int21() && !cpu.cf);
+    }
+    dos_core_set_door(0);
+    dos_fs_init();
+    CHECK(unlink("VZ.COM") == 0);
+    CHECK(chdir(fixture) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
+static int door_try_entry(const char *path) {
+    Cpu saved = cpu;
+    guest_string(0x3400, path);
+    cpu.a.x = 0x3c00; cpu.ds = parent_psp; cpu.d.x = 0x3400; cpu.c.x = 0;
+    CHECK(dos_fs_int21());
+    int error = cpu.cf ? cpu.a.x : 0;
+    if (!error) {
+        cpu.b.x = cpu.a.x; cpu.a.x = 0x3e00;
+        CHECK(dos_fs_int21() && !cpu.cf);
+    }
+    cpu = saved;
+    return error;
+}
+
+static void door_delete_entry(const char *path) {
+    Cpu saved = cpu;
+    guest_string(0x3400, path);
+    cpu.a.x = 0x4100; cpu.ds = parent_psp; cpu.d.x = 0x3400;
+    CHECK(dos_fs_int21() && !cpu.cf);
+    cpu = saved;
+}
+
+static void door_vz_entry_case(int full) {
+    char root[256], file[64];
+    snprintf(root, sizeof root, "%s/doorentries", fixture);
+    CHECK(mkdir(root, 0700) == 0 && chdir(root) == 0);
+    host_file("VZ.COM", vz_file, sizeof vz_file);
+    CHECK(mkdir("ENTRIES", 0700) == 0);
+    const unsigned seeded = DOS_DOOR_ENTRY_LIMIT - (full ? 2 : 3);
+    for (unsigned i = 0; i < seeded; ++i) {
+        snprintf(file, sizeof file, "ENTRIES/F%04u", i);
+        host_file(file, (const uint8_t *)"", 0);
+    }
+    dos_core_set_door(0);
+    fresh_machine();
+    CHECK(dos_fs_init_door(root, UINT64_C(8) * 1024 * 1024) == 0);
+    dos_core_set_door(1);
+    path_env("H:\\");
+    int bypass = 0;
+    if (full) {
+        /* VZ needs one new private directory even before it creates a swap
+         * file. This EXEC must fail with disk full at exactly 4096 entries. */
+        exec_file("H:\\VZ.COM", "");
+        bypass = hle_redirect || registered || !cpu.cf || cpu.a.x != 39;
+        if (hle_redirect && registered == &image_vz) end_child();
+    } else {
+        for (unsigned i = 0; i < 4; ++i) {
+            hle_redirect = 0; registered = NULL;
+            exec_file("H:\\VZ.COM", "");
+            CHECK(registered == &image_vz && hle_redirect && !host_runs);
+            const char *temporary = child_environment("TMP");
+            CHECK(temporary && !strncmp(temporary, "H:\\v", 4));
+            char host_temp[4096];
+            guest_string(0x3200, temporary);
+            CHECK(!dos_fs_to_host(parent_psp, 0x3200, host_temp, sizeof host_temp));
+            struct stat st;
+            CHECK(!stat(host_temp, &st) && (st.st_mode & 0777) == 0700);
+            int error = door_try_entry("H:\\DURING");
+            if (error != 39) ++bypass;
+            if (!error) door_delete_entry("H:\\DURING");
+            end_child();
+            CHECK(access(host_temp, F_OK) < 0 && errno == ENOENT);
+            CHECK(door_try_entry("H:\\AFTER") == 0);
+            error = door_try_entry("H:\\ONE_MORE");
+            if (error != 39) ++bypass;
+            if (!error) door_delete_entry("H:\\ONE_MORE");
+            door_delete_entry("H:\\AFTER");
+        }
+    }
+    dos_core_set_door(0);
+    dos_fs_init();
+    for (unsigned i = 0; i < seeded; ++i) {
+        snprintf(file, sizeof file, "ENTRIES/F%04u", i);
+        CHECK(unlink(file) == 0);
+    }
+    CHECK(rmdir("ENTRIES") == 0 && unlink("VZ.COM") == 0);
+    CHECK(chdir(fixture) == 0 && rmdir(root) == 0);
+    printf("door VZ entry quota: %s: %s\n", full ? "full-cap EXEC" : "repeated EXEC/terminate accounting",
+           bypass ? "FAILED" : "passed");
+    CHECK(!bypass);
+}
+
+static void test_door_vz_entry_cap(void) { door_vz_entry_case(1); }
+static void test_door_vz_entry_reclaim(void) { door_vz_entry_case(0); }
+
 static unsigned open_descriptor_count(void) {
     DIR *dir = opendir("/proc/self/fd");
     CHECK(dir != NULL);
@@ -993,6 +1148,9 @@ int main(int argc, char **argv) {
         {"vz-command-limits", test_vz_command_file_limits},
         {"vz-wildcard-paths", test_vz_wildcard_paths},
         {"vz-temp", test_vz_temp_environment},
+        {"door-vz-quota", test_door_vz_quota_cleanup},
+        {"door-vz-entry-cap", test_door_vz_entry_cap},
+        {"door-vz-entry-reclaim", test_door_vz_entry_reclaim},
         {"vz-capture-failure", test_vz_process_capture_failure},
         {"vz-resident-temp", test_vz_resident_temp},
         {"vz-resident-leases", test_vz_resident_leases},

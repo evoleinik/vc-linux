@@ -22,8 +22,10 @@ EM_JS(void, browser_exit, (int status), {
     if (Module['vcExit']) Module['vcExit'](status);
 });
 #else
+#include "door.h"
 static void usage(void) {
     fputs("usage: vc [DIRECTORY]\n"
+          "       vc --door [--door-minutes N] [--door-run PROGRAM]\n"
           "Volkov Commander 4.99.09, translated from 8086 assembly to native code.\n"
           "Settings live in $XDG_CONFIG_HOME/vc-linux (default ~/.config/vc-linux).\n"
           "A log is written to $VC_LOG (default ~/.cache/vc-linux/vc.log).\n", stdout);
@@ -241,6 +243,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 #else
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--door")) return door_main(argc, argv);
+    for (int i = 1; i < argc; ++i)
+        if (!strncmp(argv[i], "--door-", 7)) { usage(); return 2; }
     if (argc > 2 || (argc == 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")))) {
         usage();
         return argc > 2 ? 2 : 0;

@@ -27,6 +27,9 @@ typedef struct ModemTransport {
  * tick never sleeps or delivers a CPU interrupt, including when called from
  * a translated port-poll loop. now_ns must be monotonic; equal times are OK. */
 void modem_init(const ModemTransport *transport);
+/* Empty the phone book for a BBS door, regardless of host endpoint variables.
+ * Device reset cannot re-enable it. Defaults off for normal native/web runs. */
+void modem_set_door(int enabled);
 void modem_reset(void);
 void modem_tick(uint64_t now_ns);
 uint8_t modem_port_in(uint16_t port); /* Full addresses 03F8h..03FFh. */

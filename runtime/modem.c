@@ -37,6 +37,9 @@ typedef struct Phone {
 static const Phone phone_book[] = {
     {"5551992", "VC_MODEM_555_1992", "wss://axis.tail85247.ts.net:8443/"},
 };
+static int door_mode;
+
+void modem_set_door(int enabled) { door_mode = !!enabled; }
 
 static struct {
     ModemTransport host;
@@ -202,7 +205,7 @@ static void dial(const char *number) {
     }
     digits[count] = 0;
     const Phone *phone = NULL;
-    for (size_t i = 0; i < sizeof phone_book / sizeof *phone_book; ++i)
+    for (size_t i = 0; !door_mode && i < sizeof phone_book / sizeof *phone_book; ++i)
         if (!strcmp(phone_book[i].number, digits)) phone = phone_book + i;
     if (!phone || !m.host.dial || !m.host.status) { answer(NO_ANSWER); return; }
     m.remote_eof = 0;

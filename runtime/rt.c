@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "bios.h"
+#include "guest_mem.h"
 #include "hle.h"
 #include "modem.h"
 #include "rt.h"
@@ -33,8 +34,15 @@ int rt_halted;
 /* ---- logging and faults -------------------------------------------------- */
 
 static FILE *logf;
+static int logging_enabled = 1;
+
+void rt_set_logging(int enabled) {
+    logging_enabled = !!enabled;
+    if (!logging_enabled && logf) { fclose(logf); logf = NULL; }
+}
 
 static FILE *log_open(void) {
+    if (!logging_enabled) return NULL;
     if (logf) return logf;
     const char *p = getenv("VC_LOG");
     char path[512];
@@ -213,7 +221,7 @@ RtProcessState *rt_save_process_state(const Image *parent) {
     if (!state) return NULL;
     state->parent_image = parent ? save_known_image(parent) : NULL;
     if (parent && !state->parent_image) { free(state); return NULL; }
-    memcpy(state->vectors, mem, sizeof state->vectors);
+    (void)guest_read(state->vectors, 0, sizeof state->vectors); /* constant range */
     memcpy(state->pit, pit, sizeof pit);
     state->speaker_control = speaker_control;
     state->pic_mask = pic_mask;
@@ -226,7 +234,7 @@ RtProcessState *rt_save_process_state(const Image *parent) {
 void rt_finish_process_state(RtProcessState *state, int restore) {
     if (!state) return;
     if (restore) {
-        memcpy(mem, state->vectors, sizeof state->vectors);
+        (void)guest_write(0, state->vectors, sizeof state->vectors); /* constant range */
         memcpy(pit, state->pit, sizeof pit);
         speaker_control = state->speaker_control;
         pic_mask = state->pic_mask;
@@ -477,7 +485,8 @@ void rt_register_image(const Image *img, uint16_t loadseg) {
         if (nknown == MAX_KNOWN) rt_fault("too many images");
         k = &known[nknown++];
         k->img = img;
-        k->snap = malloc(img->size);
+        k->snap = malloc(img->size ? img->size : 1);
+        if (!k->snap) rt_fault("out of memory registering %s", img->name);
     }
     k->loadseg = loadseg;
     k->base = base;
@@ -489,7 +498,8 @@ void rt_register_image(const Image *img, uint16_t loadseg) {
     known[nknown - 1] = t;
     k = &known[nknown - 1];
     nmoved_reset();
-    memcpy(k->snap, &mem[base], img->size);
+    /* The loader has already proved this range; never read past guest RAM. */
+    if (guest_read(k->snap, base, img->size)) rt_fault("%s loaded outside guest memory", img->name);
     rt_log("loaded %s at %04X (linear %05X, %u bytes)", img->name, loadseg, base, img->size);
 }
 
@@ -535,13 +545,14 @@ static void restore_known_image(Known *saved) {
 }
 
 static int code_matches(const Known *k, uint32_t off, uint32_t L, uint32_t n) {
-    if (off + n > k->img->size || L + n > MEM_SIZE) return 0;
-    if (!memcmp(&mem[L], &k->snap[off], n)) return 1;
+    const uint8_t *code = guest_span(L, n);
+    if (off + n > k->img->size || !code) return 0;
+    if (!memcmp(code, &k->snap[off], n)) return 1;
     /* Ignore only declared mutable bytes, never a whole image. Emitted code
      * reads patched operands from guest memory; VZ's source-proved two-byte
      * opcode slot additionally checks its finite variants before executing. */
     for (uint32_t j = 0; j < n; ++j) {
-        if (mem[L + j] == k->snap[off + j]) continue;
+        if (code[j] == k->snap[off + j]) continue;
         uint32_t low = 0, high = k->img->nmutable;
         while (low < high) {
             uint32_t middle = low + (high - low) / 2;

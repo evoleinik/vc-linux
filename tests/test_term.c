@@ -100,6 +100,7 @@ static void reset(void)
     term_set_output(capture, NULL);
     term_set_truecolor(0);
     term_reset_input();
+    term_set_door(0);
     term_invalidate();
     clear_output();
 }
@@ -433,6 +434,91 @@ static void test_navigation_keys(void)
     }
     expect_sequence("Home tilde 7 alias", "\033[7~", 0x47e0);
     expect_sequence("End tilde 8 alias", "\033[8~", 0x4fe0);
+}
+
+static void check_classic_output(void)
+{
+    CHECK(strstr(output, "\033[?u") == NULL,
+          "door never queries kitty keyboard support");
+    CHECK(strstr(output, "\033[>11u") == NULL && strstr(output, "\033[<u") == NULL,
+          "door never enables or resets kitty keyboard mode");
+    CHECK(strstr(output, "\033[>4") == NULL,
+          "door never requests or resets modifyOtherKeys");
+    CHECK(strstr(output, "\033[?100") == NULL,
+          "door never requests or resets mouse tracking");
+}
+
+static void test_door_classic_keys(void)
+{
+    static const unsigned tilde[] = {11,12,13,14,15,17,18,19,20,21,23,24};
+    static const unsigned modifiers[] = {1,2,5,3};
+    static const unsigned scans[4][12] = {
+        {0x3b,0x3c,0x3d,0x3e,0x3f,0x40,0x41,0x42,0x43,0x44,0x85,0x86},
+        {0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x5b,0x5c,0x5d,0x87,0x88},
+        {0x5e,0x5f,0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x89,0x8a},
+        {0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f,0x70,0x71,0x8b,0x8c},
+    };
+    reset();
+    term_set_door(1);
+    for (unsigned key = 0; key < 12; ++key) {
+        char sequence[32];
+        (void)snprintf(sequence, sizeof(sequence), "\033[%u~", tilde[key]);
+        expect_sequence("door F1-F12 classic VT", sequence, scans[0][key] << 8);
+        for (unsigned mod = 0; mod < 4; ++mod) {
+            (void)snprintf(sequence, sizeof(sequence), "\033[%u;%u~",
+                           tilde[key], modifiers[mod]);
+            expect_sequence("door VT function key with modifier", sequence,
+                            scans[mod][key] << 8);
+            if (key < 4) {
+                (void)snprintf(sequence, sizeof(sequence), "\033[1;%u%c",
+                               modifiers[mod], 'P' + (int)key);
+                expect_sequence("door CSI function key with modifier", sequence,
+                                scans[mod][key] << 8);
+                sequence[1] = 'O';
+                expect_sequence("door SS3 function key with modifier", sequence,
+                                scans[mod][key] << 8);
+            }
+        }
+        if (key < 4) {
+            (void)snprintf(sequence, sizeof(sequence), "\033O%c", 'P' + (int)key);
+            expect_sequence("door F1-F4 SS3", sequence, scans[0][key] << 8);
+        }
+        if (key < 5) {
+            (void)snprintf(sequence, sizeof(sequence), "\033[[%c", 'A' + (int)key);
+            expect_sequence("door F1-F5 Linux console", sequence, scans[0][key] << 8);
+        }
+    }
+    static const struct {
+        const char *sequence;
+        unsigned expected;
+    } navigation[] = {
+        {"\033[A",0x48e0}, {"\033[B",0x50e0}, {"\033[C",0x4de0}, {"\033[D",0x4be0},
+        {"\033OA",0x48e0}, {"\033OB",0x50e0}, {"\033OC",0x4de0}, {"\033OD",0x4be0},
+        {"\033[H",0x47e0}, {"\033[F",0x4fe0}, {"\033OH",0x47e0}, {"\033OF",0x4fe0},
+        {"\033[1~",0x47e0}, {"\033[4~",0x4fe0}, {"\033[7~",0x47e0}, {"\033[8~",0x4fe0},
+        {"\033[5~",0x49e0}, {"\033[6~",0x51e0}, {"\033[2~",0x52e0}, {"\033[3~",0x53e0},
+        {"\033[I",0x49e0}, {"\033[G",0x51e0}, {"\033[L",0x52e0}, {"\033[Z",0x0f00},
+        {"\033[1;5A",0x8de0}, {"\033[1;5B",0x91e0},
+        {"\033[1;5C",0x74e0}, {"\033[1;5D",0x73e0},
+        {"\033[1;5H",0x77e0}, {"\033[1;5F",0x75e0},
+        {"\033[5;5~",0x84e0}, {"\033[6;5~",0x76e0},
+        {"\033[2;5~",0x92e0}, {"\033[3;5~",0x93e0},
+        {"\033\033[A",0x9800}, {"\033\033[B",0xa000},
+        {"\033\033[C",0x9d00}, {"\033\033[D",0x9b00},
+    };
+    for (unsigned i = 0; i < sizeof(navigation) / sizeof(navigation[0]); ++i)
+        expect_sequence("door classic navigation", navigation[i].sequence,
+                        navigation[i].expected);
+    clear_input();
+    feed("\033[?1u\033[?0u\033[<0;10;12M", 100);
+    check_number(pop_raw(), 0x10000, "unsolicited protocol replies are not keys");
+    mouse(3, 0, 0, 0);
+    check_number(cpu.b.x, 0, "door ignores unrequested mouse reports");
+    check_classic_output();
+    term_set_door(0);
+    clear_input();
+    feed("\033[I\033[G\033[L", 200);
+    check_number(pop_raw(), 0x10000, "normal mode keeps its existing ANSI alias behavior");
 }
 
 static void test_kitty_keypad_navigation(void)
@@ -1363,6 +1449,42 @@ static void test_renderer_graphics_dumps(void)
     rmdir(directory);
 }
 
+static void test_door_no_host_dumps(void)
+{
+    char directory[] = "/tmp/vc-door-dump-XXXXXX", frame[128], screen[128], temporary[132];
+    char *created = mkdtemp(directory);
+    CHECK(created != NULL, "create isolated forbidden door dump targets");
+    if (!created)
+        return;
+    reset();
+    term_set_door(1);
+    snprintf(frame, sizeof(frame), "%s/frame.pgm", directory);
+    snprintf(screen, sizeof(screen), "%s/screen.txt", directory);
+    CHECK(setenv("VC_FRAME_DUMP", frame, 1) == 0, "set forbidden door frame path");
+    CHECK(setenv("VC_SCREEN_DUMP", screen, 1) == 0, "set forbidden door screen path");
+    for (unsigned mode = 3; mode <= 4; ++mode) {
+        video(mode, 0, 0, 0);
+        term_render();
+        CHECK(access(frame, F_OK) != 0 && errno == ENOENT,
+              "door must not create a host graphics dump");
+        CHECK(access(screen, F_OK) != 0 && errno == ENOENT,
+              "door must not create a host text dump");
+        snprintf(temporary, sizeof(temporary), "%s.tmp", frame);
+        CHECK(access(temporary, F_OK) != 0 && errno == ENOENT,
+              "door must not create a temporary host graphics dump");
+        snprintf(temporary, sizeof(temporary), "%s.tmp", screen);
+        CHECK(access(temporary, F_OK) != 0 && errno == ENOENT,
+              "door must not create a temporary host text dump");
+        clear_output();
+    }
+    unsetenv("VC_FRAME_DUMP");
+    unsetenv("VC_SCREEN_DUMP");
+    term_set_door(0);
+    unlink(frame);
+    unlink(screen);
+    rmdir(directory);
+}
+
 /* A click delivered in one read (press then release) must still show the
  * button down to one function 03h poll, then up. */
 /* A press stays reported down for a minimum click time; wait it out. */
@@ -1851,7 +1973,7 @@ static void on_test_usr1(int number)
     usr1_seen = 1;
 }
 
-static void pty_child(int commands, int responses)
+static void pty_child(int commands, int responses, int door)
 {
     uint8_t acknowledgement = 'I';
     /* Fatal-signal tests must not leave core files in the workspace. */
@@ -1869,6 +1991,7 @@ static void pty_child(int commands, int responses)
         _exit(122);
     reset();
     term_set_output(NULL, NULL);
+    term_set_door(door);
     put_word(cell(0,0), 0x0750);
     term_init();
     if (!write_bytes(responses, &acknowledgement, 1))
@@ -1961,7 +2084,7 @@ static void pty_child(int commands, int responses)
     }
 }
 
-static int pty_open(PtyCase *terminal)
+static int pty_open_mode(PtyCase *terminal, int door)
 {
     int commands[2] = {-1,-1}, responses[2] = {-1,-1};
     *terminal = (PtyCase){.master=-1,.slave=-1,.command=-1,.response=-1,.child=-1};
@@ -2014,7 +2137,7 @@ static int pty_open(PtyCase *terminal)
             _exit(118);
         if (terminal->slave > STDERR_FILENO)
             (void)close(terminal->slave);
-        pty_child(commands[0], responses[1]);
+        pty_child(commands[0], responses[1], door);
         _exit(119);
     }
     close_descriptor(&commands[0]);
@@ -2033,6 +2156,11 @@ failure:
     close_descriptor(&responses[1]);
     pty_dispose(terminal);
     return 0;
+}
+
+static int pty_open(PtyCase *terminal)
+{
+    return pty_open_mode(terminal, 0);
 }
 
 static int pty_exit(PtyCase *terminal, int *status)
@@ -2283,6 +2411,82 @@ done:
     pty_dispose(&terminal);
 }
 
+static void test_pty_door_terminal(void)
+{
+    PtyCase terminal;
+    int status;
+    reset();
+    if (!pty_open_mode(&terminal, 1))
+        return;
+    check_raw(&terminal);
+    CHECK(strstr(output, "\033[?1049h") != NULL, "door enters alternate screen");
+    check_classic_output();
+    clear_output();
+    if (!pty_input(&terminal, "\033[?1u\033[?0u"))
+        goto done;
+    check_classic_output();
+    static const struct {
+        const char *sequence;
+        unsigned expected;
+    } keys[] = {
+        {"\033OP",0x3b00}, {"\033OQ",0x3c00}, {"\033OR",0x3d00}, {"\033OS",0x3e00},
+        {"\033[15~",0x3f00}, {"\033[17~",0x4000}, {"\033[18~",0x4100}, {"\033[19~",0x4200},
+        {"\033[20~",0x4300}, {"\033[21~",0x4400}, {"\033[23~",0x8500}, {"\033[24~",0x8600},
+        {"\033[A",0x48e0}, {"\033[B",0x50e0}, {"\033[C",0x4de0}, {"\033[D",0x4be0},
+        {"\033OA",0x48e0}, {"\033OB",0x50e0}, {"\033OC",0x4de0}, {"\033OD",0x4be0},
+        {"\033[H",0x47e0}, {"\033[F",0x4fe0}, {"\033[5~",0x49e0}, {"\033[6~",0x51e0},
+        {"\033[2~",0x52e0}, {"\033[3~",0x53e0}, {"\033[I",0x49e0}, {"\033[G",0x51e0},
+        {"\033[L",0x52e0}, {"\033[20;2~",0x5c00}, {"\033[1;5D",0x73e0},
+    };
+    for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i)
+        if (!pty_blocking_key(&terminal, 'H', keys[i].sequence, keys[i].expected,
+                              "door classic sequence crosses real PTY and BIOS"))
+            goto done;
+    clear_output();
+    if (!pty_command(&terminal, 'S'))
+        goto done;
+    check_restored(&terminal);
+    check_classic_output();
+    clear_output();
+    if (!pty_command(&terminal, 'U'))
+        goto done;
+    check_raw(&terminal);
+    check_classic_output();
+    clear_output();
+    if (pty_command(&terminal, 'X') && pty_exit(&terminal, &status)) {
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "door terminal exits cleanly");
+        check_restored(&terminal);
+        CHECK(strstr(output, "\033[?1049l") != NULL, "door restores alternate screen");
+        check_classic_output();
+    }
+done:
+    pty_dispose(&terminal);
+}
+
+static void test_pty_door_hangup(void)
+{
+    PtyCase terminal;
+    int status;
+    reset();
+    if (!pty_open_mode(&terminal, 1))
+        return;
+    clear_output();
+    if (kill(terminal.child, SIGHUP) != 0) {
+        CHECK(0, "sending door hangup failed");
+        goto done;
+    }
+    if (pty_exit(&terminal, &status)) {
+        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGHUP,
+              "door hangup preserves signal termination");
+        check_restored(&terminal);
+        CHECK(strstr(output, "\033[?1049l") != NULL, "door hangup restores alternate screen");
+        check_classic_output();
+    }
+done:
+    pty_dispose(&terminal);
+}
+
 static void test_pty_signal_handlers(void)
 {
     PtyCase terminal;
@@ -2380,6 +2584,7 @@ int main(void)
     RUN(test_ctrl_break);
     RUN(test_function_keys);
     RUN(test_navigation_keys);
+    RUN(test_door_classic_keys);
     RUN(test_kitty_keypad_navigation);
     RUN(test_utf8_keys);
     RUN(test_streaming_and_escape);
@@ -2400,6 +2605,7 @@ int main(void)
     RUN(test_renderer_graphics_cache_sources);
     RUN(test_renderer_graphics_cache_repaint);
     RUN(test_renderer_graphics_dumps);
+    RUN(test_door_no_host_dumps);
     RUN(test_mouse_quick_click);
     RUN(test_mouse);
     RUN(test_sgr_mouse_input);
@@ -2410,6 +2616,8 @@ int main(void)
     RUN(test_pty_lifecycle);
     RUN(test_pty_atexit);
     RUN(test_pty_blocking_keyboard);
+    RUN(test_pty_door_terminal);
+    RUN(test_pty_door_hangup);
     RUN(test_pty_signal_handlers);
     RUN(test_pty_fatal_signals);
     term_set_output(NULL, NULL);

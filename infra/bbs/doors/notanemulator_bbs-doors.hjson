@@ -1,0 +1,29 @@
+// Merge these entries into the existing menu map; do not replace the board's
+// whole menu file. DOOR is the verified example's type; VC ignores its path.
+doorVolkovCommander: {
+    desc: Volkov Commander
+    module: abracadabra
+    config: {
+        name: Volkov Commander
+        dropFileType: DOOR
+        cmd: /enigma-bbs/mods/vc-door/run-door.sh
+        args: [ "{dropFilePath}", "{node}", "vc" ]
+        nodeMax: 4
+        tooManyArt: DOORMANY
+        io: stdio
+    }
+}
+
+doorRogue: {
+    desc: Rogue
+    module: abracadabra
+    config: {
+        name: Rogue
+        dropFileType: DOOR
+        cmd: /enigma-bbs/mods/vc-door/run-door.sh
+        args: [ "{dropFilePath}", "{node}", "rogue" ]
+        nodeMax: 4
+        tooManyArt: DOORMANY
+        io: stdio
+    }
+}

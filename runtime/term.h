@@ -10,6 +10,9 @@
 typedef void (*TermOutput)(const char *data, size_t n, void *opaque);
 void term_set_output(TermOutput output, void *opaque);
 void term_set_truecolor(int enabled);
+/* Select classic BBS terminal I/O before term_init; normal mode is default.
+ * Does not negotiate extended keyboard protocols or mouse tracking. */
+void term_set_door(int enabled);
 void term_invalidate(void);
 void term_bell(void);
 /* Test hook: total complete CGA pixel/braille decodes, independent of timing. */

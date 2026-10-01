@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L /* clock_gettime */
 #include "bios.h"
 #include "cpu.h"
+#include "guest_mem.h"
 #include "hle.h"
 #include "term.h"
 
@@ -218,9 +219,13 @@ static size_t screen_cell(unsigned column, unsigned row)
 
 static void fill_cells(size_t first, size_t count, uint8_t attribute)
 {
+    uint8_t *cells = first < MEM_SIZE && count <= MEM_SIZE / 2 ?
+                     guest_span((uint32_t)first, 2 * count) : NULL;
+    if (!cells)
+        return;
     for (size_t i = 0; i < count; ++i) {
-        mem[first + 2 * i] = ' ';
-        mem[first + 2 * i + 1] = attribute;
+        cells[2 * i] = ' ';
+        cells[2 * i + 1] = attribute;
     }
 }
 
@@ -276,7 +281,7 @@ static void mode_graphics(unsigned mode, int preserve_screen)
     mem[0x487] = (uint8_t)(0x60 | (preserve_screen ? 0x80 : 0));
     blink_enabled = 0;
     if (!preserve_screen)
-        memset(mem + SCREEN, 0, CGA_BYTES);
+        (void)guest_fill(SCREEN, 0, CGA_BYTES); /* constant range */
     term_invalidate();
 }
 
@@ -306,7 +311,7 @@ void bios_init(void)
     bda_set_word(0x1c, KEY_START);
     bda_set_word(0x80, KEY_START);
     bda_set_word(0x82, KEY_END);
-    memset(mem + 0x400 + KEY_START, 0, KEY_END - KEY_START);
+    (void)guest_fill(0x400 + KEY_START, 0, KEY_END - KEY_START); /* constant range */
     console_scan_pending = 0;
     console_scan = 0;
     break_pending = 0;
@@ -520,32 +525,40 @@ static void scroll_window(int down, unsigned count, uint8_t attribute,
         uint8_t fill = bios_graphics_width() == 640 ?
                        ((attribute & 1) ? 0xff : 0) : (attribute & 3) * 0x55;
         /* Copy whole scanlines in direction order, keeping the two physical
-         * banks interlaced. Both ends are aligned to 8-pixel character cells. */
+         * banks interlaced. Both ends are aligned to 8-pixel character cells.
+         * The guest owns the BDA rows/columns these bounds come from, so
+         * each copy is checked; a failing one ends the scroll. */
         if (down) {
             for (unsigned y = limit; y-- > first + shift;)
-                memmove(mem + cga_address(left * 8, y),
-                        mem + cga_address(left * 8, y - shift), bytes);
+                if (guest_move((uint32_t)cga_address(left * 8, y),
+                               (uint32_t)cga_address(left * 8, y - shift), bytes))
+                    return;
             for (unsigned y = first; y < first + shift; ++y)
-                memset(mem + cga_address(left * 8, y), fill, bytes);
+                if (guest_fill((uint32_t)cga_address(left * 8, y), fill, bytes))
+                    return;
         } else {
             for (unsigned y = first; y + shift < limit; ++y)
-                memmove(mem + cga_address(left * 8, y),
-                        mem + cga_address(left * 8, y + shift), bytes);
+                if (guest_move((uint32_t)cga_address(left * 8, y),
+                               (uint32_t)cga_address(left * 8, y + shift), bytes))
+                    return;
             for (unsigned y = limit - shift; y < limit; ++y)
-                memset(mem + cga_address(left * 8, y), fill, bytes);
+                if (guest_fill((uint32_t)cga_address(left * 8, y), fill, bytes))
+                    return;
         }
         return;
     }
     if (down) {
         for (unsigned row = bottom + 1; row-- > top + count;)
-            memmove(mem + screen_cell(left, row),
-                    mem + screen_cell(left, row - count), width * 2);
+            if (guest_move((uint32_t)screen_cell(left, row),
+                           (uint32_t)screen_cell(left, row - count), width * 2))
+                return;
         for (unsigned row = top; row < top + count; ++row)
             fill_cells(screen_cell(left, row), width, attribute);
     } else {
         for (unsigned row = top; row + count <= bottom; ++row)
-            memmove(mem + screen_cell(left, row),
-                    mem + screen_cell(left, row + count), width * 2);
+            if (guest_move((uint32_t)screen_cell(left, row),
+                           (uint32_t)screen_cell(left, row + count), width * 2))
+                return;
         for (unsigned row = bottom + 1 - count; row <= bottom; ++row)
             fill_cells(screen_cell(left, row), width, attribute);
     }

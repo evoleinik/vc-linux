@@ -32,6 +32,9 @@ spec:
     metadata:
       labels: {app: enigma}
     spec:
+      # pause becomes PID 1 and reaps each door's janitor, which outlives its
+      # worker by design. ENiGMA's pm2-runtime does not reap adopted orphans.
+      shareProcessNamespace: true
       containers:
         - name: enigma
           image: enigmabbs/enigma-bbs@sha256:e754957e26879db247d3e3d32f826d23fa9607ed85e3a87f252b0aea6ccaa13d
@@ -39,8 +42,8 @@ spec:
             - {name: telnet, containerPort: 8888}
             - {name: ws, containerPort: 8810}
           resources:
-            requests: {cpu: 50m, memory: 128Mi}
-            limits: {memory: 768Mi}
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: 2, memory: 1Gi}
           volumeMounts: &mounts
             - {name: data, mountPath: /enigma-bbs/config, subPath: config}
             - {name: data, mountPath: /enigma-bbs/mods, subPath: mods}
@@ -48,9 +51,14 @@ spec:
             - {name: data, mountPath: /enigma-bbs/db, subPath: db}
             - {name: data, mountPath: /enigma-bbs/filebase, subPath: filebase}
             - {name: data, mountPath: /enigma-bbs/logs, subPath: logs}
+            - {name: door-sessions, mountPath: /run/vc-doors}
       volumes:
         - name: data
           persistentVolumeClaim: {claimName: enigma-data}
+        - name: door-sessions
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
 ---
 apiVersion: v1
 kind: Service
