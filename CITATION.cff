@@ -10,6 +10,7 @@ type: software
 authors:
   - family-names: Oleynik
     given-names: Evgeny
+doi: 10.5281/zenodo.23085585
 repository-code: "https://github.com/evoleinik/vc-linux"
 url: "https://notanemulator.com/"
 license: BSD-2-Clause

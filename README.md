@@ -2,6 +2,7 @@
 
 [![ci](https://github.com/evoleinik/vc-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/evoleinik/vc-linux/actions/workflows/ci.yml)
 [![license: BSD-2](https://img.shields.io/badge/license-BSD--2-blue)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23085585.svg)](https://doi.org/10.5281/zenodo.23085585)
 
 **Preserving DOS software as source, not as an emulator image.**
 
@@ -286,6 +287,14 @@ VC 4 fits in one COM file under 64 KB. It added keys that later file managers co
 Ctrl-] put a panel's path on the command line. Ctrl-I puts the selected names there. Nikolai
 Bezroukov, who ran Softpanorama, tells the story in
 [Volkov Commander: a masterpiece of assembler programming](https://softpanorama.org/OFM/Paradigm/Ch03/volkov_commander.shtml).
+
+## Citing and archives
+
+Each release is archived on Zenodo. The DOI
+[10.5281/zenodo.23085585](https://doi.org/10.5281/zenodo.23085585) always resolves to the latest
+release. `CITATION.cff` gives the full citation, and GitHub's "Cite this repository" button reads
+it. Software Heritage also keeps the full git history, at
+[archive.softwareheritage.org](https://archive.softwareheritage.org/browse/origin/?origin_url=https://github.com/evoleinik/vc-linux).
 
 ## Credits and license
 
