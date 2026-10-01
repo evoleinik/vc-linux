@@ -18,7 +18,7 @@ keywords:
   - static recompilation
   - binary translation
   - DOS
-  - 8086
+  - "8086"
   - Volkov Commander
   - WebAssembly
 references:
