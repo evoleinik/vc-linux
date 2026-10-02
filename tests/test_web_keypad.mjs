@@ -6,6 +6,14 @@ import { join } from 'node:path';
 const output = process.argv[2] || 'build/web';
 const page = await readFile(join(output, 'index.html'), 'utf8');
 assert.match(page, /id="keypad"[^>]*hidden/, 'the portrait keypad starts hidden');
+const keypadMarkup = page.match(/<div\b[^>]*id="keypad"[^>]*>(.*?)<\/div>/s)?.[1];
+assert.ok(keypadMarkup, 'inspect the real keypad markup');
+const keypadButtons = [...keypadMarkup.matchAll(/<button\b([^>]*)>(.*?)<\/button>/gs)]
+  .map(([, attributes, label]) => ({
+    attributes: Object.fromEntries([...attributes.matchAll(/([\w-]+)="([^"]*)"/g)]
+      .map(([, name, value]) => [name, value])),
+    label: label.trim(),
+  }));
 const source = await readFile(new URL('../web/vc-keypad.js', import.meta.url), 'utf8');
 const { PORTRAIT_QUERY, initialInput, reduceInput, keySequence, bindKeypad } =
   await import(`data:text/javascript,${encodeURIComponent(source)}`);
@@ -18,7 +26,8 @@ const keyCodes = {
 };
 for (const [key, code] of Object.entries(keyCodes)) {
   assert.equal(keySequence(key), report(code), key);
-  for (const flags of [1, 2, 4, 7]) assert.equal(keySequence(key, flags), report(code, flags), `${key}/${flags}`);
+  for (let flags = 0; flags < 8; flags++)
+    assert.equal(keySequence(key, flags), report(code, flags), `${key}/${flags}`);
   const result = reduceInput(initialInput(), { type: 'pad', key });
   assert.equal(result.bytes, report(code), `${key} goes through the shared input reducer`);
   assert.equal(result.handled, true);
@@ -114,11 +123,12 @@ const media = {
   addEventListener: (name, callback) => mediaListeners.set(name, callback),
   removeEventListener: (name) => mediaListeners.delete(name),
 };
-const buttons = ['Control', 'Alt', 'Shift', 'F1', 'Keyboard'].map(key => ({
-  dataset: { key }, attributes: {},
+const buttons = keypadButtons.map(({ attributes }) => ({
+  dataset: { key: attributes['data-key'] }, attributes: { ...attributes },
   setAttribute(name, value) { this.attributes[name] = value; },
   closest() { return this; },
 }));
+const buttonFor = key => buttons.find(button => button.dataset.key === key);
 const element = {
   hidden: true,
   querySelectorAll: () => buttons,
@@ -144,15 +154,18 @@ media.matches = true;
 mediaListeners.get('change')();
 assert.equal(element.hidden, false, 'coarse-pointer portrait shows the keypad');
 binding.setSticky(5);
-assert.equal(buttons[0].attributes['aria-pressed'], 'true');
-assert.equal(buttons[1].attributes['aria-pressed'], 'false');
-assert.equal(buttons[2].attributes['aria-pressed'], 'true');
+assert.equal(buttonFor('Control').attributes['aria-pressed'], 'true');
+assert.equal(buttonFor('Alt').attributes['aria-pressed'], 'false');
+assert.equal(buttonFor('Shift').attributes['aria-pressed'], 'true');
 let prevented = 0;
-listeners.get('pointerdown')({ target: buttons[3], preventDefault: () => prevented++ });
-assert.equal(prevented, 1, 'keypad taps keep textarea focus and cannot scroll it into view');
-listeners.get('click')({ target: buttons[3], preventDefault() {} });
-assert.deepEqual(pressed, ['F1']);
-listeners.get('click')({ target: buttons[4], preventDefault() {} });
+for (const button of buttons)
+  listeners.get('pointerdown')({ target: button, preventDefault: () => prevented++ });
+assert.equal(prevented, buttons.length, 'all keypad taps keep focus and cannot scroll it into view');
+assert.equal(focused, 0, 'even Keyboard waits for its click before opening the phone keyboard');
+assert.deepEqual(pressed, [], 'pointerdown itself sends no key bytes');
+for (const button of buttons) listeners.get('click')({ target: button, preventDefault() {} });
+assert.deepEqual(pressed, buttons.filter(button => button.dataset.key !== 'Keyboard')
+  .map(button => button.dataset.key), 'every published button routes its unchanged data-key');
 assert.equal(focused, 1, 'the keyboard button focuses xterm synchronously');
 media.matches = false;
 mediaListeners.get('change')();
@@ -174,13 +187,123 @@ assert.match(buttonRule, /-webkit-user-select:\s*none\s*;/,
   'iOS buttons must not select text on a long press');
 assert.match(buttonRule, /-webkit-touch-callout:\s*none\s*;/,
   'iOS buttons must not open the long-press callout');
-assert.match(page, /@media\s*\(pointer: coarse\) and \(orientation: portrait\)/);
+
+// A long press anywhere on a touch screen must not select text or open the
+// copy bubble, which misfires while tapping VC's panels (Eugene, 2026-10-02).
+const coarseBlocks = [...page.matchAll(/@media\s*\(pointer:\s*coarse\)\s*\{([\s\S]*?)\n    \}/g)].map(m => m[1]);
+const pageRule = coarseBlocks.map(b => b.match(/html,\s*body[^{]*\{([^}]*)\}/)?.[1]).find(Boolean) || '';
+assert.match(pageRule, /-webkit-touch-callout:\s*none\s*;/, 'touch pages suppress the long-press callout');
+assert.match(pageRule, /-webkit-user-select:\s*none\s*;/, 'touch pages suppress long-press text selection');
+assert.match(pageRule, /(?:^|;)\s*user-select:\s*none\s*;/);
+const webScript = await readFile(join(output, 'vc-web.js'), 'utf8');
+assert.match(webScript, /addEventListener\("contextmenu"[^;]*coarse/s,
+  'a long press on a touch screen never opens the context menu');
+
+const expectedRows = [
+  ['F1', 'F2', 'F3', 'F4', 'F5'],
+  ['F6', 'F7', 'F8', 'F9', 'F10'],
+  ['Escape', 'Tab', 'ArrowUp', 'Insert', 'Enter'],
+  ['Control', 'ArrowLeft', 'ArrowDown', 'ArrowRight', 'Enter'],
+  ['Shift', 'Alt', 'Keyboard', 'Keyboard', 'Keyboard'],
+];
+assert.deepEqual(keypadButtons.map(button => button.attributes['data-key']),
+  [...new Set(expectedRows.flat())], 'five-row keypad order, including Shift then Alt in row five');
+for (const { attributes, label } of keypadButtons) {
+  assert.equal(attributes.type, 'button');
+  if (/^F\d+$/.test(attributes['data-key']))
+    assert.equal(label, attributes['data-key'], 'F-key labels contain only F and their number');
+}
+assert.match(keypadRule, /grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)\s*;/);
+assert.match(keypadRule, /grid-template-rows:\s*repeat\(5,\s*minmax\(44px,\s*auto\)\)\s*;/,
+  'all five rows, including the two under Enter, stay at least 44px high');
+const classRule = className => page.match(new RegExp(`#keypad \\.${className}\\s*\\{([^}]*)\\}`, 's'))?.[1] || '';
+const enterRule = classRule('enter');
+assert.match(enterRule, /grid-column:\s*5\s*;/, 'Enter occupies column five');
+assert.match(enterRule, /grid-row:\s*3\s*\/\s*span\s+2\s*;/, 'Enter spans rows three and four');
+assert.match(classRule('keyboard'), /grid-column:\s*span\s+3\s*;/);
+assert.ok(buttonFor('Keyboard').attributes.class?.split(/\s+/).includes('keyboard'),
+  'the published Keyboard button actually receives its three-column span');
+assert.doesNotMatch(keypadMarkup, /class="[^"]*\bwide\b/, 'Shift no longer takes two columns');
+
+// Model ordinary row-wise grid auto-placement, reserving Enter's explicit
+// two-row box first. This catches order/span combinations that make six rows.
+const grid = Array.from({ length: 5 }, () => Array(5).fill(null));
+grid[2][4] = grid[3][4] = 'Enter';
+let cursor = 0;
+for (const { attributes } of keypadButtons) {
+  const key = attributes['data-key'];
+  if (key === 'Enter') continue;
+  const span = key === 'Keyboard' ? 3 : 1;
+  let placed = false;
+  for (; cursor < 25; cursor++) {
+    const row = Math.floor(cursor / 5), column = cursor % 5;
+    if (column + span <= 5 && grid[row].slice(column, column + span).every(value => value === null)) {
+      grid[row].fill(key, column, column + span);
+      cursor += span;
+      placed = true;
+      break;
+    }
+  }
+  assert.ok(placed, `${key} fits the five-row grid`);
+}
+assert.deepEqual(grid, expectedRows);
+
+for (const [key, className, background, border, text] of [
+  ['Escape', 'escape', '#5a1616', '#e24b4a', '#ffd6d6'],
+  ['Tab', 'tab', '#4a3306', '#ba7517', '#ffe2b0'],
+  ['Enter', 'enter', '#173d0a', '#639922', '#d8f0b8'],
+]) {
+  assert.ok(buttonFor(key).attributes.class?.split(/\s+/).includes(className), `${key} colour class`);
+  const rule = classRule(className);
+  assert.match(rule, new RegExp(`(?:^|;)\\s*background:\\s*${background}\\s*;`));
+  assert.match(rule, new RegExp(`border-color:\\s*${border}\\s*;`));
+  assert.match(rule, new RegExp(`(?:^|;)\\s*color:\\s*${text}\\s*;`));
+}
+for (const key of ['Control', 'Alt', 'Shift']) {
+  assert.ok(buttonFor(key).attributes.class?.split(/\s+/).includes('modifier'), `${key} violet class`);
+  assert.equal(keypadButtons.find(button => button.attributes['data-key'] === key)
+    .attributes['aria-pressed'], 'false', `${key} starts unpressed`);
+}
+assert.match(classRule('modifier'), /border-color:\s*#7f77dd\s*;/i);
+assert.match(classRule('modifier'), /(?:^|;)\s*color:\s*#cecbf6\s*;/i);
+const stickyRule = page.match(/#keypad \.modifier\[aria-pressed="true"\]\s*\{([^}]*)\}/s)?.[1] || '';
+assert.match(stickyRule, /(?:^|;)\s*background:\s*#534ab7\s*;/i);
+assert.match(stickyRule, /(?:^|;)\s*color:\s*(?:#fff(?:fff)?|white)\s*;/i);
+
+assert.match(page, /<meta\s+name="viewport"\s+content="width=device-width, initial-scale=1"\s*>/,
+  'desktop and landscape start with the exact original viewport policy');
+const portraitCSS = page.match(/@media\s*\(pointer: coarse\) and \(orientation: portrait\)\s*\{((?:[^{}]|\{[^{}]*\})*)\}/s)?.[1];
+assert.ok(portraitCSS, 'only coarse-pointer portrait receives the page layout overrides');
+assert.match(portraitCSS, /html, body\s*\{[^}]*overflow:\s*hidden\s*;/s);
+const mainRule = portraitCSS.match(/main\s*\{([^}]*)\}/s)?.[1] || '';
+assert.match(mainRule, /position:\s*fixed\s*;/);
+assert.match(mainRule, /overflow:\s*hidden\s*;/);
+assert.match(mainRule, /top:\s*var\(--vc-viewport-top,\s*0px\)\s*;/);
+assert.match(mainRule, /height:\s*var\(--vc-viewport-height,\s*100%\)\s*;/);
+assert.match(mainRule, /justify-content:\s*flex-start\s*;/);
+assert.match(mainRule, /gap:\s*0\s*;/, 'the footer follows the screen without the old flex gap');
+assert.match(mainRule, /padding:\s*env\(safe-area-inset-top\)\s+env\(safe-area-inset-right\)\s+env\(safe-area-inset-bottom\)\s+env\(safe-area-inset-left\)\s*;/,
+  'only safe-area insets, never arbitrary screen padding');
+const pinnedRule = portraitCSS.match(/#keypad\s*\{([^}]*)\}/s)?.[1] || '';
+assert.match(pinnedRule, /position:\s*absolute\s*;/);
+assert.match(pinnedRule, /bottom:\s*env\(safe-area-inset-bottom\)\s*;/);
+assert.match(pinnedRule, /left:\s*env\(safe-area-inset-left\)\s*;/);
+assert.match(pinnedRule, /right:\s*env\(safe-area-inset-right\)\s*;/);
+assert.match(portraitCSS, /#keypad\[data-keyboard-open="true"\]\s*\{\s*display:\s*none\s*;\s*\}/,
+  'phone keyboard hides the pad without changing its media-query-owned hidden state');
+assert.ok(portraitCSS.indexOf('#keypad[data-keyboard-open="true"]')
+  > portraitCSS.indexOf('#keypad:not([hidden])'), 'keyboard visibility wins over the normal portrait rule');
+assert.match(portraitCSS, /#terminal\s*\{[^}]*overflow:\s*hidden\s*;/s);
+assert.match(portraitCSS, /#terminal \.xterm\s*\{[^}]*transform-origin:\s*top left\s*;/s);
+assert.match(portraitCSS, /#source-button\s*\{[^}]*position:\s*static\s*;[^}]*min-height:\s*44px\s*;[^}]*margin-top:\s*6px\s*;/s,
+  'the portrait-only Source button participates in its footer without overlapping keys');
 assert.ok(page.indexOf('id="terminal"') < page.indexOf('id="keypad"'));
 const app = await readFile(new URL('../web/vc-web.js', import.meta.url), 'utf8');
+assert.match(app, /portraitTouch\s*\?\s*`\$\{defaultViewportContent\}, viewport-fit=cover`\s*:\s*defaultViewportContent/,
+  'only portrait touch opts into cover; leaving it restores the original viewport');
 const fit = app.slice(app.indexOf('function fit('), app.indexOf('function onExit()'));
 assert.ok(fit.includes('function fit('), 'inspect the actual fitting adapter');
-assert.doesNotMatch(fit, /keypad/i, 'the original screen fit never subtracts keypad height');
 assert.match(app, /terminal\.onData\(enqueue\)/, 'phone text keeps the existing input queue');
 assert.match(app, /pointerdown.*terminal\?\.focus/, 'screen taps keep their mouse path');
 assert.match(app, /terminal\?\.textarea\?\.focus\(\{\s*preventScroll:\s*true\s*\}\)/);
-console.log('web keypad: built-page iOS CSS, all key bytes, sticky/physical/phone input, media query, focus and unchanged screen fit passed');
+console.log('web keypad: five-row order/spans, colour classes, safe portrait CSS, all key bytes, sticky/physical/phone input and focus passed');

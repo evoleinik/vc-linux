@@ -4,7 +4,7 @@ import createVC from "./vc.mjs?v=__V__";
 import { createSpeaker } from "./speaker.js?v=__V__";
 import { createModemTransport } from "./modem.js?v=__V__";
 import { createGraphics } from "./graphics.js?v=__V__";
-import { initialInput, reduceInput, bindKeypad } from "./vc-keypad.js?v=__V__";
+import { PORTRAIT_QUERY, initialInput, reduceInput, bindKeypad } from "./vc-keypad.js?v=__V__";
 import { pageText } from "./vc-language.js?v=__V__";
 import { screenLayout } from "./vc-layout.js?v=__V__";
 
@@ -15,6 +15,11 @@ const exitMessage = document.getElementById("exit-message");
 const sourceButton = document.getElementById("source-button");
 const sourceElement = document.getElementById("source-panel");
 const touchControls = document.getElementById("keypad");
+const portraitMedia = window.matchMedia(PORTRAIT_QUERY);
+const viewportMeta = document.querySelector('meta[name="viewport"]');
+const defaultViewportContent = viewportMeta.content;
+const sourceButtonHome = sourceButton.parentNode;
+const sourceButtonNext = sourceButton.nextSibling;
 const strings = pageText(navigator.language);
 document.documentElement.lang = strings.language;
 document.getElementById("page-description").textContent = strings.footer;
@@ -36,6 +41,7 @@ let graphics;
 let vc, sourcePanel, sourceLoad, sourceSnapshot, sourceResolved;
 let sourceWasOpen = false, sourceScroll;
 let closedFit, sourceRootStyle;
+let portraitWidth = 0, portraitHeight = 0, mobileRenderStyle;
 
 function layoutSource() {
   const opened = !!sourcePanel?.opened;
@@ -44,6 +50,7 @@ function layoutSource() {
   if (opened) sourceScroll = { left: window.scrollX, top: window.scrollY };
   sourceWasOpen = opened;
   fit(true);
+  if (portraitMedia.matches) return;
   if (opened && sourceElement.dataset.position === "below")
     sourceElement.scrollIntoView({ block: "nearest" });
   else if (!opened && sourceScroll) window.scrollTo(sourceScroll);
@@ -113,6 +120,10 @@ window.addEventListener("keydown", sourceKey, { capture: true });
 window.addEventListener("keyup", sourceKey, { capture: true });
 window.addEventListener("blur", () => { sourceShortcutHeld = false; });
 document.addEventListener("visibilitychange", () => { sourceShortcutHeld = false; });
+// A long press on a touch screen opens the copy bubble or a context menu,
+// which misfires while tapping VC's panels. Touch only; desktop keeps both.
+const coarsePointer = window.matchMedia("(pointer: coarse)");
+document.addEventListener("contextmenu", (event) => { if (coarsePointer.matches) event.preventDefault(); }, { capture: true });
 
 function enqueue(data, raw = false) {
   if (exited || !data) return;
@@ -179,25 +190,67 @@ function screenText() {
 // exposing the wasm heap or adding a second input path.
 Object.defineProperty(window, "vcScreen", { value: screenText });
 
+function updateViewport() {
+  const portraitTouch = portraitMedia.matches;
+  const content = portraitTouch ? `${defaultViewportContent}, viewport-fit=cover` : defaultViewportContent;
+  // Cover is phone-portrait only: a notched landscape keeps main's viewport.
+  if (viewportMeta.content !== content) viewportMeta.content = content;
+  if (!portraitTouch) {
+    if (sourceButton.parentNode !== sourceButtonHome)
+      sourceButtonHome.insertBefore(sourceButton, sourceButtonNext);
+    layout.style.removeProperty("--vc-viewport-height");
+    layout.style.removeProperty("--vc-viewport-top");
+    delete touchControls.dataset.keyboardOpen;
+    portraitWidth = portraitHeight = 0;
+    return { portraitTouch };
+  }
+  // Source is part of the footer on a phone, leaving the rest of the gap empty.
+  if (sourceButton.parentNode !== footer) footer.appendChild(sourceButton);
+  const viewport = window.visualViewport;
+  const zoomed = viewport && viewport.scale !== 1;
+  const height = !zoomed && viewport ? viewport.height : window.innerHeight;
+  const top = !zoomed && viewport ? viewport.offsetTop : 0;
+  if (portraitWidth !== window.innerWidth) portraitHeight = 0;
+  portraitWidth = window.innerWidth;
+  portraitHeight = Math.max(portraitHeight, window.innerHeight, height);
+  // Both iOS (visual-only resize) and Android (layout resize too) retain the
+  // last unobstructed height. A toolbar change is smaller than a keyboard;
+  // pinch zoom is not a keyboard. Hiding the pad never clears sticky input.
+  const keyboardOpen = !zoomed && document.activeElement === terminal?.textarea
+    && portraitHeight - height > 120;
+  touchControls.dataset.keyboardOpen = String(keyboardOpen);
+  layout.style.setProperty("--vc-viewport-height", `${height}px`);
+  layout.style.setProperty("--vc-viewport-top", `${top}px`);
+  return { portraitTouch, height };
+}
+
 function fit(reuseClosed = false) {
   if (!terminal?.element) return;
+  const viewport = updateViewport();
+  const { portraitTouch } = viewport;
+  if (mobileRenderStyle) {
+    Object.assign(terminal.element.style, mobileRenderStyle);
+    mobileRenderStyle = null;
+    container.style.removeProperty("--vc-screen-scale-x");
+    container.style.removeProperty("--vc-screen-scale-y");
+  }
   const screen = terminal.element.querySelector(".xterm-screen");
   const original = screen.getBoundingClientRect();
   if (!original.width || !original.height) return;
   const opened = !!sourcePanel?.opened;
   const scroll = { left: window.scrollX, top: window.scrollY };
   const rootStyle = document.documentElement.style;
-  if (opened && !sourceRootStyle) sourceRootStyle = { overflowY: rootStyle.overflowY || "" };
+  if (opened && !portraitTouch && !sourceRootStyle) sourceRootStyle = { overflowY: rootStyle.overflowY || "" };
   if (sourceRootStyle) rootStyle.overflowY = sourceRootStyle.overflowY;
-  if (!opened) sourceRootStyle = null;
+  if (!opened || portraitTouch) sourceRootStyle = null;
   // Measure main's unchanged flex layout, including naturally wrapped footer
   // text. No open-panel positioning survives a close or a viewport resize.
   sourceElement.hidden = true;
   for (const node of [container, touchControls, footer])
-    for (const property of ["position", "left", "top", "width"])
+    for (const property of ["position", "left", "top", "width", "height"])
       node.style.removeProperty(property);
   let scrollbarSize;
-  if (opened) {
+  if (opened && !portraitTouch) {
     // Native bars differ by platform (including zero-width overlay bars).
     // Measure only while opening/resizing Source, never on the closed page.
     rootStyle.overflowY = "scroll";
@@ -217,11 +270,16 @@ function fit(reuseClosed = false) {
   const input = () => {
     const style = getComputedStyle(layout);
     return {
-      width: layout.clientWidth, height: layout.clientHeight,
-      padding: parseFloat(style.paddingLeft), gap: parseFloat(style.rowGap),
+      width: layout.clientWidth, height: portraitTouch ? viewport.height : layout.clientHeight,
+      padding: parseFloat(style.paddingLeft), gap: portraitTouch ? 12 : parseFloat(style.rowGap),
       footer: dimensions(footer),
       controls: getComputedStyle(touchControls).display === "none" ? null : dimensions(touchControls),
       safeCenter: style.justifyContent.includes("safe"), fontSize, measurements, scrollbarSize,
+      portraitTouch,
+      safeArea: portraitTouch ? {
+        top: parseFloat(style.paddingTop), right: parseFloat(style.paddingRight),
+        bottom: parseFloat(style.paddingBottom), left: parseFloat(style.paddingLeft),
+      } : undefined,
     };
   };
   // Font fallback and device-pixel rounding are measured, not approximated.
@@ -247,20 +305,35 @@ function fit(reuseClosed = false) {
     result = resolveLayout({ ...input(), open: true });
   }
   terminal.options.fontSize = result.fontSize;
-  if (result.panel) {
-    const place = (node, box) => Object.assign(node.style, {
-      position: "absolute", left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`,
-    });
+  const place = (node, box) => Object.assign(node.style, {
+    position: "absolute", left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`,
+  });
+  if (portraitTouch || result.panel) {
     place(container, result.screen);
     place(footer, result.footer);
     if (result.controls) place(touchControls, result.controls);
+  }
+  if (portraitTouch) {
+    // Keep the 8x16 VGA glyphs at their native size, then scale only this
+    // viewport. CGA fills the same box; xterm mouse/selection share the scale.
+    const scaleX = result.screen.width / result.nativeScreen.width;
+    const scaleY = result.screen.height / result.nativeScreen.height;
+    mobileRenderStyle = { width: terminal.element.style.width || "",
+      transform: terminal.element.style.transform || "" };
+    terminal.element.style.width = `${result.nativeScreen.width}px`;
+    terminal.element.style.transform = `scale(${scaleX}, ${scaleY})`;
+    container.style.height = `${result.screen.height}px`;
+    container.style.setProperty("--vc-screen-scale-x", String(scaleX));
+    container.style.setProperty("--vc-screen-scale-y", String(scaleY));
+  }
+  if (result.panel) {
     place(sourceElement, result.panel);
     sourceElement.style.height = `${result.panel.height}px`;
     sourceElement.dataset.position = result.panel.side;
   }
-  sourceElement.hidden = !opened;
+  sourceElement.hidden = !opened || (portraitTouch && result.panel.height < 20);
   // A layout read with the panel hidden can temporarily clamp root scroll.
-  if (opened && (window.scrollX !== scroll.left || window.scrollY !== scroll.top))
+  if (!portraitTouch && opened && (window.scrollX !== scroll.left || window.scrollY !== scroll.top))
     window.scrollTo(scroll);
 }
 
@@ -296,10 +369,20 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) releaseModifiers();
 });
 let resizeFrame = 0;
-window.addEventListener("resize", () => {
+function scheduleFit() {
   cancelAnimationFrame(resizeFrame);
   resizeFrame = requestAnimationFrame(() => fit());
+}
+window.addEventListener("resize", scheduleFit);
+portraitMedia.addEventListener("change", () => {
+  updateViewport();
+  scheduleFit();
 });
+for (const event of ["resize", "scroll"])
+  window.visualViewport?.addEventListener(event, () => { if (portraitMedia.matches) scheduleFit(); });
+for (const event of ["focusin", "focusout"])
+  container.addEventListener(event, () => { if (portraitMedia.matches) scheduleFit(); });
+updateViewport();
 
 async function start() {
   try {

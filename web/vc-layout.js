@@ -27,9 +27,31 @@ function box(left, top, width, height) {
   return { left, top, width, height, right: left + width, bottom: top + height };
 }
 
+function portraitLayout({ width, height, footer, controls, safeArea, measurements, open, gap }) {
+  const nativeScreen = measurements[16];
+  if (!nativeScreen?.width || !nativeScreen.height) return { measure: 16 };
+  const { top = 0, right = 0, bottom = 0, left = 0 } = safeArea;
+  const usableWidth = Math.max(0, width - left - right);
+  const screen = box(left, top, usableWidth, Math.round(usableWidth * 400 / 640));
+  const caption = box(left, screen.bottom, usableWidth, footer.height);
+  const keys = controls ? box(left, height - bottom - controls.height, usableWidth, controls.height) : null;
+  const result = { fontSize: 16, nativeScreen, screen, controls: keys,
+    footer: caption, panel: null };
+  if (open) {
+    // Portrait never scrolls the page: Source scrolls inside the unused band.
+    // The adapter hides a band too short even for the panel's border/padding.
+    const end = Math.max(top, (keys?.top ?? height - bottom) - gap);
+    const start = Math.min(caption.bottom + gap, end);
+    result.panel = { side: "between", ...box(left, start, usableWidth, end - start) };
+  }
+  return result;
+}
+
 export function screenLayout({ width, height, footer, controls = null,
   safeCenter = false, fontSize = 16, measurements = {}, open = false, padding = 12, gap = 12,
-  scrollbarSize = 16 }) {
+  scrollbarSize = 16, portraitTouch = false, safeArea = {} }) {
+  if (portraitTouch) return portraitLayout({ width, height, footer, controls, safeArea,
+    measurements, open, gap });
   const availableWidth = width - padding * 2;
   const availableHeight = height - padding * 2;
   const minPanelWidth = 60 * 8 + 20 + scrollbarSize; // text, padding/border, native scrollbar

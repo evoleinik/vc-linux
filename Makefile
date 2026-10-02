@@ -481,6 +481,7 @@ test-web: web $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/files-test.mjs
 	$(NODE) tests/test_web_files.mjs $(WEB_WORK)/files-test.mjs
 	$(NODE) tests/web_modules.mjs $(WEB_OUT)
 	$(NODE) tests/test_web_keypad.mjs $(WEB_OUT)
+	$(NODE) tests/test_web_mouse.mjs $(WEB_OUT)
 	$(NODE) tests/web_language.mjs $(WEB_DEMO)
 	$(NODE) tests/test_web_speaker.mjs
 	$(NODE) tests/test_web_graphics.mjs

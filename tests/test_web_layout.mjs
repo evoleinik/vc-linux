@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { mainScreenLayout } from './fixtures/main-screen-layout.mjs';
+import { mainScreenLayout, portraitTouchScreenLayout } from './fixtures/main-screen-layout.mjs';
 
 const directory = process.argv[2] || 'web';
 const source = readFileSync(join(directory, 'vc-layout.js'), 'utf8');
@@ -27,6 +27,7 @@ function resolve(input, metric = ideal) {
     const result = screenLayout(Object.freeze({ ...input,
       footer: Object.freeze({ ...input.footer }),
       controls: input.controls ? Object.freeze({ ...input.controls }) : null,
+      ...(input.safeArea && { safeArea: Object.freeze({ ...input.safeArea }) }),
       measurements: Object.freeze({ ...measurements }),
     }));
     if (!Object.hasOwn(result, 'measure')) return result;
@@ -37,7 +38,15 @@ function resolve(input, metric = ideal) {
   assert.fail('font measurement requests did not converge');
 }
 
-let cases = 0, roundTrips = 0;
+const edgeToEdge = resolve({ width: 390, height: 844, portraitTouch: true,
+  footer: { width: 390, height: 88 }, controls: { width: 390, height: 244 } });
+assert.deepEqual(edgeToEdge.screen,
+  { left: 0, top: 0, width: 390, height: 244, right: 390, bottom: 244 },
+  'a 390px portrait touch screen uses the full width at the top');
+assert.equal(edgeToEdge.controls.bottom, 844, 'the portrait keypad is pinned to the viewport bottom');
+assert.equal(edgeToEdge.footer.top, edgeToEdge.screen.bottom, 'the footer directly follows VC');
+
+let cases = 0, roundTrips = 0, portraitCases = 0, portraitRoundTrips = 0;
 for (const [name, metric, stableAnchor] of variants) {
   for (let horizontal = 320; horizontal <= 2560; horizontal += 16) {
     for (let vertical = 480; vertical <= 1440; vertical += 16) {
@@ -58,6 +67,26 @@ for (const [name, metric, stableAnchor] of variants) {
               `open/close must restore ${width}x${height}, keys=${keys}, ${name}`);
             roundTrips++;
           }
+          // A keypad alone does not select the new layout. It requires the
+          // explicit coarse-pointer/portrait media result (square included).
+          // Retain every legacy comparison above, and add a separate fixture
+          // for precisely the media-selected branch.
+          if (keys && width <= height) {
+            const portraitInput = { ...input, portraitTouch: true };
+            const portrait = resolve(portraitInput, metric);
+            assert.deepEqual(portrait, portraitTouchScreenLayout(portraitInput, metric),
+              `portrait fixture differs at ${width}x${height}, ${name}`);
+            const opened = resolve({ ...portraitInput, open: true }, metric);
+            for (const property of ['screen', 'controls', 'footer'])
+              assert.deepEqual(opened[property], portrait[property], `Source cannot move portrait ${property}`);
+            assert.equal(opened.panel.side, 'between');
+            assert.ok(opened.panel.bottom <= portrait.controls.top,
+              'Source remains above the bottom-pinned portrait keypad');
+            assert.deepEqual(resolve({ ...portraitInput, fontSize: opened.fontSize }, metric), portrait,
+              `portrait open/close must restore ${width}x${height}, ${name}`);
+            portraitCases++;
+            portraitRoundTrips++;
+          }
           cases++;
         }
       }
@@ -66,6 +95,80 @@ for (const [name, metric, stableAnchor] of variants) {
 }
 console.log(`PASS closed layout: ${cases} exact main font/screen/footer/keypad comparisons, both orientations and nine font-metric variants`);
 console.log(`PASS toggle restoration: ${roundTrips} full-grid round trips with ideal and actual xterm DPR metrics`);
+console.log(`PASS portrait layout: ${portraitCases} independent full-width/top-screen/bottom-keypad comparisons and ${portraitRoundTrips} Source round trips`);
+
+const portraitSizes = [
+  { width: 390, height: 844 },
+  { width: 360, height: 740 },
+  { width: 430, height: 932 },
+  { width: 375, height: 812 },
+  { width: 390, height: 844, safeArea: { top: 47 } },
+  { width: 390, height: 844, safeArea: { bottom: 34 } },
+  { width: 390, height: 844, safeArea: { top: 47, right: 11, bottom: 34, left: 7 } },
+  { width: 390, height: 420, controls: null, safeArea: { bottom: 16 } },
+  { width: 390, height: 360, controls: null },
+  { width: 600, height: 600 },
+];
+for (const [name, metric] of variants) {
+  for (const fontSize of [1, 9, 10, 15, 16, 17, 32, 48]) {
+    for (const size of portraitSizes) {
+      const input = { portraitTouch: true, footer: { width: size.width - 24, height: 88 },
+        controls: { width: size.width - 24, height: 244 }, fontSize, ...size };
+      const closed = resolve(input, metric);
+      assert.deepEqual(closed, portraitTouchScreenLayout(input, metric),
+        `portrait sizing ignores previous font ${fontSize} at ${size.width}x${size.height}, ${name}`);
+      assert.equal(closed.fontSize, 16, 'portrait text renders at native VGA size before scaling');
+      assert.deepEqual(closed.nativeScreen, metric(16), 'preserve exact native dimensions for the DOM transform');
+      assert.equal(closed.screen.width, size.width - (size.safeArea?.left ?? 0) - (size.safeArea?.right ?? 0));
+      assert.equal(closed.screen.height, Math.round(closed.screen.width * 400 / 640), 'full width keeps the VGA aspect');
+      assert.equal(closed.screen.top, size.safeArea?.top ?? 0, 'notches shift the top, never vertically center VC');
+      assert.equal(closed.footer.top, closed.screen.bottom, 'there is no gap between VC and its footer');
+      assert.equal(closed.footer.width, closed.screen.width, 'the footer wraps to the same safe width');
+      if (closed.controls) {
+        assert.equal(closed.controls.bottom, size.height - (size.safeArea?.bottom ?? 0), 'keep keys above the home indicator');
+        assert.equal(closed.controls.height, 244, 'five 44px rows and four 6px gaps retain their measured height');
+        assert.equal(closed.controls.width, closed.screen.width, 'the keypad uses the same safe width');
+      } else {
+        assert.equal(input.controls, null, 'the software keyboard hides the pad without hiding or shrinking VC');
+      }
+    }
+  }
+}
+assert.equal(resolve({ width: 360, height: 740, portraitTouch: true,
+  footer: { width: 360, height: 88 } }).screen.height, 225);
+assert.equal(resolve({ width: 430, height: 932, portraitTouch: true,
+  footer: { width: 430, height: 88 } }).screen.height, 269);
+assert.deepEqual(screenLayout({ width: 390, height: 844, portraitTouch: true,
+  fontSize: 9, footer: { width: 390, height: 88 }, measurements: { 9: ideal(9) } }),
+{ measure: 16 }, 'a previous desktop font must request an exact native-size measurement');
+console.log('PASS portrait sizes: 390x844, 360x740, 430x932, square media, safe areas, font anchors and reduced keyboard viewports');
+
+for (const size of portraitSizes) {
+  const input = { portraitTouch: true, footer: { width: size.width - 24, height: 88 },
+    controls: { width: size.width - 24, height: 244 }, ...size };
+  const closed = resolve(input), opened = resolve({ ...input, open: true });
+  assert.deepEqual(closed, portraitTouchScreenLayout(input, ideal));
+  for (const property of ['screen', 'controls', 'footer'])
+    assert.deepEqual(opened[property], closed[property], `portrait Source keeps ${property} in place`);
+  const panelBottom = (closed.controls?.top ?? size.height - (size.safeArea?.bottom ?? 0)) - 12;
+  const panelTop = Math.min(closed.footer.bottom + 12, panelBottom);
+  assert.deepEqual(opened.panel, { side: 'between', left: closed.screen.left, top: panelTop,
+    width: closed.screen.width, height: panelBottom - panelTop,
+    right: closed.screen.right, bottom: panelBottom }, 'Source uses only the gap between the footer and the keypad');
+  assert.ok(opened.panel.height >= 0, 'short viewports collapse Source instead of requiring page scrolling');
+  assert.ok(opened.panel.bottom <= (closed.controls?.top ?? size.height - (size.safeArea?.bottom ?? 0)));
+  assert.deepEqual(resolve({ ...input, open: false, fontSize: opened.fontSize }), closed);
+}
+console.log('PASS portrait Source: fixed screen/footer/pad, safe-width interior pane and zero-height short-window fallback');
+
+for (const [width, height] of [[390, 844], [844, 390], [1440, 900], [600, 600]]) {
+  for (const controls of [null, { width: 360, height: 244 }]) {
+    const input = { width, height, footer: { width: Math.min(1050, width - 24), height: 88 }, controls,
+      portraitTouch: false, safeCenter: true, safeArea: { top: 47, right: 11, bottom: 34, left: 7 } };
+    assert.deepEqual(resolve(input), mainScreenLayout(input, ideal),
+      'explicitly non-portrait-touch layouts ignore portrait-only safe areas');
+  }
+}
 
 for (const [, metric] of variants) for (const fontSize of [1, 9, 10, 15, 16, 17, 32, 48]) {
   for (const [width, height] of [[390, 480], [416, 844], [912, 600], [1440, 900], [2560, 1440]]) {
@@ -127,7 +230,7 @@ assert.equal(below.panel.top, below.screen.bottom + 12, 'without touch keys the 
 const threshold = resolve({ width: 912, height: 900, footer: { width: 800, height: 60 }, open: true });
 assert.equal(threshold.panel.side, 'right', 'exactly enough room for a 360px screen and 60-column panel');
 assert.equal(resolve({ width: 911, height: 900, footer: { width: 800, height: 60 }, open: true }).panel.side, 'below');
-console.log('PASS open phone layout: 390x844 below keypad, viewport remainder, ten-line minimum, footer below and exact close restoration');
+console.log('PASS legacy non-portrait-touch narrow layout: 390x844 below keypad, viewport remainder, ten-line minimum, footer below and exact close restoration');
 
 const scrollbarFailures = [];
 const scrollbarCheck = (name, check) => {

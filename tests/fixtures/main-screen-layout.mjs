@@ -58,3 +58,23 @@ export function mainScreenLayout(input, measure) {
   return { fontSize: terminal.options.fontSize, screen, controls: keys,
     footer: rect(footer, (keys || screen).bottom + gap), panel: null };
 }
+
+// Brief 35's closed portrait-touch fixture is separate from the verbatim
+// main arithmetic above. Native 80x25 rendering is scaled into a full-width
+// 640:400 box; footer flow and the bottom-pinned keys do not affect its size.
+export function portraitTouchScreenLayout(input, measure) {
+  const { width, height, footer, controls = null } = input;
+  const { top = 0, right = 0, bottom = 0, left = 0 } = input.safeArea ?? {};
+  const usableWidth = width - left - right;
+  const screenHeight = Math.round(usableWidth * 400 / 640);
+  const rectangle = (x, y, w, h) => ({ left: x, top: y, width: w, height: h,
+    right: x + w, bottom: y + h });
+  return {
+    fontSize: 16,
+    nativeScreen: measure(16),
+    screen: rectangle(left, top, usableWidth, screenHeight),
+    controls: controls ? rectangle(left, height - bottom - controls.height, usableWidth, controls.height) : null,
+    footer: rectangle(left, top + screenHeight, usableWidth, footer.height),
+    panel: null,
+  };
+}

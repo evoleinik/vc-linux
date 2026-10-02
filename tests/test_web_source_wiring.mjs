@@ -71,8 +71,13 @@ function eventTarget() {
   };
 }
 
-function harness(layoutFunction, screenMetric = size => ({ width: 40 * size, height: 25 * size })) {
-  const style = () => ({ removeProperty(name) { delete this[name]; } });
+function harness(layoutFunction, screenMetric = size => ({ width: 40 * size, height: 25 * size }),
+  { portraitTouch = false, safeArea = {}, visualViewport = portraitTouch } = {}) {
+  const style = () => ({
+    removeProperty(name) { delete this[name]; },
+    setProperty(name, value) { this[name] = value; },
+    getPropertyValue(name) { return this[name] || ''; },
+  });
   const scrolls = [];
   let clampOnMeasure = false;
   const nodes = new Map([...page.matchAll(/\bid="([^"]+)"/g)].map(([, id]) =>
@@ -82,11 +87,20 @@ function harness(layoutFunction, screenMetric = size => ({ width: 40 * size, hei
       scrollIntoView: options => scrolls.push(options),
       setAttribute(name, value) { this.attributes[name] = value; },
       removeAttribute(name) { delete this.attributes[name]; } }]));
+  const media = { ...eventTarget(), matches: portraitTouch };
   const main = { style: style(), clientWidth: 390, clientHeight: 844 };
-  const footer = { style: style(), getBoundingClientRect: () => ({ width: 366, height: 88 }) };
+  const body = { insertBefore(node) { node.parentNode = this; } };
+  const footer = { style: style(), appendChild(node) { node.parentNode = this; },
+    getBoundingClientRect: () => ({ width: media.matches ? 390 : 366,
+      height: 88 + (nodes.get('source-button').parentNode === footer ? 50 : 0) }) };
+  const viewportMeta = { content: 'width=device-width, initial-scale=1' };
+  nodes.get('source-button').parentNode = body;
+  nodes.get('source-button').nextSibling = {};
+  nodes.get('keypad').hidden = !portraitTouch;
   const document = { ...eventTarget(), activeElement: null, hidden: false,
     documentElement: { dataset: {}, style: style() },
-    getElementById: id => nodes.get(id), querySelector: selector => selector === 'main' ? main : footer,
+    getElementById: id => nodes.get(id), querySelector: selector => selector === 'main' ? main
+      : selector === 'footer' ? footer : viewportMeta,
     fonts: { load: () => new Promise(() => {}) } };
   Object.defineProperty(document.documentElement, 'clientWidth', {
     configurable: true, get: () => main.clientWidth,
@@ -96,17 +110,33 @@ function harness(layoutFunction, screenMetric = size => ({ width: 40 * size, hei
     focus(options) { focusCalls.push(options); document.activeElement = this; } };
   let toggles = 0;
   const window = { ...eventTarget(), scrollX: 0, scrollY: 0,
+    matchMedia(query) {
+      // The long-press guard asks only whether the pointer is coarse.
+      if (query === '(pointer: coarse)') return { matches: media.matches };
+      assert.equal(query, '(pointer: coarse) and (orientation: portrait)');
+      return media;
+    },
     innerWidth: 390, innerHeight: 844, scrollTo(options) {
       scrolls.push(options);
       this.scrollX = options.left ?? this.scrollX;
       this.scrollY = options.top ?? this.scrollY;
     } };
+  if (visualViewport) window.visualViewport = { ...eventTarget(),
+    width: 390, height: 844, offsetTop: 0, scale: 1 };
   const terminal = { textarea, options: { fontSize: 16 },
-    element: { querySelector: () => ({ getBoundingClientRect: () =>
-      screenMetric(terminal.options.fontSize) }) },
+    element: { style: style(), querySelector: () => ({ getBoundingClientRect() {
+      const size = screenMetric(terminal.options.fontSize);
+      const scale = terminal.element.style.transform?.match(/scale\(([^,]+),\s*([^)]+)\)/);
+      return scale ? { width: size.width * Number(scale[1]), height: size.height * Number(scale[2]) } : size;
+    } }) },
     focus: options => textarea.focus(options) };
+  const frames = new Map();
+  let nextFrame = 0;
   const context = {
     window, document, navigator: { language: 'en' }, TextEncoder, console,
+    PORTRAIT_QUERY: '(pointer: coarse) and (orientation: portrait)',
+    requestAnimationFrame(callback) { frames.set(++nextFrame, callback); return nextFrame; },
+    cancelAnimationFrame(id) { frames.delete(id); },
     pageText: () => ({}), initialInput: () => ({}),
     reduceInput: state => ({ state, bytes: '' }),
     createSpeaker: () => ({ unlock() {} }),
@@ -116,17 +146,27 @@ function harness(layoutFunction, screenMetric = size => ({ width: 40 * size, hei
     screenLayout: layoutFunction,
     getComputedStyle: node => {
       if (clampOnMeasure && nodes.get('source-panel').hidden) window.scrollY = 0;
+      if (node === main && media.matches) return {
+        paddingLeft: String(safeArea.left || 0), paddingRight: String(safeArea.right || 0),
+        paddingTop: String(safeArea.top || 0), paddingBottom: String(safeArea.bottom || 0),
+        rowGap: '0', justifyContent: 'flex-start',
+      };
       return { paddingLeft: '12', paddingRight: '12',
         paddingTop: '12', paddingBottom: '12', rowGap: '12', justifyContent: 'safe center',
-        display: node.hidden ? 'none' : 'grid' };
+        display: node.hidden || node.dataset?.keyboardOpen === 'true' ? 'none' : 'grid' };
     },
   };
   runInNewContext(app.replace(/^import .*;\r?\n/gm, '')
     .replaceAll('import.meta.url', '"https://local.invalid/vc-web.js"')
     + '\nterminal = terminalDouble; vc = {}; toggleSource = toggleDouble;'
     + '\nglobalThis.geometry = { fit, layoutSource, setOpen(value) { sourcePanel = { opened: value }; } };', context);
-  return { window, document, button: nodes.get('source-button'), textarea,
+  return { window, document, body, media, viewportMeta, button: nodes.get('source-button'), textarea,
     focusCalls, main, footer, nodes, terminal, scrolls, geometry: context.geometry,
+    flushFrames() {
+      const pending = [...frames.values()];
+      frames.clear();
+      for (const callback of pending) callback();
+    },
     clampScrollOnMeasure() { clampOnMeasure = true; },
     get toggles() { return toggles; } };
 }
@@ -290,4 +330,138 @@ test('open layout budgets the measured native scrollbar instead of assuming 16px
   assert.ok(calls.some(input => input.open));
   for (const input of calls.filter(input => input.open)) assert.equal(input.scrollbarSize, 17);
   assert.ok(!h.document.documentElement.style.overflowY, 'right layout restores the original root scroll policy');
+});
+
+test('portrait fits full-width native VGA pixels above the footer and bottom keypad', () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true });
+  h.geometry.fit();
+  const screen = h.nodes.get('terminal').style, keys = h.nodes.get('keypad').style;
+  assert.equal(screen.left, '0px');
+  assert.equal(screen.top, '0px');
+  assert.equal(screen.width, '390px');
+  assert.equal(screen.height, '244px');
+  assert.equal(h.terminal.options.fontSize, 16, 'render the original VGA font before scaling');
+  assert.equal(h.terminal.element.style.width, '640px');
+  assert.equal(h.terminal.element.style.transform, 'scale(0.609375, 0.61)');
+  assert.equal(screen['--vc-screen-scale-x'], '0.609375', 'mouse and selection share the render scale');
+  assert.equal(screen['--vc-screen-scale-y'], '0.61');
+  assert.equal(h.footer.style.top, '244px');
+  assert.equal(keys.top, '600px');
+  assert.equal(keys.width, '390px');
+  assert.equal(h.button.parentNode, h.footer, 'Source belongs to the footer, not the empty gap or keypad');
+  assert.equal(h.main.style['--vc-viewport-height'], '844px');
+  assert.match(h.viewportMeta.content, /viewport-fit=cover/);
+  for (let i = 0; i < 3; i++) h.geometry.fit();
+  assert.equal(h.terminal.element.style.transform, 'scale(0.609375, 0.61)',
+    'remeasure untransformed pixels, never compound the previous scale');
+  assert.equal(h.focusCalls.length, 0);
+  assert.equal(h.scrolls.length, 0);
+});
+
+test('portrait reads all four safe insets without adding arbitrary screen margins', () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true,
+    safeArea: { top: 47, right: 5, bottom: 34, left: 7 } });
+  h.geometry.fit();
+  const screen = h.nodes.get('terminal').style, keys = h.nodes.get('keypad').style;
+  assert.equal(screen.left, '7px');
+  assert.equal(screen.top, '47px');
+  assert.equal(screen.width, '378px');
+  assert.equal(screen.height, '236px');
+  assert.equal(keys.top, '566px');
+  assert.equal(keys.left, '7px');
+  assert.equal(keys.width, '378px');
+});
+
+for (const resizeLayout of [false, true]) test(`phone keyboard hides only the pad (${resizeLayout ? 'layout + visual' : 'visual'} viewport resize)`, () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true });
+  h.geometry.fit();
+  h.document.activeElement = h.textarea;
+  h.window.visualViewport.height = 500;
+  h.window.visualViewport.offsetTop = 36;
+  if (resizeLayout) h.window.innerHeight = 500;
+  h.window.visualViewport.dispatch('resize');
+  h.flushFrames();
+  assert.equal(h.nodes.get('keypad').dataset.keyboardOpen, 'true');
+  assert.equal(h.nodes.get('terminal').style.width, '390px', 'typing never shrinks the screen');
+  assert.equal(h.main.style['--vc-viewport-height'], '500px');
+  assert.equal(h.main.style['--vc-viewport-top'], '36px');
+  assert.equal(h.focusCalls.length, 0, 'layout does not focus or blur the input');
+  h.window.visualViewport.height = h.window.innerHeight = 844;
+  h.window.visualViewport.offsetTop = 0;
+  h.window.visualViewport.dispatch('resize');
+  h.flushFrames();
+  assert.equal(h.nodes.get('keypad').dataset.keyboardOpen, 'false');
+  assert.equal(h.nodes.get('keypad').style.top, '600px');
+});
+
+test('browser chrome and pinch zoom do not masquerade as the phone keyboard', () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true });
+  h.geometry.fit();
+  h.document.activeElement = h.textarea;
+  h.window.visualViewport.height = 784;
+  h.window.visualViewport.dispatch('resize');
+  h.flushFrames();
+  assert.equal(h.nodes.get('keypad').dataset.keyboardOpen, 'false');
+  assert.equal(h.nodes.get('keypad').style.top, '540px', 'the pad follows ordinary browser-chrome changes');
+  h.window.visualViewport.height = 422;
+  h.window.visualViewport.scale = 2;
+  h.window.visualViewport.dispatch('resize');
+  h.flushFrames();
+  assert.equal(h.nodes.get('keypad').dataset.keyboardOpen, 'false');
+});
+
+test('portrait source uses the empty band and never scrolls the page', () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true });
+  h.geometry.fit();
+  h.geometry.setOpen(true);
+  h.geometry.layoutSource();
+  const panel = h.nodes.get('source-panel');
+  assert.equal(panel.dataset.position, 'between');
+  assert.equal(panel.style.top, '394px');
+  assert.equal(panel.style.height, '194px');
+  assert.equal(panel.hidden, false);
+  assert.equal(h.nodes.get('keypad').style.top, '600px');
+  assert.equal(h.scrolls.length, 0);
+  assert.ok(!h.document.documentElement.style.overflowY);
+  h.geometry.setOpen(false);
+  h.geometry.layoutSource();
+  assert.equal(h.scrolls.length, 0);
+});
+
+test('an exhausted portrait Source band cannot let its border overlap touch keys', () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true });
+  h.window.innerHeight = h.window.visualViewport.height = h.main.clientHeight = 650;
+  h.geometry.setOpen(true);
+  h.geometry.layoutSource();
+  assert.equal(h.nodes.get('source-panel').hidden, true, 'a panel shorter than its 20px chrome stays hidden');
+  assert.equal(h.nodes.get('keypad').style.top, '406px');
+  assert.equal(h.scrolls.length, 0);
+});
+
+test('leaving portrait removes every mobile override and restores original Source placement', () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true });
+  h.geometry.fit();
+  h.media.matches = false;
+  h.nodes.get('keypad').hidden = true;
+  h.media.dispatch('change');
+  h.flushFrames();
+  assert.equal(h.button.parentNode, h.body);
+  assert.equal(h.viewportMeta.content, 'width=device-width, initial-scale=1');
+  for (const node of [h.nodes.get('terminal'), h.nodes.get('keypad'), h.footer])
+    for (const property of ['position', 'left', 'top', 'width', 'height'])
+      assert.ok(!node.style[property], `leaving portrait restores ${property}`);
+  for (const property of ['--vc-screen-scale-x', '--vc-screen-scale-y'])
+    assert.ok(!h.nodes.get('terminal').style[property]);
+  assert.ok(!h.terminal.element.style.transform);
+  assert.ok(!h.terminal.element.style.width);
+  assert.ok(!h.main.style['--vc-viewport-height']);
+  assert.ok(!h.main.style['--vc-viewport-top']);
+  assert.equal(h.terminal.options.fontSize, 9, 'the unchanged desktop fitter chooses its original size');
+});
+
+test('portrait without the visual viewport API keeps a usable pinned layout', () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true, visualViewport: false });
+  h.geometry.fit();
+  assert.equal(h.nodes.get('keypad').style.top, '600px');
+  assert.equal(h.nodes.get('terminal').style.width, '390px');
 });

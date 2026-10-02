@@ -1,13 +1,18 @@
 // The page chooses a language without needing a DOM. DOS text remains CP866;
 // Ukrainian is deliberately confined to the Unicode page.
-//   node tests/web_language.mjs build/web-work/demo
+//   node tests/web_language.mjs build/web-work/demo [build/web]
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
 
-const source = readFileSync(new URL('../web/vc-language.js', import.meta.url), 'utf8');
+const pageDirectory = process.argv[3] ? pathToFileURL(`${resolve(process.argv[3])}/`)
+  : new URL('../web/', import.meta.url);
+const source = readFileSync(new URL('vc-language.js', pageDirectory), 'utf8');
 const { pageText } = await import(`data:text/javascript,${encodeURIComponent(source)}`);
+const keypadSource = readFileSync(new URL('vc-keypad.js', pageDirectory), 'utf8');
+const { PORTRAIT_QUERY } = await import(`data:text/javascript,${encodeURIComponent(keypadSource)}`);
 
 for (const tag of [undefined, null, '', 'en', 'en-US', 'en-GB', 'de-DE', 'fr',
   'russian', 'ukrainian', '__proto__', 'constructor']) {
@@ -61,28 +66,47 @@ assert.notEqual(encoded.toString('utf8'), russian, 'the DOS README must not cont
 
 // Exercise the real page wiring without a browser. Font loading stays
 // pending so startup cannot construct xterm or run wasm in this small DOM.
-const app = readFileSync(new URL('../web/vc-web.js', import.meta.url), 'utf8');
-const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-for (const language of ['ru-RU', 'uk-UA', 'en-US', 'de-DE', undefined]) {
+const app = readFileSync(new URL('vc-web.js', pageDirectory), 'utf8');
+const html = readFileSync(new URL('index.html', pageDirectory), 'utf8');
+for (const portraitTouch of [false, true]) for (const language of ['ru-RU', 'uk-UA', 'en-US', 'de-DE', undefined]) {
   let modemCloses = 0;
   const nodes = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) =>
-    [id, { textContent: '', hidden: true, addEventListener() {} }]));
+    [id, { textContent: '', hidden: true, dataset: {}, addEventListener() {} }]));
+  const style = () => ({
+    setProperty(name, value) { this[name] = value; },
+    removeProperty(name) { delete this[name]; },
+  });
+  const parent = () => ({
+    appendChild(node) { node.parentNode = this; },
+    insertBefore(node) { node.parentNode = this; },
+  });
+  const body = parent(), footer = parent(), main = { style: style() };
+  const sourceButton = nodes.get('source-button');
+  body.appendChild(sourceButton);
+  sourceButton.nextSibling = {};
+  const defaultViewportContent = html.match(/<meta name="viewport" content="([^"]+)"/)[1];
+  const viewportMeta = { content: defaultViewportContent };
+  const media = { matches: portraitTouch, addEventListener() {} };
   const document = {
-    documentElement: { lang: 'en', dataset: {} },
+    documentElement: { lang: 'en', dataset: {}, style: style() },
+    activeElement: null,
     getElementById: (id) => nodes.get(id) || null,
-    querySelector: () => ({}),
+    querySelector: selector => ({ main, footer, 'meta[name="viewport"]': viewportMeta })[selector],
     addEventListener() {},
     fonts: { load: () => new Promise(() => {}) },
   };
   // This non-module VM supplies the real script URL for lazy Source URLs;
   // font loading remains pending, so no dynamic import or wasm can run.
   runInNewContext(app.replace(/^import .*;\r?\n/gm, '')
-    .replaceAll('import.meta.url', JSON.stringify(new URL('../web/vc-web.js', import.meta.url).href))
+    .replaceAll('import.meta.url', JSON.stringify(new URL('vc-web.js', pageDirectory).href))
     + '\nterminal = { options: {} }; onExit();', {
     document,
-    window: { addEventListener() {} },
+    window: { addEventListener() {}, innerWidth: 390, innerHeight: 844,
+      visualViewport: { scale: 1, height: 844, offsetTop: 0, addEventListener() {} },
+      matchMedia(query) { if (query === '(pointer: coarse)') return { matches: media.matches }; assert.equal(query, PORTRAIT_QUERY); return media; } },
     navigator: { language },
     pageText,
+    PORTRAIT_QUERY,
     TextEncoder,
     initialInput: () => ({}),
     createSpeaker: () => ({ silence() {} }),
@@ -100,7 +124,11 @@ for (const language of ['ru-RU', 'uk-UA', 'en-US', 'de-DE', undefined]) {
   assert.equal(nodes.get('exit-message').hidden, false);
   assert.equal(document.documentElement.dataset.vcState, 'quit');
   assert.equal(modemCloses, 1, 'the page closes any modem call when VC exits');
+  assert.equal(viewportMeta.content, defaultViewportContent + (portraitTouch ? ', viewport-fit=cover' : ''),
+    'translated pages keep the same portrait-only viewport policy');
+  assert.equal(sourceButton.parentNode, portraitTouch ? footer : body,
+    'translated footer text survives portrait-only Source placement');
 }
 assert.match(app, /^import \{ pageText \} from ["']\.\/vc-language\.js\?v=/m,
   'the page imports the language module with a build hash');
-console.log('web language: ru/uk/en page, keyboard and quit wiring, locale fallback, and the CP866 Russian README passed');
+console.log('web language: portrait/nonportrait ru/uk/en page, keyboard and quit wiring, locale fallback, and the CP866 Russian README passed');
