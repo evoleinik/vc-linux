@@ -181,6 +181,19 @@ function send(data) {
   pending = next;
 }
 
+// Hack keeps drawing for a moment after its first screen appears, so a
+// before/after comparison must wait for a quiet screen (flaked 2026-10-02).
+async function settledScreen(quietMs = 300, limitMs = 5000) {
+  const start = Date.now();
+  let last = screen, since = Date.now();
+  while (Date.now() - start < limitMs) {
+    await new Promise(done => realSetTimeout(done, 50));
+    if (screen !== last) { last = screen; since = Date.now(); }
+    else if (Date.now() - since >= quietMs) return screen;
+  }
+  return screen;
+}
+
 function until(description, predicate) {
   parentPort.postMessage(description);
   return new Promise((resolveWait, reject) => {
@@ -704,7 +717,7 @@ async function checkHack() {
   assert.equal(fileFetches.length, cachedFiles, 'typed Hack reuses its already opened file contents');
   if (sourcePanel) {
     stage = 'Source Hack function map';
-    const beforeSource = screen;
+    const beforeSource = await settledScreen();
     const sourceView = await openSource('HACK.EXE');
     assert.equal(typeof sourceView.current.function, 'string', 'Hack reports a compiled C function');
     assert.ok(sourceView.current.function.length > 0);
@@ -721,7 +734,7 @@ async function checkHack() {
     assert.ok(sourceElement.textContent.includes(sourceView.current.function));
     assert.match(sourceElement.textContent, /C function[^\n]*map/);
     await closeSourceWithShortcut();
-    assert.equal(screen, beforeSource, 'opening and closing Source preserves Hack\'s screen');
+    assert.equal(await settledScreen(), beforeSource, 'opening and closing Source preserves Hack\'s screen');
     console.log('PASS Source Hack: real C function name/offset and map label, unchanged game screen');
   }
   await quitHack();

@@ -43,7 +43,8 @@ const edgeToEdge = resolve({ width: 390, height: 844, portraitTouch: true,
 assert.deepEqual(edgeToEdge.screen,
   { left: 0, top: 0, width: 390, height: 244, right: 390, bottom: 244 },
   'a 390px portrait touch screen uses the full width at the top');
-assert.equal(edgeToEdge.controls.bottom, 844, 'the portrait keypad is pinned to the viewport bottom');
+// A 12px gap keeps the bottom row off the browser's address bar (Eugene, 2026-10-02).
+assert.equal(edgeToEdge.controls.bottom, 844 - 12, 'the portrait keypad sits 12px above the viewport bottom');
 assert.equal(edgeToEdge.footer.top, edgeToEdge.screen.bottom, 'the footer directly follows VC');
 
 let cases = 0, roundTrips = 0, portraitCases = 0, portraitRoundTrips = 0;
@@ -125,7 +126,7 @@ for (const [name, metric] of variants) {
       assert.equal(closed.footer.top, closed.screen.bottom, 'there is no gap between VC and its footer');
       assert.equal(closed.footer.width, closed.screen.width, 'the footer wraps to the same safe width');
       if (closed.controls) {
-        assert.equal(closed.controls.bottom, size.height - (size.safeArea?.bottom ?? 0), 'keep keys above the home indicator');
+        assert.equal(closed.controls.bottom, size.height - (size.safeArea?.bottom ?? 0) - 12, 'keep keys 12px above the home indicator');
         assert.equal(closed.controls.height, 244, 'five 44px rows and four 6px gaps retain their measured height');
         assert.equal(closed.controls.width, closed.screen.width, 'the keypad uses the same safe width');
       } else {

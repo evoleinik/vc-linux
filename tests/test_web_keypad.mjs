@@ -286,7 +286,8 @@ assert.match(mainRule, /padding:\s*env\(safe-area-inset-top\)\s+env\(safe-area-i
   'only safe-area insets, never arbitrary screen padding');
 const pinnedRule = portraitCSS.match(/#keypad\s*\{([^}]*)\}/s)?.[1] || '';
 assert.match(pinnedRule, /position:\s*absolute\s*;/);
-assert.match(pinnedRule, /bottom:\s*env\(safe-area-inset-bottom\)\s*;/);
+assert.match(pinnedRule, /bottom:\s*calc\(env\(safe-area-inset-bottom\)\s*\+\s*12px\)\s*;/,
+  'the pinned pad keeps a 12px gap above the address bar');
 assert.match(pinnedRule, /left:\s*env\(safe-area-inset-left\)\s*;/);
 assert.match(pinnedRule, /right:\s*env\(safe-area-inset-right\)\s*;/);
 assert.match(portraitCSS, /#keypad\[data-keyboard-open="true"\]\s*\{\s*display:\s*none\s*;\s*\}/,

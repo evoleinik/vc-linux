@@ -346,7 +346,7 @@ test('portrait fits full-width native VGA pixels above the footer and bottom key
   assert.equal(screen['--vc-screen-scale-x'], '0.609375', 'mouse and selection share the render scale');
   assert.equal(screen['--vc-screen-scale-y'], '0.61');
   assert.equal(h.footer.style.top, '244px');
-  assert.equal(keys.top, '600px');
+  assert.equal(keys.top, '588px'); // 844 - 244 - 12px gap
   assert.equal(keys.width, '390px');
   assert.equal(h.button.parentNode, h.footer, 'Source belongs to the footer, not the empty gap or keypad');
   assert.equal(h.main.style['--vc-viewport-height'], '844px');
@@ -367,7 +367,7 @@ test('portrait reads all four safe insets without adding arbitrary screen margin
   assert.equal(screen.top, '47px');
   assert.equal(screen.width, '378px');
   assert.equal(screen.height, '236px');
-  assert.equal(keys.top, '566px');
+  assert.equal(keys.top, '554px'); // 844 - 34 inset - 244 - 12px gap
   assert.equal(keys.left, '7px');
   assert.equal(keys.width, '378px');
 });
@@ -391,7 +391,7 @@ for (const resizeLayout of [false, true]) test(`phone keyboard hides only the pa
   h.window.visualViewport.dispatch('resize');
   h.flushFrames();
   assert.equal(h.nodes.get('keypad').dataset.keyboardOpen, 'false');
-  assert.equal(h.nodes.get('keypad').style.top, '600px');
+  assert.equal(h.nodes.get('keypad').style.top, '588px');
 });
 
 test('browser chrome and pinch zoom do not masquerade as the phone keyboard', () => {
@@ -402,7 +402,7 @@ test('browser chrome and pinch zoom do not masquerade as the phone keyboard', ()
   h.window.visualViewport.dispatch('resize');
   h.flushFrames();
   assert.equal(h.nodes.get('keypad').dataset.keyboardOpen, 'false');
-  assert.equal(h.nodes.get('keypad').style.top, '540px', 'the pad follows ordinary browser-chrome changes');
+  assert.equal(h.nodes.get('keypad').style.top, '528px', 'the pad follows ordinary browser-chrome changes');
   h.window.visualViewport.height = 422;
   h.window.visualViewport.scale = 2;
   h.window.visualViewport.dispatch('resize');
@@ -418,9 +418,9 @@ test('portrait source uses the empty band and never scrolls the page', () => {
   const panel = h.nodes.get('source-panel');
   assert.equal(panel.dataset.position, 'between');
   assert.equal(panel.style.top, '394px');
-  assert.equal(panel.style.height, '194px');
+  assert.equal(panel.style.height, '182px');
   assert.equal(panel.hidden, false);
-  assert.equal(h.nodes.get('keypad').style.top, '600px');
+  assert.equal(h.nodes.get('keypad').style.top, '588px');
   assert.equal(h.scrolls.length, 0);
   assert.ok(!h.document.documentElement.style.overflowY);
   h.geometry.setOpen(false);
@@ -434,7 +434,7 @@ test('an exhausted portrait Source band cannot let its border overlap touch keys
   h.geometry.setOpen(true);
   h.geometry.layoutSource();
   assert.equal(h.nodes.get('source-panel').hidden, true, 'a panel shorter than its 20px chrome stays hidden');
-  assert.equal(h.nodes.get('keypad').style.top, '406px');
+  assert.equal(h.nodes.get('keypad').style.top, '394px');
   assert.equal(h.scrolls.length, 0);
 });
 
@@ -462,6 +462,6 @@ test('leaving portrait removes every mobile override and restores original Sourc
 test('portrait without the visual viewport API keeps a usable pinned layout', () => {
   const h = harness(screenLayout, undefined, { portraitTouch: true, visualViewport: false });
   h.geometry.fit();
-  assert.equal(h.nodes.get('keypad').style.top, '600px');
+  assert.equal(h.nodes.get('keypad').style.top, '588px');
   assert.equal(h.nodes.get('terminal').style.width, '390px');
 });

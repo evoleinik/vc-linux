@@ -73,7 +73,7 @@ export function portraitTouchScreenLayout(input, measure) {
     fontSize: 16,
     nativeScreen: measure(16),
     screen: rectangle(left, top, usableWidth, screenHeight),
-    controls: controls ? rectangle(left, height - bottom - controls.height, usableWidth, controls.height) : null,
+    controls: controls ? rectangle(left, height - bottom - 12 - controls.height, usableWidth, controls.height) : null,  // 12px above the address bar
     footer: rectangle(left, top + screenHeight, usableWidth, footer.height),
     panel: null,
   };

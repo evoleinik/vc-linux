@@ -27,6 +27,8 @@ function box(left, top, width, height) {
   return { left, top, width, height, right: left + width, bottom: top + height };
 }
 
+const KEYPAD_BOTTOM_GAP = 12;
+
 function portraitLayout({ width, height, footer, controls, safeArea, measurements, open, gap }) {
   const nativeScreen = measurements[16];
   if (!nativeScreen?.width || !nativeScreen.height) return { measure: 16 };
@@ -34,7 +36,8 @@ function portraitLayout({ width, height, footer, controls, safeArea, measurement
   const usableWidth = Math.max(0, width - left - right);
   const screen = box(left, top, usableWidth, Math.round(usableWidth * 400 / 640));
   const caption = box(left, screen.bottom, usableWidth, footer.height);
-  const keys = controls ? box(left, height - bottom - controls.height, usableWidth, controls.height) : null;
+  // Keep the bottom row off the browser's address bar and home indicator.
+  const keys = controls ? box(left, height - bottom - KEYPAD_BOTTOM_GAP - controls.height, usableWidth, controls.height) : null;
   const result = { fontSize: 16, nativeScreen, screen, controls: keys,
     footer: caption, panel: null };
   if (open) {
