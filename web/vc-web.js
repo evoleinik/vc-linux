@@ -25,7 +25,7 @@ document.documentElement.lang = strings.language;
 document.getElementById("page-description").textContent = strings.footer;
 document.getElementById("linux-version").textContent = strings.linux;
 document.getElementById("font-credit-label").textContent = strings.fontCredit;
-document.getElementById("keyboard-button").textContent = strings.keyboard;
+document.getElementById("keyboard-button").setAttribute("aria-label", strings.keyboard);
 const encoder = new TextEncoder();
 const input = [];
 let keyState = initialInput();

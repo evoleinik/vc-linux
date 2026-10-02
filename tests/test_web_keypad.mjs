@@ -14,7 +14,7 @@ const keypadButtons = [...keypadMarkup.matchAll(/<button\b([^>]*)>(.*?)<\/button
       .map(([, name, value]) => [name, value])),
     label: label.trim(),
   }));
-const source = await readFile(new URL('../web/vc-keypad.js', import.meta.url), 'utf8');
+const source = await readFile(join(output, 'vc-keypad.js'), 'utf8');
 const { PORTRAIT_QUERY, initialInput, reduceInput, keySequence, bindKeypad } =
   await import(`data:text/javascript,${encodeURIComponent(source)}`);
 const report = (code, flags = 0, type) => `\x1b[${code};${flags + 1}${type ? `:${type}` : ''}u`;
@@ -23,6 +23,9 @@ const keyCodes = {
   F6: 57369, F7: 57370, F8: 57371, F9: 57372, F10: 57373,
   ArrowLeft: 57350, ArrowRight: 57351, ArrowUp: 57352, ArrowDown: 57353,
   Escape: 27, Tab: 9, Insert: 57348, Enter: 13,
+  Home: 57356, End: 57357, PageUp: 57354, PageDown: 57355,
+  Delete: 57349, Backspace: 127, ' ': 32,
+  NumpadAdd: 57413, NumpadSubtract: 57412, NumpadMultiply: 57411,
 };
 for (const [key, code] of Object.entries(keyCodes)) {
   assert.equal(keySequence(key), report(code), key);
@@ -32,6 +35,51 @@ for (const [key, code] of Object.entries(keyCodes)) {
   assert.equal(result.bytes, report(code), `${key} goes through the shared input reducer`);
   assert.equal(result.handled, true);
   assert.match(page, new RegExp(`data-key="${key}"`));
+}
+const modifiers = [['Shift', 1, 57441], ['Alt', 2, 57443], ['Control', 4, 57442]];
+const greyCharacters = { NumpadAdd: '+', NumpadSubtract: '-', NumpadMultiply: '*' };
+for (const [key, code] of Object.entries(keyCodes)) for (let flags = 0; flags < 8; flags++) {
+  let state = initialInput();
+  for (const [modifier, flag] of modifiers) if (flags & flag)
+    state = reduceInput(state, { type: 'toggle', key: modifier }).state;
+  const frozen = structuredClone(state);
+  const releases = modifiers.filter(([, flag]) => flags & flag)
+    .map(([, , code]) => report(code, 0, 3)).join('');
+  const result = reduceInput(state, { type: 'pad', key });
+  assert.equal(result.bytes, report(code, flags) + releases, `${key}: sticky flags ${flags}`);
+  assert.equal(result.handled, true);
+  assert.equal(result.preventDefault, true);
+  assert.deepEqual(result.state, initialInput(), `${key}: modifiers are one-shot`);
+  assert.deepEqual(state, frozen, `${key}: encoding never mutates the previous state`);
+  if (flags || greyCharacters[key]) {
+    const physical = reduceInput(state, { type: 'key', event: {
+      type: 'keydown', key: greyCharacters[key] ?? key, code: key === ' ' ? 'Space' : key,
+    } });
+    assert.equal(physical.bytes, result.bytes, `${key}: real key and pad share sticky bytes ${flags}`);
+    assert.equal(physical.handled, true, 'xterm cannot also emit an unmodified duplicate');
+  }
+}
+for (const [code, key] of Object.entries(greyCharacters)) for (const numLock of [false, true])
+  for (let flags = 0; flags < 8; flags++) {
+    const event = { type: 'keydown', code, key,
+      shiftKey: !!(flags & 1), altKey: !!(flags & 2), ctrlKey: !!(flags & 4),
+      getModifierState: name => name === 'NumLock' && numLock };
+    const physical = reduceInput(initialInput(), { type: 'key', event });
+    assert.equal(physical.bytes, report(keyCodes[code], flags | (numLock ? 128 : 0)),
+      `${code}: physical modifiers ${flags}, NumLock ${numLock}`);
+    assert.equal(physical.handled, true);
+    assert.equal(physical.preventDefault, true);
+    const repeated = reduceInput(physical.state, { type: 'key', event: { ...event, repeat: true } });
+    assert.equal(repeated.bytes, physical.bytes, `${code}: native repeat keeps keypad identity`);
+    const released = reduceInput(physical.state, { type: 'key', event: { ...event, type: 'keyup' } });
+    assert.equal(released.bytes, '', `${code}: keyup cannot send another operator`);
+    assert.equal(reduceInput(initialInput(), { type: 'key', event: { ...event, isComposing: true } }).bytes,
+      '', `${code}: composition stays with committed text`);
+  }
+for (const [code, key] of [['Equal', '+'], ['Minus', '-'], ['Digit8', '*']]) {
+  assert.equal(reduceInput(initialInput(), { type: 'key', event: { type: 'keydown', code, key } }).handled,
+    false, `ordinary ${key} keeps xterm's existing text path`);
+  assert.equal(keySequence(key), report(key.codePointAt(0)), 'text operators are not grey keys');
 }
 assert.equal(keySequence('Unidentified'), null, 'IME placeholders are not keys');
 assert.equal(keySequence('ж', 1), report('ж'.codePointAt(0), 1));
@@ -167,6 +215,13 @@ for (const button of buttons) listeners.get('click')({ target: button, preventDe
 assert.deepEqual(pressed, buttons.filter(button => button.dataset.key !== 'Keyboard')
   .map(button => button.dataset.key), 'every published button routes its unchanged data-key');
 assert.equal(focused, 1, 'the keyboard button focuses xterm synchronously');
+const iconTarget = { closest: () => buttonFor('Keyboard') };
+listeners.get('pointerdown')({ target: iconTarget, preventDefault: () => prevented++ });
+assert.equal(prevented, buttons.length + 1, 'an SVG child tap also prevents a focus change');
+assert.equal(focused, 1, 'tapping the icon waits for click before opening the keyboard');
+listeners.get('click')({ target: iconTarget, preventDefault() {} });
+assert.equal(focused, 2, 'a click directly on the SVG follows the same keyboard callback');
+assert.equal(pressed.length, buttons.length - 1, 'the keyboard icon sends no guest key');
 media.matches = false;
 mediaListeners.get('change')();
 assert.equal(element.hidden, true, 'rotating or changing pointer type hides it again');
@@ -200,53 +255,80 @@ assert.match(webScript, /addEventListener\("contextmenu"[^;]*coarse/s,
   'a long press on a touch screen never opens the context menu');
 
 const expectedRows = [
-  ['F1', 'F2', 'F3', 'F4', 'F5'],
-  ['F6', 'F7', 'F8', 'F9', 'F10'],
-  ['Escape', 'Tab', 'ArrowUp', 'Insert', 'Enter'],
-  ['Control', 'ArrowLeft', 'ArrowDown', 'ArrowRight', 'Enter'],
-  ['Shift', 'Alt', 'Keyboard', 'Keyboard', 'Keyboard'],
+  ['F1', 'F2', 'F3', 'F4', 'F5', 'F6'],
+  ['F7', 'F8', 'F9', 'F10', 'Insert', 'Delete'],
+  ['Escape', 'Home', 'End', 'PageUp', 'PageDown', 'Backspace'],
+  ['Tab', 'NumpadAdd', 'NumpadSubtract', 'ArrowUp', 'NumpadMultiply', 'Enter'],
+  ['Shift', 'Keyboard', 'ArrowLeft', 'ArrowDown', 'ArrowRight', 'Enter'],
+  ['Control', 'Alt', ' ', ' ', ' ', ' '],
 ];
 assert.deepEqual(keypadButtons.map(button => button.attributes['data-key']),
-  [...new Set(expectedRows.flat())], 'five-row keypad order, including Shift then Alt in row five');
+  [...new Set(expectedRows.flat())], 'six-row keypad order, including the bottom Ctrl, Alt and Space');
 for (const { attributes, label } of keypadButtons) {
   assert.equal(attributes.type, 'button');
   if (/^F\d+$/.test(attributes['data-key']))
     assert.equal(label, attributes['data-key'], 'F-key labels contain only F and their number');
 }
-assert.match(keypadRule, /grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)\s*;/);
-assert.match(keypadRule, /grid-template-rows:\s*repeat\(5,\s*minmax\(44px,\s*auto\)\)\s*;/,
-  'all five rows, including the two under Enter, stay at least 44px high');
+assert.match(keypadRule, /grid-template-columns:\s*repeat\(6,\s*minmax\(0,\s*1fr\)\)\s*;/);
+assert.match(keypadRule, /grid-template-rows:\s*repeat\(6,\s*minmax\(44px,\s*auto\)\)\s*;/,
+  'all six rows, including the two under Enter, stay at least 44px high');
+assert.match(keypadRule, /(?:^|;)\s*gap:\s*6px\s*;/, 'six 44px rows and five 6px gaps total 294px');
 const classRule = className => page.match(new RegExp(`#keypad \\.${className}\\s*\\{([^}]*)\\}`, 's'))?.[1] || '';
 const enterRule = classRule('enter');
-assert.match(enterRule, /grid-column:\s*5\s*;/, 'Enter occupies column five');
-assert.match(enterRule, /grid-row:\s*3\s*\/\s*span\s+2\s*;/, 'Enter spans rows three and four');
-assert.match(classRule('keyboard'), /grid-column:\s*span\s+3\s*;/);
-assert.ok(buttonFor('Keyboard').attributes.class?.split(/\s+/).includes('keyboard'),
-  'the published Keyboard button actually receives its three-column span');
+assert.match(enterRule, /grid-column:\s*6\s*;/, 'Enter occupies column six');
+assert.match(enterRule, /grid-row:\s*4\s*\/\s*span\s+2\s*;/, 'Enter spans rows four and five');
+assert.match(classRule('space'), /grid-column:\s*span\s+4\s*;/);
+assert.ok(buttonFor(' ').attributes.class?.split(/\s+/).includes('space'),
+  'the published Space button actually receives its four-column span');
+assert.doesNotMatch(classRule('keyboard'), /grid-column/, 'Keyboard now occupies just one cell');
+const keyboardIcon = keypadButtons.find(button => button.attributes['data-key'] === 'Keyboard');
+assert.equal(keyboardIcon.attributes['aria-label'], 'Keyboard', 'the icon has a fallback accessible name');
+assert.match(keyboardIcon.label, /<svg\b[^>]*aria-hidden="true"[^>]*>/,
+  'the Keyboard label is an inline decorative icon');
+assert.match(keyboardIcon.label, /<svg\b[^>]*focusable="false"[^>]*>/,
+  'the SVG itself cannot take focus from the terminal');
+assert.doesNotMatch(keyboardIcon.label, /(?:href|src)=/, 'the keyboard icon loads nothing externally');
+for (const [key, label] of Object.entries({ Backspace: '⌫', Home: 'Home', End: 'End',
+  PageUp: 'PgUp', PageDown: 'PgDn', Delete: 'Del', NumpadAdd: '+', NumpadSubtract: '−',
+  NumpadMultiply: '*', ' ': 'Space' }))
+  assert.equal(keypadButtons.find(button => button.attributes['data-key'] === key).label, label);
+assert.equal(buttonFor('Backspace').attributes['aria-label'], 'Backspace');
 assert.doesNotMatch(keypadMarkup, /class="[^"]*\bwide\b/, 'Shift no longer takes two columns');
 
 // Model ordinary row-wise grid auto-placement, reserving Enter's explicit
-// two-row box first. This catches order/span combinations that make six rows.
-const grid = Array.from({ length: 5 }, () => Array(5).fill(null));
-grid[2][4] = grid[3][4] = 'Enter';
+// two-row box first. This catches order/span combinations that add a seventh row.
+const grid = Array.from({ length: 6 }, () => Array(6).fill(null));
+grid[3][5] = grid[4][5] = 'Enter';
 let cursor = 0;
 for (const { attributes } of keypadButtons) {
   const key = attributes['data-key'];
   if (key === 'Enter') continue;
-  const span = key === 'Keyboard' ? 3 : 1;
+  const span = key === ' ' ? 4 : 1;
   let placed = false;
-  for (; cursor < 25; cursor++) {
-    const row = Math.floor(cursor / 5), column = cursor % 5;
-    if (column + span <= 5 && grid[row].slice(column, column + span).every(value => value === null)) {
+  for (; cursor < 36; cursor++) {
+    const row = Math.floor(cursor / 6), column = cursor % 6;
+    if (column + span <= 6 && grid[row].slice(column, column + span).every(value => value === null)) {
       grid[row].fill(key, column, column + span);
       cursor += span;
       placed = true;
       break;
     }
   }
-  assert.ok(placed, `${key} fits the five-row grid`);
+  assert.ok(placed, `${key} fits the six-row grid`);
 }
 assert.deepEqual(grid, expectedRows);
+
+for (const [keys, className, border, text] of [
+  [['Home', 'End', 'PageUp', 'PageDown'], 'navigation', '#378ADD', '#B5D4F4'],
+  [['NumpadAdd', 'NumpadSubtract', 'NumpadMultiply'], 'grey', '#1D9E75', '#9FE1CB'],
+]) {
+  for (const key of keys)
+    assert.ok(buttonFor(key).attributes.class?.split(/\s+/).includes(className), `${key} colour class`);
+  const rule = classRule(className);
+  assert.match(rule, new RegExp(`border-color:\\s*${border}\\s*;`, 'i'));
+  assert.match(rule, new RegExp(`(?:^|;)\\s*color:\\s*${text}\\s*;`, 'i'));
+  assert.doesNotMatch(rule, /background/, `${className} keeps the ordinary button fill`);
+}
 
 for (const [key, className, background, border, text] of [
   ['Escape', 'escape', '#5a1616', '#e24b4a', '#ffd6d6'],
@@ -299,7 +381,7 @@ assert.match(portraitCSS, /#terminal \.xterm\s*\{[^}]*transform-origin:\s*top le
 assert.match(portraitCSS, /#source-button\s*\{[^}]*position:\s*static\s*;[^}]*min-height:\s*44px\s*;[^}]*margin-top:\s*6px\s*;/s,
   'the portrait-only Source button participates in its footer without overlapping keys');
 assert.ok(page.indexOf('id="terminal"') < page.indexOf('id="keypad"'));
-const app = await readFile(new URL('../web/vc-web.js', import.meta.url), 'utf8');
+const app = webScript;
 assert.match(app, /portraitTouch\s*\?\s*`\$\{defaultViewportContent\}, viewport-fit=cover`\s*:\s*defaultViewportContent/,
   'only portrait touch opts into cover; leaving it restores the original viewport');
 const fit = app.slice(app.indexOf('function fit('), app.indexOf('function onExit()'));
@@ -307,4 +389,4 @@ assert.ok(fit.includes('function fit('), 'inspect the actual fitting adapter');
 assert.match(app, /terminal\.onData\(enqueue\)/, 'phone text keeps the existing input queue');
 assert.match(app, /pointerdown.*terminal\?\.focus/, 'screen taps keep their mouse path');
 assert.match(app, /terminal\?\.textarea\?\.focus\(\{\s*preventScroll:\s*true\s*\}\)/);
-console.log('web keypad: five-row order/spans, colour classes, safe portrait CSS, all key bytes, sticky/physical/phone input and focus passed');
+console.log('web keypad: six-row order/spans, colour classes, safe portrait CSS, all key bytes, sticky/physical/phone input and icon focus passed');

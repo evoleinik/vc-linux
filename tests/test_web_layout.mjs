@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { mainScreenLayout, portraitTouchScreenLayout } from './fixtures/main-screen-layout.mjs';
+import { mainScreenLayout, portraitKeypadHeight, portraitTouchScreenLayout } from './fixtures/main-screen-layout.mjs';
 
 const directory = process.argv[2] || 'web';
 const source = readFileSync(join(directory, 'vc-layout.js'), 'utf8');
@@ -39,12 +39,13 @@ function resolve(input, metric = ideal) {
 }
 
 const edgeToEdge = resolve({ width: 390, height: 844, portraitTouch: true,
-  footer: { width: 390, height: 88 }, controls: { width: 390, height: 244 } });
+  footer: { width: 390, height: 88 }, controls: { width: 390, height: portraitKeypadHeight } });
 assert.deepEqual(edgeToEdge.screen,
   { left: 0, top: 0, width: 390, height: 244, right: 390, bottom: 244 },
   'a 390px portrait touch screen uses the full width at the top');
 // A 12px gap keeps the bottom row off the browser's address bar (Eugene, 2026-10-02).
 assert.equal(edgeToEdge.controls.bottom, 844 - 12, 'the portrait keypad sits 12px above the viewport bottom');
+assert.equal(edgeToEdge.controls.top, 538, 'six portrait rows lift the keypad top from 588px by exactly 50px');
 assert.equal(edgeToEdge.footer.top, edgeToEdge.screen.bottom, 'the footer directly follows VC');
 
 let cases = 0, roundTrips = 0, portraitCases = 0, portraitRoundTrips = 0;
@@ -73,7 +74,8 @@ for (const [name, metric, stableAnchor] of variants) {
           // Retain every legacy comparison above, and add a separate fixture
           // for precisely the media-selected branch.
           if (keys && width <= height) {
-            const portraitInput = { ...input, portraitTouch: true };
+            const portraitInput = { ...input, portraitTouch: true,
+              controls: { ...input.controls, height: portraitKeypadHeight } };
             const portrait = resolve(portraitInput, metric);
             assert.deepEqual(portrait, portraitTouchScreenLayout(portraitInput, metric),
               `portrait fixture differs at ${width}x${height}, ${name}`);
@@ -114,7 +116,7 @@ for (const [name, metric] of variants) {
   for (const fontSize of [1, 9, 10, 15, 16, 17, 32, 48]) {
     for (const size of portraitSizes) {
       const input = { portraitTouch: true, footer: { width: size.width - 24, height: 88 },
-        controls: { width: size.width - 24, height: 244 }, fontSize, ...size };
+        controls: { width: size.width - 24, height: portraitKeypadHeight }, fontSize, ...size };
       const closed = resolve(input, metric);
       assert.deepEqual(closed, portraitTouchScreenLayout(input, metric),
         `portrait sizing ignores previous font ${fontSize} at ${size.width}x${size.height}, ${name}`);
@@ -127,7 +129,7 @@ for (const [name, metric] of variants) {
       assert.equal(closed.footer.width, closed.screen.width, 'the footer wraps to the same safe width');
       if (closed.controls) {
         assert.equal(closed.controls.bottom, size.height - (size.safeArea?.bottom ?? 0) - 12, 'keep keys 12px above the home indicator');
-        assert.equal(closed.controls.height, 244, 'five 44px rows and four 6px gaps retain their measured height');
+        assert.equal(closed.controls.height, 294, 'six 44px rows and five 6px gaps retain their measured height');
         assert.equal(closed.controls.width, closed.screen.width, 'the keypad uses the same safe width');
       } else {
         assert.equal(input.controls, null, 'the software keyboard hides the pad without hiding or shrinking VC');
@@ -146,7 +148,7 @@ console.log('PASS portrait sizes: 390x844, 360x740, 430x932, square media, safe 
 
 for (const size of portraitSizes) {
   const input = { portraitTouch: true, footer: { width: size.width - 24, height: 88 },
-    controls: { width: size.width - 24, height: 244 }, ...size };
+    controls: { width: size.width - 24, height: portraitKeypadHeight }, ...size };
   const closed = resolve(input), opened = resolve({ ...input, open: true });
   assert.deepEqual(closed, portraitTouchScreenLayout(input, ideal));
   for (const property of ['screen', 'controls', 'footer'])
@@ -159,8 +161,23 @@ for (const size of portraitSizes) {
   assert.ok(opened.panel.height >= 0, 'short viewports collapse Source instead of requiring page scrolling');
   assert.ok(opened.panel.bottom <= (closed.controls?.top ?? size.height - (size.safeArea?.bottom ?? 0)));
   assert.deepEqual(resolve({ ...input, open: false, fontSize: opened.fontSize }), closed);
+  if (input.controls) {
+    const fiveRows = resolve({ ...input, controls: { ...input.controls, height: 244 }, open: true });
+    for (const property of ['screen', 'footer', 'fontSize', 'nativeScreen'])
+      assert.deepEqual(opened[property], fiveRows[property], `the added row cannot change portrait ${property}`);
+    assert.deepEqual(opened.controls, { ...fiveRows.controls,
+      top: fiveRows.controls.top - 50, height: fiveRows.controls.height + 50 },
+    'the 50px row lifts only the keypad top, keeping its sides and bottom fixed');
+    assert.equal(opened.panel.bottom, fiveRows.panel.bottom - 50,
+      'the Source band ends exactly 50px higher above the taller keypad');
+    assert.equal(opened.panel.height, Math.max(0, fiveRows.panel.height - 50),
+      'the Source band gives up exactly one row of free height, or collapses');
+    assert.equal(opened.panel.top, Math.min(fiveRows.panel.top, opened.panel.bottom),
+      'Source stays below the unchanged footer unless the band collapses');
+  }
 }
 console.log('PASS portrait Source: fixed screen/footer/pad, safe-width interior pane and zero-height short-window fallback');
+console.log('PASS six-row portrait delta: keypad top and Source bottom move up exactly 50px; screen, footer and safe-area bottom stay fixed');
 
 for (const [width, height] of [[390, 844], [844, 390], [1440, 900], [600, 600]]) {
   for (const controls of [null, { width: 360, height: 244 }]) {

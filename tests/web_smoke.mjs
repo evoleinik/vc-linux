@@ -1,6 +1,7 @@
 // The real translated VC in Emscripten's MEMFS, with the same byte hooks as
 // the page. Actions wait for screen state; timers only put a bound on failure.
 // Add --fetch-failure, --fetch-timeout or --memory-limit for recovery gates.
+// Add --keypad-only for the portrait pad's real VC selection/input checks.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -50,6 +51,7 @@ const lazyFilesOnly = process.argv.includes('--lazy-files-only');
 const fileFailure = process.argv.includes('--file-fetch-failure');
 const hackOnly = process.argv.includes('--hack-only');
 const sourceOnly = process.argv.includes('--source-only');
+const keypadOnly = process.argv.includes('--keypad-only');
 const lazyParentMove = process.argv.includes('--lazy-parent-move');
 const lazyRmdir = process.argv.includes('--lazy-rmdir');
 if (process.argv.includes('--no-webcrypto')) {
@@ -594,6 +596,103 @@ const isPanel = (text) => hasPanels(text) && text.includes('README');
 // independent of the left panel's remembered C: directory.
 const selected = (text) => (text.split('\n')[21] || '').slice(40);
 const commandLine = (text) => text.split('\n')[23] || '';
+
+async function checkPortraitKeypad() {
+  stage = 'portrait keypad: Grey operators and Space';
+  const page = readFileSync(join(dirname(modulePath), 'index.html'), 'utf8');
+  const markup = page.match(/<div\b[^>]*id="keypad"[^>]*>(.*?)<\/div>/s)?.[1];
+  assert.ok(markup, 'exercise the published portrait keypad markup');
+  const script = readFileSync(join(dirname(modulePath), 'vc-keypad.js'), 'utf8');
+  const { initialInput, reduceInput, bindKeypad, PORTRAIT_QUERY } =
+    await import(`data:text/javascript,${encodeURIComponent(script)}`);
+  const document = { createElement: tag => sourceNode(document, tag) };
+  const element = document.createElement('div');
+  const buttons = [...markup.matchAll(/<button\b([^>]*)>/g)].map(([, attributes]) => {
+    const button = document.createElement('button');
+    for (const [, name, value] of attributes.matchAll(/([\w-]+)="([^"]*)"/g))
+      button.setAttribute(name, value);
+    button.dataset.key = button.getAttribute('data-key');
+    button.closest = selector => selector === 'button[data-key]' ? button : null;
+    return button;
+  });
+  element.append(...buttons);
+  element.contains = button => buttons.includes(button);
+  element.querySelectorAll = selector => selector === 'button[data-key]' ? buttons : [];
+  let state = initialInput();
+  let binding;
+  const dispatch = action => {
+    const result = reduceInput(state, action);
+    state = result.state;
+    binding?.setSticky(state.sticky);
+    send(result.bytes);
+    return result;
+  };
+  // Only DOM storage/events are doubled: taps use the published binding and
+  // reducer, then the existing input queue and the actual wasm terminal.
+  binding = bindKeypad(element, {
+    matchMedia(query) {
+      assert.equal(query, PORTRAIT_QUERY);
+      return { matches: true, addEventListener() {}, removeEventListener() {} };
+    },
+    onKey(key) {
+      const result = dispatch({ type: /^(Control|Alt|Shift)$/.test(key) ? 'toggle' : 'pad', key });
+      assert.equal(result.handled, true, `${key}: a portrait tap is an encoded guest key`);
+    },
+    onKeyboard() { assert.fail('selection and Space must not open the phone keyboard'); },
+    onHide: () => dispatch({ type: 'clearSticky' }),
+  });
+  assert.equal(element.hidden, false, 'the keypad is visible for coarse-pointer portrait');
+  const tap = key => {
+    const button = buttons.find(button => button.dataset.key === key);
+    assert.ok(button, `the published portrait pad provides ${JSON.stringify(key)}`);
+    let prevented = 0;
+    for (const type of ['pointerdown', 'click'])
+      element.dispatch(type, { target: button, preventDefault() { prevented++; } });
+    assert.equal(prevented, 2, `${key}: pad input preserves terminal focus`);
+  };
+  const filesBefore = fileFetches.length;
+  const modulesBefore = moduleFetches.length;
+  // DOS contains several files but no child directories. Use its unchanged
+  // lazy metadata to know how many files VC, not the harness, must select.
+  const files = vc.FS.readdir('/home/vc/DOS').filter(name =>
+    vc.FS.isFile(vc.FS.stat(`/home/vc/DOS/${name}`).mode));
+  assert.ok(files.length > 1, 'group selection covers more than a single file');
+  send('cd DOS\r');
+  const inDOS = text => hasPanels(text) && commandLine(text).trimEnd() === 'H:\\DOS>';
+  await until('the DOS panel before portrait group selection', inDOS);
+  assert.doesNotMatch(selected(screen), /selected files?/, 'the panel initially has no selected files');
+  const allSelected = new RegExp(`\\b${files.length} selected files\\b`);
+  for (const [key, title, count] of [
+    ['NumpadAdd', 'Select', files.length],
+    ['NumpadSubtract', 'Unselect', 0],
+    ['NumpadMultiply', 'Invert', files.length],
+    ['NumpadMultiply', 'Invert', 0],
+  ]) {
+    tap(key);
+    await until(`portrait ${key} opens VC's ${title} dialog`, text =>
+      text.includes(`${title} the files`) && text.includes('*.*'));
+    tap('Enter');
+    await until(`portrait ${key} and Enter leave ${count} selected panel files`, text =>
+      inDOS(text) && (count ? allSelected.test(selected(text)) : !/selected files?/.test(selected(text))));
+  }
+  send('pad');
+  await until('the command-line prefix before portrait Space', text =>
+    commandLine(text).trimEnd() === 'H:\\DOS>pad');
+  tap(' ');
+  send('check');
+  await until('portrait Space separates two words on VC\'s command line', text =>
+    commandLine(text).trimEnd() === 'H:\\DOS>pad check');
+  tap('Escape');
+  await until('portrait Escape clears the unexecuted command', inDOS);
+  send('cd ..\r');
+  await until('root panels after portrait keypad checks', text =>
+    isPanel(text) && commandLine(text).trimEnd() === 'H:\\>');
+  assert.equal(fileFetches.length, filesBefore, 'group selection needs no lazy file contents');
+  assert.equal(moduleFetches.length, modulesBefore, 'pad selection and command editing launch no programs');
+  binding.dispose();
+  console.log('PASS portrait keypad: Grey +/−/* and pad Enter select, unselect and invert real panel files; Space edits the command line');
+}
+
 const rogueStatus = /Level:\s*(\d+)\s+Gold:\s*\d+\s+Hp:\s*\d+\(\s*\d+\)/;
 const roguePlayers = (text) => text.split('\n').flatMap((line, row) =>
   row > 0 && !rogueStatus.test(line)
@@ -1655,7 +1754,7 @@ try {
       };
     };
   }
-  if (!fetchFailure && !fetchTimeout && !memoryLimit && !msdosOnly && !hackOnly && !sourceOnly && !lazyParentMove && !lazyRmdir) await installSourcePanel();
+  if (!fetchFailure && !fetchTimeout && !memoryLimit && !msdosOnly && !hackOnly && !sourceOnly && !keypadOnly && !lazyParentMove && !lazyRmdir) await installSourcePanel();
   const wasmBinary = await readFile(new URL('./vc.wasm', moduleURL));
   const installedAfter = Date.now();
   await createVC({
@@ -1738,6 +1837,13 @@ try {
   assert.ok(!vc.FS.analyzePath('/home/vc/GAMES/NOTHING.TXT').exists);
   console.log('PASS 1: startup shows 10Quit and README on H:');
 
+  if (keypadOnly) {
+    await checkPortraitKeypad();
+    await quitVC();
+    console.log('web portrait keypad smoke passed');
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
   if (fileFailure || lazyFilesOnly) {
     await checkLazyFiles();
     await quitVC();
@@ -1798,6 +1904,7 @@ try {
     exitAfterOutput(0);
     await new Promise(() => {});
   }
+  await checkPortraitKeypad();
   await checkLazyFiles();
   await checkHack();
   await checkLazySources();
@@ -2359,7 +2466,7 @@ try {
   await quitVC();
   console.log('PASS 26: F10, Enter quits and fires the exit hook');
   assertFetches();
-  console.log('web smoke: legacy checks, Hack, DOS shell/utilities, Russian F3, lazy H: files, VC405, Source, and all fifteen first-use/cached module fetches passed');
+  console.log('web smoke: portrait keypad, legacy checks, Hack, DOS shell/utilities, Russian F3, lazy H: files, VC405, Source, and all fifteen first-use/cached module fetches passed');
   exitAfterOutput(0);
 } catch (error) {
   fail(error);

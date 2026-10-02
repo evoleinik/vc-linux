@@ -11,11 +11,12 @@ const namedCodes = {
   ArrowLeft: 57350, ArrowRight: 57351, ArrowUp: 57352, ArrowDown: 57353,
   PageUp: 57354, PageDown: 57355, Home: 57356, End: 57357, Pause: 57362,
 };
+const numpadCodes = { NumpadAdd: 57413, NumpadSubtract: 57412, NumpadMultiply: 57411 };
 const controlCodes = { "[": 91, i: 105, m: 109, h: 104 };
 const report = (code, flags, type) => `\x1b[${code};${flags + 1}${type ? `:${type}` : ""}u`;
 
 export function keySequence(key, flags = 0) {
-  let code = namedCodes[key];
+  let code = namedCodes[key] ?? numpadCodes[key];
   if (/^F(?:[1-9]|1[0-2])$/.test(key)) code = 57363 + Number(key.slice(1));
   if (code === undefined && [...key].length === 1) code = key.codePointAt(0);
   return code === undefined ? null : report(code, flags);
@@ -111,9 +112,14 @@ export function reduceInput(state, action) {
       if (code !== undefined) bytes = report(code, flags);
     }
   }
-  if (bytes === null && state.sticky) bytes = keySequence(event.key, flags);
+  // xterm reports these as ordinary text, losing VC's grey-key scan codes.
+  // Share the pad's kitty encoding; event.code preserves keypad identity even
+  // under Shift or NumLock. Other physical keys retain xterm's translations.
+  const numpad = numpadCodes[event.code];
+  if (bytes === null && (state.sticky || numpad))
+    bytes = keySequence(numpad ? event.code : event.key, flags);
   if (bytes !== null) return clearSticky(state, bytes);
-  // Unmodified desktop keys keep xterm's established translations.
+  // Other desktop keys keep xterm's established translations.
   return result(state, "", false, /^F(?:[1-9]|1[0-2])$/.test(event.key) || event.ctrlKey);
 }
 

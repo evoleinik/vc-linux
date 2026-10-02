@@ -82,8 +82,8 @@
       display: none;
       flex: none;
       width: min(100%, 640px);
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      grid-template-rows: repeat(5, minmax(44px, auto));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      grid-template-rows: repeat(6, minmax(44px, auto));
       gap: 6px;
       touch-action: manipulation;
     }
@@ -110,15 +110,18 @@
     #keypad .escape { background: #5a1616; border-color: #e24b4a; color: #ffd6d6; }
     #keypad .tab { background: #4a3306; border-color: #ba7517; color: #ffe2b0; }
     #keypad .enter {
-      grid-column: 5;
-      grid-row: 3 / span 2;
+      grid-column: 6;
+      grid-row: 4 / span 2;
       background: #173d0a;
       border-color: #639922;
       color: #d8f0b8;
     }
     #keypad .modifier { border-color: #7f77dd; color: #cecbf6; }
     #keypad .modifier[aria-pressed="true"] { background: #534AB7; color: #fff; }
-    #keypad .keyboard { grid-column: span 3; }
+    #keypad .navigation { border-color: #378ADD; color: #B5D4F4; }
+    #keypad .grey { border-color: #1D9E75; color: #9FE1CB; }
+    #keypad .space { grid-column: span 4; }
+    #keypad .keyboard svg { vertical-align: middle; }
     @media (pointer: coarse) and (orientation: portrait) {
       html, body { overflow: hidden; }
       main {
@@ -169,18 +172,33 @@
       <button type="button" data-key="F8">F8</button>
       <button type="button" data-key="F9">F9</button>
       <button type="button" data-key="F10">F10</button>
-      <button type="button" data-key="Escape" class="escape">Esc</button>
-      <button type="button" data-key="Tab" class="tab">Tab</button>
-      <button type="button" data-key="ArrowUp" aria-label="Up">↑</button>
       <button type="button" data-key="Insert">Ins</button>
+      <button type="button" data-key="Delete">Del</button>
+      <button type="button" data-key="Escape" class="escape">Esc</button>
+      <button type="button" data-key="Home" class="navigation">Home</button>
+      <button type="button" data-key="End" class="navigation">End</button>
+      <button type="button" data-key="PageUp" class="navigation">PgUp</button>
+      <button type="button" data-key="PageDown" class="navigation">PgDn</button>
+      <button type="button" data-key="Backspace" aria-label="Backspace">⌫</button>
+      <button type="button" data-key="Tab" class="tab">Tab</button>
+      <button type="button" data-key="NumpadAdd" class="grey" aria-label="Grey +">+</button>
+      <button type="button" data-key="NumpadSubtract" class="grey" aria-label="Grey −">−</button>
+      <button type="button" data-key="ArrowUp" aria-label="Up">↑</button>
+      <button type="button" data-key="NumpadMultiply" class="grey" aria-label="Grey *">*</button>
       <button type="button" data-key="Enter" class="enter">Enter</button>
-      <button type="button" data-key="Control" class="modifier" aria-pressed="false">Ctrl</button>
+      <button type="button" data-key="Shift" class="modifier" aria-pressed="false">Shift</button>
+      <button id="keyboard-button" type="button" data-key="Keyboard" class="keyboard" aria-label="Keyboard">
+        <svg width="24" height="18" viewBox="0 0 24 18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="1" y="1" width="22" height="16" rx="2"/>
+          <path d="M5 5h2m2 0h2m2 0h2m2 0h2M5 9h2m2 0h2m2 0h2m2 0h2M7 13h10"/>
+        </svg>
+      </button>
       <button type="button" data-key="ArrowLeft" aria-label="Left">←</button>
       <button type="button" data-key="ArrowDown" aria-label="Down">↓</button>
       <button type="button" data-key="ArrowRight" aria-label="Right">→</button>
-      <button type="button" data-key="Shift" class="modifier" aria-pressed="false">Shift</button>
+      <button type="button" data-key="Control" class="modifier" aria-pressed="false">Ctrl</button>
       <button type="button" data-key="Alt" class="modifier" aria-pressed="false">Alt</button>
-      <button id="keyboard-button" type="button" data-key="Keyboard" class="keyboard">Keyboard</button>
+      <button type="button" data-key=" " class="space">Space</button>
     </div>
     <aside id="source-panel" aria-label="Original source" hidden></aside>
     <footer>

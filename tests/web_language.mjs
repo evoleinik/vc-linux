@@ -71,7 +71,8 @@ const html = readFileSync(new URL('index.html', pageDirectory), 'utf8');
 for (const portraitTouch of [false, true]) for (const language of ['ru-RU', 'uk-UA', 'en-US', 'de-DE', undefined]) {
   let modemCloses = 0;
   const nodes = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) =>
-    [id, { textContent: '', hidden: true, dataset: {}, addEventListener() {} }]));
+    [id, { textContent: '', hidden: true, dataset: {}, attributes: {},
+      setAttribute(name, value) { this.attributes[name] = value; }, addEventListener() {} }]));
   const style = () => ({
     setProperty(name, value) { this[name] = value; },
     removeProperty(name) { delete this[name]; },
@@ -118,8 +119,10 @@ for (const portraitTouch of [false, true]) for (const language of ['ru-RU', 'uk-
   assert.equal(nodes.get('page-description')?.textContent, text.footer, 'the page uses the footer');
   assert.equal(nodes.get('linux-version')?.textContent, text.linux, 'the link text is translated');
   assert.equal(nodes.get('font-credit-label')?.textContent, text.fontCredit, 'the credit is translated');
-  assert.equal(nodes.get('keyboard-button')?.textContent, text.keyboard,
-    'the real keyboard button uses the translated label');
+  assert.equal(nodes.get('keyboard-button')?.attributes['aria-label'], text.keyboard,
+    'the real keyboard icon uses the translated accessible label');
+  assert.equal(nodes.get('keyboard-button')?.textContent, '',
+    'localization never replaces the inline keyboard icon with text');
   assert.equal(nodes.get('exit-message').textContent, text.quit, 'the actual exit hook is translated');
   assert.equal(nodes.get('exit-message').hidden, false);
   assert.equal(document.documentElement.dataset.vcState, 'quit');

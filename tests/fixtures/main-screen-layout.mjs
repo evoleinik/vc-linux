@@ -62,6 +62,10 @@ export function mainScreenLayout(input, measure) {
 // Brief 35's closed portrait-touch fixture is separate from the verbatim
 // main arithmetic above. Native 80x25 rendering is scaled into a full-width
 // 640:400 box; footer flow and the bottom-pinned keys do not affect its size.
+// Brief 38 adds one 44px row and one 6px gap, moving only the keypad's top
+// 50px upward. The legacy desktop/landscape fixture above stays unchanged.
+export const portraitKeypadHeight = 6 * 44 + 5 * 6;
+
 export function portraitTouchScreenLayout(input, measure) {
   const { width, height, footer, controls = null } = input;
   const { top = 0, right = 0, bottom = 0, left = 0 } = input.safeArea ?? {};

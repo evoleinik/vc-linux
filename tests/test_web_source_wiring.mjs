@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
+import { portraitKeypadHeight } from './fixtures/main-screen-layout.mjs';
 
 const output = process.argv[2] || 'build/web';
 const page = readFileSync(join(output, 'index.html'), 'utf8');
@@ -88,6 +89,8 @@ function harness(layoutFunction, screenMetric = size => ({ width: 40 * size, hei
       setAttribute(name, value) { this.attributes[name] = value; },
       removeAttribute(name) { delete this.attributes[name]; } }]));
   const media = { ...eventTarget(), matches: portraitTouch };
+  nodes.get('keypad').getBoundingClientRect = () => ({ width: 366,
+    height: media.matches ? portraitKeypadHeight : 244 });
   const main = { style: style(), clientWidth: 390, clientHeight: 844 };
   const body = { insertBefore(node) { node.parentNode = this; } };
   const footer = { style: style(), appendChild(node) { node.parentNode = this; },
@@ -346,7 +349,7 @@ test('portrait fits full-width native VGA pixels above the footer and bottom key
   assert.equal(screen['--vc-screen-scale-x'], '0.609375', 'mouse and selection share the render scale');
   assert.equal(screen['--vc-screen-scale-y'], '0.61');
   assert.equal(h.footer.style.top, '244px');
-  assert.equal(keys.top, '588px'); // 844 - 244 - 12px gap
+  assert.equal(keys.top, '538px'); // 844 - 294 - 12px gap; 50px above the five-row pad
   assert.equal(keys.width, '390px');
   assert.equal(h.button.parentNode, h.footer, 'Source belongs to the footer, not the empty gap or keypad');
   assert.equal(h.main.style['--vc-viewport-height'], '844px');
@@ -367,7 +370,7 @@ test('portrait reads all four safe insets without adding arbitrary screen margin
   assert.equal(screen.top, '47px');
   assert.equal(screen.width, '378px');
   assert.equal(screen.height, '236px');
-  assert.equal(keys.top, '554px'); // 844 - 34 inset - 244 - 12px gap
+  assert.equal(keys.top, '504px'); // 844 - 34 inset - 294 - 12px gap
   assert.equal(keys.left, '7px');
   assert.equal(keys.width, '378px');
 });
@@ -391,7 +394,7 @@ for (const resizeLayout of [false, true]) test(`phone keyboard hides only the pa
   h.window.visualViewport.dispatch('resize');
   h.flushFrames();
   assert.equal(h.nodes.get('keypad').dataset.keyboardOpen, 'false');
-  assert.equal(h.nodes.get('keypad').style.top, '588px');
+  assert.equal(h.nodes.get('keypad').style.top, '538px');
 });
 
 test('browser chrome and pinch zoom do not masquerade as the phone keyboard', () => {
@@ -402,7 +405,7 @@ test('browser chrome and pinch zoom do not masquerade as the phone keyboard', ()
   h.window.visualViewport.dispatch('resize');
   h.flushFrames();
   assert.equal(h.nodes.get('keypad').dataset.keyboardOpen, 'false');
-  assert.equal(h.nodes.get('keypad').style.top, '528px', 'the pad follows ordinary browser-chrome changes');
+  assert.equal(h.nodes.get('keypad').style.top, '478px', 'the pad follows ordinary browser-chrome changes');
   h.window.visualViewport.height = 422;
   h.window.visualViewport.scale = 2;
   h.window.visualViewport.dispatch('resize');
@@ -418,13 +421,38 @@ test('portrait source uses the empty band and never scrolls the page', () => {
   const panel = h.nodes.get('source-panel');
   assert.equal(panel.dataset.position, 'between');
   assert.equal(panel.style.top, '394px');
-  assert.equal(panel.style.height, '182px');
+  assert.equal(panel.style.height, '132px');
   assert.equal(panel.hidden, false);
-  assert.equal(h.nodes.get('keypad').style.top, '588px');
+  assert.equal(h.nodes.get('keypad').style.top, '538px');
   assert.equal(h.scrolls.length, 0);
   assert.ok(!h.document.documentElement.style.overflowY);
   h.geometry.setOpen(false);
   h.geometry.layoutSource();
+  assert.equal(h.scrolls.length, 0);
+});
+
+test('a sixth portrait row lifts the keypad and Source boundary by exactly 50px', () => {
+  const h = harness(screenLayout, undefined, { portraitTouch: true });
+  const keys = h.nodes.get('keypad'), panel = h.nodes.get('source-panel');
+  const sixRowMeasurement = keys.getBoundingClientRect;
+  keys.getBoundingClientRect = () => ({ width: 366, height: 244 });
+  h.geometry.setOpen(true);
+  h.geometry.layoutSource();
+  const screenBefore = { ...h.nodes.get('terminal').style }, footerBefore = { ...h.footer.style };
+  const keysTopBefore = parseFloat(keys.style.top), panelTopBefore = parseFloat(panel.style.top);
+  const panelHeightBefore = parseFloat(panel.style.height);
+
+  keys.getBoundingClientRect = sixRowMeasurement;
+  h.geometry.fit();
+  assert.equal(parseFloat(keys.style.top), keysTopBefore - 50);
+  assert.equal(parseFloat(keys.style.top) + sixRowMeasurement().height, keysTopBefore + 244,
+    'the bottom row stays pinned 12px above the safe-area bottom');
+  assert.equal(parseFloat(panel.style.top), panelTopBefore);
+  assert.equal(parseFloat(panel.style.height), panelHeightBefore - 50);
+  assert.equal(parseFloat(panel.style.top) + parseFloat(panel.style.height),
+    panelTopBefore + panelHeightBefore - 50);
+  assert.deepEqual(h.nodes.get('terminal').style, screenBefore, 'the VC screen does not move');
+  assert.deepEqual(h.footer.style, footerBefore, 'the footer does not move');
   assert.equal(h.scrolls.length, 0);
 });
 
@@ -434,7 +462,7 @@ test('an exhausted portrait Source band cannot let its border overlap touch keys
   h.geometry.setOpen(true);
   h.geometry.layoutSource();
   assert.equal(h.nodes.get('source-panel').hidden, true, 'a panel shorter than its 20px chrome stays hidden');
-  assert.equal(h.nodes.get('keypad').style.top, '394px');
+  assert.equal(h.nodes.get('keypad').style.top, '344px');
   assert.equal(h.scrolls.length, 0);
 });
 
@@ -462,6 +490,6 @@ test('leaving portrait removes every mobile override and restores original Sourc
 test('portrait without the visual viewport API keeps a usable pinned layout', () => {
   const h = harness(screenLayout, undefined, { portraitTouch: true, visualViewport: false });
   h.geometry.fit();
-  assert.equal(h.nodes.get('keypad').style.top, '588px');
+  assert.equal(h.nodes.get('keypad').style.top, '538px');
   assert.equal(h.nodes.get('terminal').style.width, '390px');
 });
