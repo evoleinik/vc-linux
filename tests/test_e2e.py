@@ -95,16 +95,19 @@ def confirm_until(s: VcSession, done, timeout: float = 10.0) -> None:
     in, so a key sent on a timer can land before the box can take it."""
     import time
     end = time.time() + timeout
-    answered = None
+    answered, answered_at = None, 0.0
     while time.time() < end:
         s.pump(0.1)
         if done():
             return
         box = [line for line in s.text().splitlines() if "Delete" in line and "║" in line]
-        if box and box != answered:
+        # VC flushes the keyboard while it opens a box, so on a loaded machine
+        # an Enter can vanish. If the same box is still up 1.5 s later, press
+        # Enter again (CI lost one on 2026-10-02 in the symlink delete test).
+        if box and (box != answered or time.time() - answered_at > 1.5):
             s.pump(0.3)  # let the zoom finish
             s.send("enter")
-            answered = box
+            answered, answered_at = box, time.time()
     raise AssertionError(f"not done after {timeout}s\n{s.text()}")
 
 
@@ -428,8 +431,7 @@ def test_delete_symlink_to_ancestor(work, tmp_path):
         select(s, "up")
         s.send("f8")
         s.wait_for("Delete", timeout=5)
-        s.send("enter")
-        until(s, lambda: not (work / "up").is_symlink())
+        confirm_until(s, lambda: not (work / "up").is_symlink())
     finally:
         s.close()
     assert (work / "hello.txt").exists()
