@@ -460,3 +460,10 @@ def test_pdcurses_date_stamp_is_pinned():
     for bad in (b"no stamp here", image + image, b"PDCurses 3.9 - tomorrow!!!\x00"):
         with pytest.raises(SystemExit):
             build_rogue.pin_build_date(bad)
+    # In the object, the containing OMF record's checksum must stay valid.
+    data = b"\x00\x00\x00" + b"PDCurses 3.9 - Oct  2 2026\x00"
+    body = bytes([0xA0]) + (len(data) + 1).to_bytes(2, "little") + data
+    record = body + bytes([-sum(body) & 0xFF])
+    pinned = build_rogue.pin_object_date(b"\x80\x02\x00\x00\x00" + record)
+    assert b"Oct  1 2026" in pinned
+    assert sum(pinned[5:]) & 0xFF == 0

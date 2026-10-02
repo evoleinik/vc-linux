@@ -69,6 +69,8 @@ def build(root: Path, watcom: Path, out: Path, jobs: int) -> None:
                  for path, obj in zip(sources, objects)]
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         list(pool.map(run, commands))
+    initscr = out / "pdc" / "initscr.obj"
+    initscr.write_bytes(pin_object_date(initscr.read_bytes()))
     library = out / "pdcurses.lib"
     run([watcom / "binl64/wlib", "-q", "-n", "-b", library] + ["+" + str(path) for path in pdcobjects])
     linkfile = out / "rogue.lnk"
@@ -79,8 +81,9 @@ def build(root: Path, watcom: Path, out: Path, jobs: int) -> None:
     lines += [f"library {library}"]
     linkfile.write_text("\n".join(lines) + "\n")
     run([watcom / "binl64/wlink", "@" + str(linkfile)])
-    exe = out / "ROGUE.EXE"
-    exe.write_bytes(pin_build_date(exe.read_bytes()))
+    image = (out / "ROGUE.EXE").read_bytes()
+    if pin_build_date(image) != image:
+        raise SystemExit("ROGUE.EXE: PDCurses date stamp was not pinned before linking")
     # The license and source notice accompany both redistributed executables.
     notice = (watcom / "license.txt").read_bytes()
     notice += (b"\r\nOpenWatcom runtime source:\r\n"
@@ -93,7 +96,9 @@ def build(root: Path, watcom: Path, out: Path, jobs: int) -> None:
 # PDCurses stamps __DATE__ into its notice (initscr.c), and OpenWatcom ignores
 # SOURCE_DATE_EPOCH and refuses to redefine __DATE__. Unpinned, ROGUE.EXE
 # changed every day; CI went red at midnight UTC on 2026-10-02. Pin the stamp
-# to the day this build was verified, so the pinned hashes hold.
+# in the object file, before linking, to the day this build was verified, so
+# the linked image, the OMF data the translator checks it against, and the
+# pinned hashes all agree.
 PDC_NOTICE = b"PDCurses 3.9 - "
 PDC_DATE = b"Oct  1 2026"
 
@@ -107,6 +112,24 @@ def pin_build_date(image: bytes) -> bytes:
     if not re.fullmatch(rb"[A-Z][a-z]{2} [ 123][0-9] [0-9]{4}", stamp):
         raise SystemExit(f"ROGUE.EXE: unexpected PDCurses date stamp {stamp!r}")
     return image[:start] + PDC_DATE + image[start + len(PDC_DATE):]
+
+
+def pin_object_date(obj: bytes) -> bytes:
+    """Pin the stamp inside an OMF object and repair its record checksum."""
+    pinned = bytearray(pin_build_date(obj))
+    at = pinned.find(PDC_NOTICE)
+    offset = 0
+    while offset < len(pinned):
+        length = int.from_bytes(pinned[offset + 1:offset + 3], "little")
+        end = offset + 3 + length
+        if offset <= at < end:
+            if at + len(PDC_NOTICE) + len(PDC_DATE) > end - 1:
+                raise SystemExit("initscr.obj: date stamp crosses an OMF record")
+            if pinned[end - 1]:  # zero means "no checksum" in OMF
+                pinned[end - 1] = -sum(pinned[offset:end - 1]) & 0xFF
+            return bytes(pinned)
+        offset = end
+    raise SystemExit("initscr.obj: date stamp is outside every OMF record")
 
 
 def main() -> None:
