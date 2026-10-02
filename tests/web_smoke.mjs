@@ -635,8 +635,15 @@ async function startHack() {
 }
 
 async function quitHack() {
-  send('Q');
-  await until('Hack asks Really quit?', text => text.includes('Really quit?'));
+  // Hack's dungeon is random: a monster next to the start can leave a --More--
+  // up, which eats the Q (CI, 2026-10-02). Dismiss it, then ask to quit.
+  for (let tries = 0; tries < 8 && !screen.includes('Really quit?'); tries++) {
+    const previous = screen;
+    send(screen.includes('--More--') ? ' ' : 'Q');
+    await until('Hack shows its next prompt or Really quit?', text =>
+      text !== previous || text.includes('Really quit?'));
+  }
+  assert.ok(screen.includes('Really quit?'), 'Hack asks Really quit?');
   send('y');
   for (let prompts = 0; prompts < 8; prompts++) {
     await until('Hack returns to VC or asks to continue its score screen', text =>
