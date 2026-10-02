@@ -6,6 +6,9 @@ It neither installs nor adds the file's bytes to the native binary.
 file. --web-only-lazy does the same without a native installation. Their exact
 content-derived URLs go in C; the sibling .web.json manifest lets web_files.py
 publish the bytes separately, with no dependency on the page's version hash.
+--native-only=NAME=PATH installs a native file without adding its bytes or name
+to the browser. A separate --web-only-lazy entry may expose the same file under
+the browser's H: path without creating duplicate references.
 
 Writes the `embedded_files` table declared in runtime/rt.h. Native arrays stay
 unchanged. The browser reconstructs VC from its already-linked, unrelocated
@@ -97,10 +100,11 @@ def main() -> None:
     for pair in pairs:
         web_only = pair.startswith(("--web-only=", "--web-only-lazy="))
         lazy = pair.startswith(("--web-lazy=", "--web-only-lazy="))
-        if web_only or lazy:
+        native_only = pair.startswith("--native-only=")
+        if web_only or lazy or native_only:
             pair = pair.split("=", 1)[1]
         name, path = pair.split("=", 1)
-        if web_only and name in ("VC.COM", "VC.OVL"):
+        if (web_only or native_only) and name in ("VC.COM", "VC.OVL"):
             raise ValueError("VC's built-in files must exist in both builds")
         if lazy and name in ("VC.COM", "VC.OVL", "VC.INI", "VC.EXT", "VCEDIT.EXT"):
             raise ValueError(f"{name}: VC's startup files must remain eager")
@@ -110,13 +114,13 @@ def main() -> None:
         names.add(name)
         data = Path(path).read_bytes()
         parts = vc_parts(name, path, data) if name in ("VC.COM", "VC.OVL") else None
-        entries.append((name, data, parts, len(payload), web_only, lazy))
+        entries.append((name, data, parts, len(payload), web_only, lazy, native_only))
         if lazy:
             digest = sha256(data).hexdigest()
             lazy_files.append({"name": name, "source": str(Path(path).resolve()),
                                "asset": f"file.{digest[:12]}.bin", "sha256": digest,
                                "size": len(data), "checksum": zlib.adler32(data)})
-        elif parts is None:
+        elif parts is None and not native_only:
             payload.extend(data)
 
     lines = ['#include "rt.h"', '#ifdef __EMSCRIPTEN__', '#include "embed_lzma.h"',
@@ -139,12 +143,14 @@ def main() -> None:
             "  if (embed_adler32(embedded_unpacked, sizeof embedded_unpacked) !=",
             f"          {zlib.adler32(payload)}u) abort();",
         ]
-    for i, (name, data, parts, offset, web_only, lazy) in enumerate(entries):
+    for i, (name, data, parts, offset, web_only, lazy, native_only) in enumerate(entries):
         if lazy:
             lines += ["#ifdef __EMSCRIPTEN__", f"#define f{i} NULL"]
             if not web_only:
                 lines += ["#else", *array(f"f{i}", data)]
             lines.append("#endif")
+        elif native_only:
+            lines += ["#ifndef __EMSCRIPTEN__", *array(f"f{i}", data), "#endif"]
         elif parts is not None:
             image, prefix, suffix, size = parts
             lines += ["#ifdef __EMSCRIPTEN__", f"static uint8_t f{i}[{len(data)}];"]
@@ -178,8 +184,10 @@ def main() -> None:
                 lines.append("#endif")
         if web_only:
             table.append("#ifdef __EMSCRIPTEN__")
+        elif native_only:
+            table.append("#ifndef __EMSCRIPTEN__")
         table.append(f'  {{{json.dumps(name, ensure_ascii=False)}, f{i}, {len(data)}}},')
-        if web_only:
+        if web_only or native_only:
             table.append("#endif")
     lines += ["", "const EmbeddedFile embedded_files[] = {", *table, "};"]
     lines.append("const int embedded_file_count = sizeof embedded_files / sizeof embedded_files[0];")

@@ -368,9 +368,9 @@ struct Known {
     int ndeltas;
 };
 
-/* VC's two parts plus BASIC, Logo, Rogue and VZ need six entries, which
- * survive child termination. Leave two slots for further compiled-C images. */
-#define MAX_KNOWN 16
+/* VC's two parts and fifteen other translated programs need seventeen entries,
+ * which survive child termination. Keep one spare for another image. */
+#define MAX_KNOWN 18
 static Known known[MAX_KNOWN];
 static int nknown;
 static struct { const Image *image; RtImageRunner run; } supplements[MAX_KNOWN];
@@ -565,6 +565,72 @@ static int code_matches(const Known *k, uint32_t off, uint32_t L, uint32_t n) {
     return 1;
 }
 
+enum { COPY_MATCH_WIDTH = 12 };
+typedef struct {
+    Known *known;
+    uint32_t off;
+    unsigned width, order;
+    int cached;
+} CopyMatch;
+
+/* A copied block's final instruction can have only three unchanged bytes.
+ * Keep that fallback, but prefer the candidate whose surrounding bytes give
+ * the strongest evidence. COMMAND moves its EXEC routine repeatedly; two
+ * different TEST instructions share seven bytes and can otherwise make an
+ * old delta win over the newer, correctly relocated routine. */
+static unsigned copy_match_width(const Known *k, uint32_t off, uint32_t L,
+                                 int preceding) {
+    if (off > k->img->size) return 0;
+    uint32_t available = preceding ? off : k->img->size - off;
+    if (preceding && available > L) available = L;
+    unsigned limit = available < COPY_MATCH_WIDTH ? available : COPY_MATCH_WIDTH;
+    if (!limit) return 0;
+    if (code_matches(k, preceding ? off - limit : off,
+                     preceding ? L - limit : L, limit)) return limit;
+    unsigned width = 0;
+    while (width < limit && code_matches(k,
+            preceding ? off - width - 1 : off + width,
+            preceding ? L - width - 1 : L + width, 1)) ++width;
+    return width;
+}
+
+static int consider_copy_match(CopyMatch *best, CopyMatch after, Known *k,
+                               uint32_t off, uint32_t L, int preceding,
+                               unsigned order, int cached) {
+    unsigned width = copy_match_width(k, off, L, preceding);
+    unsigned minimum = preceding && off < 3 ? off : 3;
+    if (!minimum || width < minimum || width <= best->width ||
+        width > after.width || (width == after.width && order <= after.order)) return 0;
+    *best = (CopyMatch){k, off, width, order, cached};
+    return width == COPY_MATCH_WIDTH;
+}
+
+/* Enumerate candidates in descending match strength, retaining the existing
+ * cached/newest-image order for ties. A rejected translation entry has no
+ * guest side effects, so dispatch can ask for the next candidate. The source
+ * inspector uses this same selector without probing any translated code. */
+static CopyMatch next_copy_match(uint32_t L, int preceding, CopyMatch after) {
+    CopyMatch best = {0};
+    unsigned order = 0;
+    for (int i = 0; i < nmoved; ++i, ++order) {
+        Moved *m = &moved[i];
+        if (m->lin != L) continue;
+        Known *k = find_known(m->img);
+        if (k && consider_copy_match(&best, after, k, m->off, L,
+                                     preceding, order, 1)) return best;
+    }
+    for (int i = nknown - 1; i >= 0; --i) {
+        Known *k = &known[i];
+        for (int j = 0; j < k->ndeltas; ++j, ++order) {
+            int64_t off = (int64_t)L - k->base - k->deltas[j];
+            if (off < 0 || off > k->img->size) continue;
+            if (consider_copy_match(&best, after, k, (uint32_t)off, L,
+                                     preceding, order, 0)) return best;
+        }
+    }
+    return best;
+}
+
 const Image *rt_image_return(const char *name, uint16_t cs, uint16_t ip) {
     Known *k = NULL;
     for (int i = nknown - 1; i >= 0; --i)
@@ -615,9 +681,9 @@ static int source_matches(const Known *k, uint32_t off, uint32_t L,
 static SourceLocation source_location(uint16_t cs, uint16_t ip, int preceding) {
     SourceLocation out = {.cs = cs, .ip = ip};
     uint32_t L = lin(cs, ip);
-    /* Preserve dispatch order: most recently loaded live image, exact
-     * cached copy, then already-observed deltas. Unlike run_at, never probe
-     * a translation to discover an instruction boundary. The fetched map
+    /* Preserve dispatch order: most recently loaded live image, then the
+     * strongest known copied-code match. Unlike run_at, never probe a
+     * translation to discover an instruction boundary. The fetched map
      * makes that final check without changing guest state. */
     for (int i = nknown - 1; i >= 0; --i) {
         Known *k = &known[i];
@@ -628,25 +694,11 @@ static SourceLocation source_location(uint16_t cs, uint16_t ip, int preceding) {
         out.offset = off;
         return out;
     }
-    for (int i = 0; i < nmoved; ++i) {
-        Moved *m = &moved[i];
-        if (m->lin != L) continue;
-        Known *k = find_known(m->img);
-        if (!k || !source_matches(k, m->off, L, preceding, 3)) continue;
-        out.image = k->img->name;
-        out.offset = m->off;
-        return out;
-    }
-    for (int i = nknown - 1; i >= 0; --i) {
-        Known *k = &known[i];
-        for (int j = 0; j < k->ndeltas; ++j) {
-            int64_t off = (int64_t)L - k->base - k->deltas[j];
-            if (off < 0 || off > k->img->size ||
-                !source_matches(k, (uint32_t)off, L, preceding, 3)) continue;
-            out.image = k->img->name;
-            out.offset = (uint32_t)off;
-            return out;
-        }
+    CopyMatch match = next_copy_match(L, preceding,
+                                     (CopyMatch){.width = COPY_MATCH_WIDTH + 1});
+    if (match.known) {
+        out.image = match.known->img->name;
+        out.offset = match.off;
     }
     return out;
 }
@@ -778,26 +830,14 @@ static int run_at(uint32_t L) {
         uint32_t n = k->img->size - off < 6 ? k->img->size - off : 6;
         if (code_matches(k, off, L, n) && run_image(k, off) == 0) { n_direct++; return 1; }
     }
-    for (int i = 0; i < nmoved; i++) {
-        Moved *m = &moved[i];
-        Known *k = find_known(m->img);
-        if (m->lin == L && code_matches(k, m->off, L, 3)) {
-            n_cached++;
-            return run_moved(k, m->off, L) == 0;
-        }
+    CopyMatch match = {.width = COPY_MATCH_WIDTH + 1};
+    while ((match = next_copy_match(L, 0, match)).known) {
+        if (run_moved(match.known, match.off, L) != 0) continue;
+        if (match.cached) n_cached++;
+        else { n_delta++; note_moved(match.known, match.off, L); }
+        return 1;
     }
-    /* A copy we already know: the same offset, and at least 3 matching bytes
-     * at an instruction start. A block's last instruction is followed by
-     * different bytes in the copy, so a longer match cannot be required. */
-    for (int i = nknown - 1; i >= 0; i--) {
-        Known *k = &known[i];
-        for (int j = 0; j < k->ndeltas; j++) {
-            int64_t off = (int64_t)L - k->deltas[j] - k->base;
-            if (off < 0 || off + 3 > k->img->size || !code_matches(k, (uint32_t)off, L, 3)) continue;
-            if (run_moved(k, (uint32_t)off, L) == 0) { n_delta++; note_moved(k, (uint32_t)off, L); return 1; }
-        }
-    }
-    const uint32_t K = 12;
+    const uint32_t K = COPY_MATCH_WIDTH;
     n_search++;
     for (int i = nknown - 1; i >= 0; i--) {
         Known *k = &known[i];

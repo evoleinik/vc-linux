@@ -2,7 +2,7 @@
 // reads JWasm's byte/source columns and binary-map table itself; it does not ask
 // the Python map builder which instruction addresses ought to be present.
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { readFile, mkdtemp, open, writeFile, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
@@ -11,9 +11,31 @@ import { spawnSync } from 'node:child_process';
 const root = resolve(import.meta.dirname, '..');
 const output = resolve(process.argv[2] || process.env.WEB_OUT || join(root, 'build/web'));
 const build = resolve(process.env.BUILD_DIR || join(root, 'build'));
+const source = await readFile(join(output, 'vc-source.js'), 'utf8');
+const { sourceLocation } = await import(`data:text/javascript,${encodeURIComponent(source)}`);
 const indexName = (await readFile(`${output}-work/source-index-name.txt`, 'utf8')).trim();
 const physicalLines = text => text.split('\n').map(line => line.replace(/\r$/, ''));
 const hash = data => createHash('sha256').update(data).digest('hex').slice(0, 12);
+
+async function captured(command, args, cwd = root) {
+  // Managed sandboxes can deny pipe capture even when the child succeeds.
+  // Private files preserve real Make/JWasm/Python diagnostics in that case.
+  const directory = await mkdtemp(join(tmpdir(), 'vc-source-command-'));
+  const stdoutPath = join(directory, 'stdout'), stderrPath = join(directory, 'stderr');
+  let stdout, stderr;
+  try {
+    stdout = await open(stdoutPath, 'wx');
+    stderr = await open(stderrPath, 'wx');
+    const result = spawnSync(command, args, { cwd, timeout: 30000,
+      stdio: ['ignore', stdout.fd, stderr.fd] });
+    assert.ifError(result.error);
+    return { ...result, stdout: await readFile(stdoutPath, 'utf8'), stderr: await readFile(stderrPath, 'utf8') };
+  } finally {
+    await stdout?.close();
+    await stderr?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
 
 async function generated(name) {
   assert.equal(basename(name), name, `unsafe generated filename: ${name}`);
@@ -42,16 +64,35 @@ function originalText(bytes, path = '') {
 const index = JSON.parse(await generated(indexName));
 assert.equal(index.version, 1);
 assert.deepEqual(Object.keys(index.images).sort(),
-  ['VC.COM', 'VC.OVL', 'GWBASIC.EXE', 'LOGO.COM', 'ROGUE.EXE', 'VZ.COM', 'VC405.COM', 'VCSETUP.COM'].sort());
+  ['VC.COM', 'VC.OVL', 'GWBASIC.EXE', 'LOGO.COM', 'ROGUE.EXE', 'HACK.EXE', 'VZ.COM', 'VC405.COM', 'VCSETUP.COM'].sort());
+
+// Ask make for its expanded prerequisites without building anything. A map
+// that is correct once but stays stale after HACK.MAP changes is still broken.
+const prerequisites = await captured('make', ['--no-print-directory', '--dry-run', '--eval',
+  '.PHONY: source-map-inputs\nsource-map-inputs: ; $(info SOURCE_MAP_INPUTS=$(WEB_SOURCE_INPUTS))',
+  `B=${build}`, 'source-map-inputs']);
+assert.equal(prerequisites.status, 0, prerequisites.stdout + prerequisites.stderr);
+const sourceInputs = prerequisites.stdout.match(/^SOURCE_MAP_INPUTS=(.*)$/m)?.[1].split(/\s+/);
+assert.ok(sourceInputs, 'make did not expose Source map prerequisites');
+for (const filename of ['HACK.EXE', 'HACK.MAP']) {
+  assert.ok(sourceInputs.includes(join(build, 'hack', filename)),
+    `${filename}: Hack changes must invalidate the published Source map`);
+}
 const maps = new Map();
 const originals = new Map();
 let fetchedBytes = 0;
 const sourceURLs = new Set();
+const imageDirectories = { 'GWBASIC.EXE': 'gwbasic', 'LOGO.COM': 'bootlogo',
+  'ROGUE.EXE': 'rogue', 'HACK.EXE': 'hack', 'VZ.COM': 'vz', 'VC405.COM': 'vc405', 'VCSETUP.COM': 'vc405' };
 for (const [image, item] of Object.entries(index.images)) {
   const map = JSON.parse(await generated(item.url));
   assert.equal(map.version, 1);
   assert.equal(map.image, image);
   maps.set(image, map);
+  const executable = await readFile(join(build, imageDirectories[image] || '', image === 'VC405.COM' ? 'VC.COM' : image));
+  const expectedStack = executable[0] === 0x4d && executable[1] === 0x5a
+    ? { segment: executable.readUInt16LE(14), top: executable.readUInt16LE(16) || 0x10000 } : undefined;
+  assert.deepEqual(map.stack, expectedStack, `${image}: Source stack bounds must match the original MZ header`);
   if (map.kind !== 'asm') continue;
   for (const file of map.files) {
     const bytes = await readFile(join(root, file.path));
@@ -232,25 +273,48 @@ for (const image of ['VC.COM', 'VC.OVL', 'VC405.COM', 'VCSETUP.COM']) {
   console.log(`source maps: ${image}: every ${listed.length.toLocaleString('en')} listed instruction maps once; 10 mnemonic samples; ${generatedCount} generated samples; ${expectedCalls.length} CALL ends`);
 }
 
-// Rogue is a separate provenance class. Every published function must be a
+// Compiled C is a separate provenance class. Every published function must be a
 // CODE address and a symbol literally present in the linker's memory map.
-const rogue = maps.get('ROGUE.EXE');
-assert.equal(rogue.kind, 'functions');
-assert.equal(rogue.lines, undefined, 'compiled C must not claim invented C line numbers');
-assert.equal(rogue.files, undefined, 'compiled C has function symbols, not source-line mappings');
-const rogueMap = await readFile(join(build, 'rogue/ROGUE.MAP'), 'utf8');
-const symbols = new Set();
-for (const line of rogueMap.split('|   Memory Map   |', 2)[1].split('|   Module Segments   |', 1)[0].split('\n')) {
-  const match = line.trim().match(/^([\da-f]{4}):([\da-f]{4})[*+]?\s+(\S+)$/i);
-  if (match) symbols.add(`${parseInt(match[1], 16) * 16 + parseInt(match[2], 16)}:${match[3]}`);
+for (const image of ['ROGUE.EXE', 'HACK.EXE']) {
+  const map = maps.get(image), stem = image.slice(0, -4);
+  assert.equal(map.kind, 'functions');
+  assert.equal(map.lines, undefined, 'compiled C must not claim invented C line numbers');
+  assert.equal(map.files, undefined, 'compiled C has function symbols, not source-line mappings');
+  const linkerMap = await readFile(join(build, stem.toLowerCase(), `${stem}.MAP`), 'utf8');
+  const segments = [];
+  for (const line of linkerMap.split('|   Segments   |', 2)[1].split('|   Memory Map   |', 1)[0].split('\n')) {
+    const match = line.trim().match(/^\S+\s+CODE\s+\S+\s+([\da-f]{4}):([\da-f]{4})\s+([\da-f]+)$/i);
+    if (match) {
+      const start = parseInt(match[1], 16) * 16 + parseInt(match[2], 16);
+      segments.push([start, start + parseInt(match[3], 16)]);
+    }
+  }
+  assert.ok(segments.length, `${image}: no CODE segments in independent link-map oracle`);
+  const symbols = new Set();
+  for (const line of linkerMap.split('|   Memory Map   |', 2)[1].split('|   Module Segments   |', 1)[0].split('\n')) {
+    const match = line.trim().match(/^([\da-f]{4}):([\da-f]{4})[*+]?\s+(\S+)$/i);
+    if (match) symbols.add(`${parseInt(match[1], 16) * 16 + parseInt(match[2], 16)}:${match[3]}`);
+  }
+  let end = 0;
+  for (const [start, next, name] of map.functions) {
+    assert.ok(start >= end && next > start, `${image}: compiled function ranges overlap`);
+    end = next;
+    assert.ok(symbols.has(`${start}:${name}`), `${image}: invented a function: ${name}`);
+    assert.ok(segments.some(([first, last]) => start >= first && next <= last),
+      `${image}: ${name} must stay inside its CODE segment`);
+    for (const address of [start, next - 1]) {
+      const location = sourceLocation(map, address);
+      assert.equal(location.image, image);
+      assert.equal(location.function, name, `${image}: Source panel cannot resolve ${name}`);
+      assert.equal(location.offset, address - start);
+      assert.equal(location.label, 'C function (map)');
+      assert.equal(location.line, undefined, 'Source must not present an invented C line');
+    }
+  }
+  assert.ok(map.functions.length > 200, `${image}: lost its mapped functions`);
+  assert.ok(map.calls.length > 100, `${image}: lost its mapped CALL ends`);
+  console.log(`source maps: ${image}: ${map.functions.length} real CODE functions resolve in Source; ${map.calls.length} CALL ends`);
 }
-let end = 0;
-for (const [start, next, name] of rogue.functions) {
-  assert.ok(start >= end && next > start, 'compiled function ranges overlap');
-  end = next;
-  assert.ok(symbols.has(`${start}:${name}`), `Rogue invented a function: ${name}`);
-}
-assert.ok(rogue.functions.length > 200, 'Rogue lost its mapped functions');
 
 // The current tree includes UTF-8 conversions. A CP866-only fixture prevents
 // the required DOS fallback from becoming untested when every real file is
@@ -261,10 +325,10 @@ try {
   const comment = Buffer.from([0x8f, 0xe0, 0xa8, 0xa2, 0xa5, 0xe2]); // Привет in CP866
   const source = Buffer.concat([Buffer.from('.model tiny\r\n.code\r\norg 100h\r\nstart:\tmov ax,1 ; '), comment, Buffer.from('\r\n\tret\r\nend start\r\n')]);
   await writeFile(join(fixture, 'FIXTURE.ASM'), source);
-  const assemble = spawnSync(join(root, 'tools/jwasm/jwasm'), ['-q', '-Sg', '-bin', '-Fl=FIXTURE.lst', '-Fo=FIXTURE.COM', 'FIXTURE.ASM'], { cwd: fixture, encoding: 'utf8' });
+  const assemble = await captured(join(root, 'tools/jwasm/jwasm'), ['-q', '-Sg', '-bin', '-Fl=FIXTURE.lst', '-Fo=FIXTURE.COM', 'FIXTURE.ASM'], fixture);
   assert.equal(assemble.status, 0, assemble.stdout + assemble.stderr);
   const program = `import json,sys\nfrom pathlib import Path\nfrom tools.source_maps import Sources,jwasm_origins,decode_source\np=Path(sys.argv[1])\no=jwasm_origins(p/'FIXTURE.lst',Sources(p))\nt,e=decode_source((p/'FIXTURE.ASM').read_bytes())\nprint(json.dumps({'text':t,'encoding':e,'lines':[x.line for x in o.values()]}))\n`;
-  const run = spawnSync(join(root, '.venv/bin/python'), ['-c', program, fixture], { cwd: root, encoding: 'utf8' });
+  const run = await captured(join(root, '.venv/bin/python'), ['-c', program, fixture]);
   assert.equal(run.status, 0, run.stdout + run.stderr);
   const value = JSON.parse(run.stdout);
   assert.equal(value.encoding, 'ibm866');
@@ -275,4 +339,4 @@ try {
   await rm(fixture, { recursive: true, force: true });
 }
 
-console.log(`source maps: exact original text/CP866, include breadcrumbs, immutable URLs, all eight images; ${fetchedBytes.toLocaleString('en')} source-text bytes (${sourceURLs.size} lazy files)`);
+console.log(`source maps: exact original text/CP866, include breadcrumbs, immutable URLs, all nine images; ${fetchedBytes.toLocaleString('en')} source-text bytes (${sourceURLs.size} lazy files)`);

@@ -21,6 +21,15 @@ You are @. Move with h (left), j (down), k (up), l (right); y/u/b/n
 move diagonally. ? shows help. Q then y quits and returns to VC.
 S then y saves in the current directory; ROGUE there restores the game.
 Saves and scores disappear when the page is reloaded, like all H: files.
+Open GAMES\HACK and press Enter on HACK.EXE for Hack 1.0.3, the game
+NetHack grew from. All files are listed immediately; each file loads on
+its first open, and code loads on first run. You can also type HACK.
+You are @. Use h/j/k/l and y/u/b/n to move, ? for help, S to save,
+and Q then y to quit. HACK restores its save on the next start.
+Data, saves, bones and scores stay in GAMES\HACK until the page reloads.
+On Linux, type HACK103 instead: HACK stays a host command, such as bsdgames.
+To launch a particular Linux copy, open its directory and type DOS2 /C HACK.EXE.
+Browser and door commands remain HACK, with the game at H:\GAMES\HACK\HACK.EXE.
 Select BBS.TAK and press Enter to dial the notanemulator BBS in MS-DOS Kermit.
 Its own ANSI-BBS terminal connects through a virtual 14400-bps Hayes modem.
 Ctrl-] then C returns to Kermit's prompt; HANGUP, then EXIT, returns to VC.
@@ -55,7 +64,7 @@ Inside VZ Editor:
   F12         English help. Esc closes help.
 New lines use DOS CRLF. VZ's original settings add a final Ctrl-Z byte on save.
 
-HISTORY.TXT tells VC's story. SRC holds its assembly sources.
+HISTORY.TXT tells VC's story. Each SRC assembly file loads on first open.
 GAMES holds twelve of David Ahl's public-domain BASIC Computer Games.
 SPIRAL.BAS is our own short SCREEN 1 / DRAW graphics demonstration.
 Open GAMES, select a .BAS file and press Enter to play.
@@ -67,6 +76,8 @@ LOGOLIC.TXT is bootLogo's BSD-2 licence, by Oscar Toledo G.
 GAMES/ROGUELIC.TXT is Rogue's BSD-3 licence, by Toy, Arnold and Wichman.
 GAMES/PDCLIC.TXT has the public-domain notice for its PDCurses DOS port.
 GAMES/OWLIC.TXT has the OpenWatcom runtime licence and its source link.
+GAMES/HACK/HACKLIC.TXT and FENLIC.TXT are Hack's two BSD-3 licences,
+by CWI Amsterdam and Jay Fenlason; this is NetBSD's maintained 1.0.3.
 VZLIC.TXT is VZ Editor's BSD-3 licence, by c.mos / Village Center.
 KERMLIC.TXT is MS-DOS Kermit's BSD-3 licence, by Columbia University.
 DOS/DOSLIC.TXT is Microsoft's MIT licence for MS-DOS 2.0's shell and utilities.

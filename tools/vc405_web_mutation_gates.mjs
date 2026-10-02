@@ -1,4 +1,4 @@
-// Brief 32: exercise the real static gates on isolated publication copies.
+// Briefs 32/36: exercise the real static gates on isolated publication copies.
 // node tools/vc405_web_mutation_gates.mjs [build/web] [build/vc405-web-mutations]
 // No browser, server, network, checked-out source, or live build is modified.
 // Rehash source maps/indexes before testing their semantic defects, so those
@@ -93,7 +93,7 @@ try {
   }
   // Source-map tests only read these dependencies; their generated CP866
   // fixture and any Python cache stay under temporary, not in the checkout.
-  for (const name of ['asm', 'asm405', 'third_party', 'tools', 'translator', '.venv', 'build']) {
+  for (const name of ['Makefile', 'asm', 'asm405', 'third_party', 'tools', 'translator', '.venv', 'build']) {
     await symlink(join(root, name), join(repo, name));
   }
   const gate = (name, script, site) => run(name, process.execPath, [join(repo, 'tests', script), site]);
@@ -102,7 +102,7 @@ try {
   green('baseline assets', await gate('baseline-assets', 'web_assets.mjs', snapshot));
   green('baseline source maps', await gate('baseline-source', 'test_source_maps.mjs', snapshot));
   const before = firstLoad(size);
-  report(`GREEN baseline: ${before.toLocaleString('en')} gzip bytes; assets and all eight Source registrations pass.`);
+  report(`GREEN baseline: ${before.toLocaleString('en')} gzip bytes; assets and all nine Source registrations pass.`);
 
   const indexName = (await readFile(`${snapshot}-work/source-index-name.txt`, 'utf8')).trim();
   const originalIndex = JSON.parse(await readFile(join(snapshot, indexName)));
@@ -224,8 +224,8 @@ try {
   await mkdir(generated, { recursive: true });
   const test = await readFile(join(root, 'tests/test_translator_regression.py'), 'utf8');
   await writeFile(join(regression, 'tests/test_translator_regression.py'), test);
-  const earlier = [...test.matchAll(/^\s+"([a-z_]+\.c)": "[0-9a-f]{64}",$/gm)].map(match => match[1]);
-  assert.equal(earlier.length, 15, 'regression mutation must cover the full earlier-program baseline');
+  const earlier = [...test.matchAll(/^\s+"([a-z0-9_]+\.c)": "[0-9a-f]{64}",$/gm)].map(match => match[1]);
+  assert.equal(earlier.length, 17, 'regression mutation must cover every earlier program including VC 4.05');
   for (const name of earlier) await symlink(join(root, 'build/gen', name), join(generated, name));
   const regressionGate = name => run(name, join(root, '.venv/bin/python'),
     ['-m', 'pytest', '-q', '-p', 'no:cacheprovider', '--noconftest', 'tests/test_translator_regression.py'], regression);
@@ -234,10 +234,10 @@ try {
   const changed = Buffer.from(original);
   changed[0] ^= 1;
   await owned(generated, 'command.c', changed);
-  red('prior-generated-c', await regressionGate('prior-c-red'), /command\.c changed while adding VC 4\.05/);
+  red('prior-generated-c', await regressionGate('prior-c-red'), /command\.c changed while rebasing Hack/);
   await owned(generated, 'command.c', original);
   green('prior C restored', await regressionGate('prior-c-restored'));
-  report('GREEN prior-generated-c restored: all 15 earlier generated-C hash comparisons pass.');
+  report('GREEN prior-generated-c restored: all 17 earlier generated-C hash comparisons pass.');
   report('GREEN complete: 11 isolated defects rejected and individually restored; live source and build output were never modified.');
 } finally {
   await writeFile(join(evidence, 'summary.log'), `${summary.join('\n')}\n`).catch(() => {});

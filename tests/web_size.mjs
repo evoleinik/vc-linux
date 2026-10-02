@@ -40,6 +40,8 @@ while (pending.length) {
 }
 
 assert.ok(sizes.has('vc.wasm'), 'the main wasm must be included in the first-load budget');
+assert.ok(![...sizes.keys()].some(file => /^(?:hack[.]|file[.]|(?:hack|source)-files[.])/.test(file)),
+  'Hack translations and lazy DOS files must be absent from first-load dependencies');
 const total = [...sizes.values()].reduce((sum, size) => sum + size, 0);
 for (const [file, size] of [...sizes].sort()) console.log(`  ${file}: ${size.toLocaleString('en-US')} gzip bytes`);
 console.log(`web first load: ${total.toLocaleString('en-US')} gzip bytes (${(total / 1_000_000).toFixed(3)} MB; limit 1,300,000)`);
@@ -48,3 +50,5 @@ const beforeLazyFiles = 1_299_288;
 const reduction = beforeLazyFiles - total;
 console.log(`web lazy-file reduction: ${beforeLazyFiles.toLocaleString('en-US')} -> ${total.toLocaleString('en-US')} gzip bytes; saved ${reduction.toLocaleString('en-US')} (required 150,000)`);
 assert.ok(reduction >= 150_000, `lazy H: files saved ${reduction} bytes; need at least 150000`);
+assert.ok(total <= mainBaseline + rebaseAllowance,
+  `first load ${total} exceeds main's ${mainBaseline} plus ${rebaseAllowance} bytes`);

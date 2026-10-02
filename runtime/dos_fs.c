@@ -105,6 +105,9 @@ struct DosPathLease {
     uint16_t psp;
     bool bound;
     bool recreate; /* Owner moved the leaf; retain only its pathname reservation. */
+#ifndef __EMSCRIPTEN__
+    bool guard_directory; /* Native playground: also validate relative-name opens. */
+#endif
     unsigned count;
     char dos[128], host[PATH_MAX];
     LeasePart parts[64];
@@ -814,6 +817,16 @@ static bool lease_parent(const DosPathLease *lease, const LeasePart *part, const
     return strlen(dir) == part->parent_end && !memcmp(dir, lease->host, part->parent_end);
 }
 
+#ifndef __EMSCRIPTEN__
+static int guarded_directory(const char *dir)
+{
+    for (DosPathLease *lease = path_leases; lease; lease = lease->next)
+        if (active_lease(lease) && lease->guard_directory && path_below(dir, lease->host) &&
+            lease_validate(lease, lease->count)) return 5;
+    return 0;
+}
+#endif
+
 /* Consult leases before exact native lookup: a newly created literal 8.3
  * name must cause refusal, not steal the selected file's saved spelling. */
 static int resolve_leased_name(const char *dir, const char *name, char out[PATH_MAX],
@@ -1178,6 +1191,9 @@ static int set_birth(const struct stat *st, struct timespec time)
 
 static int resolve_name(const char *dir, const char *name, char *out, bool allow_missing)
 {
+#ifndef __EMSCRIPTEN__
+    if (guarded_directory(dir)) return 5;
+#endif
     char utf8[4 * (DOS_NAME_MAX + 1)], exact[PATH_MAX];
     if (strlen(name) > DOS_NAME_MAX) return 3;
     bool claimed;
@@ -1226,6 +1242,9 @@ static int resolve_path(const char *dos, char out[PATH_MAX], bool allow_missing)
     if (pipe) return pipe < 0 ? -pipe : 0;
     const DosDrive *d = drives + drive;
     strcpy(out, (*p == '/' || *p == '\\') ? d->root : d->cwd);
+#ifndef __EMSCRIPTEN__
+    if (guarded_directory(out)) return 5;
+#endif
     if (door_root_fd >= 0) {
         struct stat st;
         if (fs_stat(out, &st, false)) return dos_errno(errno);
@@ -1339,6 +1358,22 @@ int dos_fs_pin_path(const char *dos, const char *host, DosPathLease **out)
     return 0;
 }
 
+#ifndef __EMSCRIPTEN__
+int dos_fs_guard_directory(const char *dos, const char *host, DosPathLease **out)
+{
+    int error = dos_fs_pin_path(dos, host, out);
+    if (error) return error;
+    DosPathLease *lease = *out;
+    if (lease->parts[lease->count - 1].type != S_IFDIR) {
+        dos_fs_release_path(lease);
+        *out = NULL;
+        return 5;
+    }
+    lease->guard_directory = true;
+    return 0;
+}
+#endif
+
 static int memory_path(uint16_t seg, uint16_t off, char out[PATH_MAX], bool allow_missing)
 {
     char dos[DOS_PATH_MAX];
@@ -1424,6 +1459,14 @@ static int host_to_dos(const char *host, bool short_names, char *out, size_t cap
 {
     return host_to_dos_on_drive(host, host_drive(host), short_names, out, cap);
 }
+
+#ifndef __EMSCRIPTEN__
+int dos_fs_host_short_path(const char *host, char *out, size_t cap)
+{
+    if (!host || *host != '/' || !out) return 5;
+    return host_to_dos(host, true, out, cap);
+}
+#endif
 
 static bool pack_time(struct timespec ts, uint16_t *time, uint16_t *date)
 {

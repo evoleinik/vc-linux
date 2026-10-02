@@ -10,6 +10,10 @@ import { isMainThread, parentPort, Worker, workerData } from 'node:worker_thread
 
 const cases = ['vc', 'vc-line', 'kermit', 'gwbasic', 'debug', 'tab', 'con', 'nul',
   'pipe-h', 'pipe-c', 'fcb-ren', 'fcb-del'];
+// Hack's PATH entry crosses a DOS environment-allocation paragraph. Exercise
+// both sides of several boundaries, not just one lucky transient-code base.
+const pathPadding = [0, 13, 14, 29, 30, 45, 46, 61, 62, 64];
+cases.push(...pathPadding.map(size => `vc-path-${size}`));
 const timeout = Number(process.env.WEB_SMOKE_TIMEOUT || 12000);
 
 if (isMainThread) {
@@ -41,6 +45,7 @@ if (isMainThread) {
 }
 
 const { modulePath, scenario } = workerData;
+const nestedVC = scenario === 'vc' || scenario.startsWith('vc-path-');
 const moduleURL = pathToFileURL(modulePath);
 const { default: createVC } = await import(moduleURL);
 const screenPath = '/tmp/brief31-screen.txt';
@@ -165,13 +170,26 @@ try {
   assert.equal(fetches.size, 0, 'first screen does not fetch COMMAND or utilities');
 
   if (scenario !== 'vc-line') await startCommand();
-  if (scenario === 'vc' || scenario === 'vc-line') {
+  if (scenario.startsWith('vc-path-')) {
+    const padding = Number(scenario.slice('vc-path-'.length));
+    const base = 'H:\\;H:\\DOS;H:\\GAMES;C:\\var\\vc\\config\\vc-linux\\;C:\\';
+    // The extra entry is deliberately nonexistent and searched only after
+    // VC's real installation directory. Only the copied environment length
+    // changes; neither program bytes nor the translated loader are patched.
+    const command = `set PATH=${base}${padding ? ';' + 'P'.repeat(padding - 1) : ''}`;
+    assert.ok(command.length < 127, 'PATH sweep fits the original DOS command-line buffer');
+    send(`${command}\r`);
+    await until(`COMMAND applies ${padding} bytes of PATH padding`, text =>
+      pending.length === 0 && /^[CH]:\\[^\n>]*>\s*$/.test(lastLine(text)) &&
+      text.split('\n').map(line => line.trimEnd()).join('').includes(`>${command}`));
+  }
+  if (nestedVC || scenario === 'vc-line') {
     const before = loads('VC.OVL');
     const beforeLog = log().length;
     send('vc\r');
     await until('VC launched under COMMAND or reports a DOS overlay error', text =>
       (loads('VC.OVL') > before && panels(text)) ||
-      (scenario === 'vc' && prompt(text) && text.includes('Error reading overlay file.')));
+      (nestedVC && prompt(text) && text.includes('Error reading overlay file.')));
     const childLog = log().slice(beforeLog);
     assert.match(childLog, /translation VC\.COM \(DOS-hosted loader\)/);
     if (/^terminate psp [0-9A-F]{4} code 2$/m.test(childLog)) {
@@ -181,12 +199,12 @@ try {
       // but never a runtime fatal or losing the enclosing shell/file manager.
       // With /C vc, COMMAND exits too and the OUTER VC redraws its panels.
       // Those panels must not be mistaken for a successfully nested VC.
-      if (scenario === 'vc') assert.match(screen, /Error reading overlay file\./);
+      if (nestedVC) assert.match(screen, /Error reading overlay file\./);
       else assert.ok(panels(screen));
       assert.doesNotMatch(childLog, /fatal:|no translated code at/);
     } else {
       assert.ok(panels(screen), 'successful nested VC must display its panels');
-      await quitChildVC(scenario === 'vc' ? prompt : panels);
+      await quitChildVC(nestedVC ? prompt : panels);
     }
   } else if (scenario === 'kermit') {
     outcome = 'Kermit PUSH reports a guest error';

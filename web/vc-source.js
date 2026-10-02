@@ -56,8 +56,20 @@ function callBefore(map, address, kind) {
 
 export function walkCallers(snapshot, mapFor, resolveAddress, missing = new Set()) {
   const result = [];
-  let cs = snapshot.current?.cs ?? snapshot.raw.cs;
+  const current = snapshot.current;
+  let cs = current?.cs ?? snapshot.raw.cs;
   const words = snapshot.stack || [];
+  const stack = current?.image ? mapFor(current.image)?.stack : null;
+  let stackTop = 0x10000;
+  if (stack && Number.isInteger(current.cs) && Number.isInteger(current.ip) && Number.isInteger(current.offset)) {
+    // A live MZ address gives its load paragraph. Apply the declared stack
+    // only when SS still names that original segment; alternate stacks and
+    // moved-code contexts with no matching stack keep the bounded fallback.
+    const base = (current.cs * 16 + current.ip - current.offset) & 0xfffff;
+    if (!(base & 15) && snapshot.raw.ss === (((base >>> 4) + stack.segment) & 0xffff)
+        && snapshot.raw.sp <= stack.top)
+      stackTop = stack.top;
+  }
   const check = (address, kind) => {
     if (!address?.image) return null;
     const map = mapFor(address.image);
@@ -69,10 +81,11 @@ export function walkCallers(snapshot, mapFor, resolveAddress, missing = new Set(
   };
   for (let index = 0; index < words.length && result.length < 8; index++) {
     const word = words[index];
+    if (word.sp >= stackTop) break;
     const next = words[index + 1];
     // FAR CALL pushes CS and IP. Once one is accepted, subsequent NEAR
     // returns belong to that caller's CS, not the currently running one.
-    const far = next && check(word.far !== undefined ? word.far
+    const far = next && next.sp < stackTop && check(word.far !== undefined ? word.far
       : resolveAddress(next.word, word.word, 1), "far");
     if (far) {
       result.push({ ...far, sp: word.sp });

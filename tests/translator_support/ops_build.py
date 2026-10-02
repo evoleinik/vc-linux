@@ -83,12 +83,12 @@ def load_cases() -> tuple[InstructionCase, ...]:
     assert generated.returncode == 0, generated.stdout
     result = []
     seen = set()
-    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE",
+    for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM", "ROGUE.EXE", "HACK.EXE", "VZ.COM", "KERMIT.EXE",
                  *msdos_programs, "VC405.COM", "VCSETUP.COM"):
-        if name == "ROGUE.EXE":
-            directory = ROOT / "build" / "rogue"
+        if name in ("ROGUE.EXE", "HACK.EXE"):
+            directory = ROOT / "build" / Path(name).stem.lower()
             loaded = load_image(directory / name)
-            layout = build_compiled_layout(loaded, directory / "ROGUE.MAP")
+            layout = build_compiled_layout(loaded, directory / f"{Path(name).stem}.MAP")
         elif name == "GWBASIC.EXE":
             directory = ROOT / "build" / "gwbasic"
             loaded = load_image(directory / name)

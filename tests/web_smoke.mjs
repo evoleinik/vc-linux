@@ -48,6 +48,14 @@ const msdosOnly = process.argv.includes('--msdos-only');
 const vc405Only = process.argv.includes('--vc405-only');
 const lazyFilesOnly = process.argv.includes('--lazy-files-only');
 const fileFailure = process.argv.includes('--file-fetch-failure');
+const hackOnly = process.argv.includes('--hack-only');
+const sourceOnly = process.argv.includes('--source-only');
+const lazyParentMove = process.argv.includes('--lazy-parent-move');
+const lazyRmdir = process.argv.includes('--lazy-rmdir');
+if (process.argv.includes('--no-webcrypto')) {
+  Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true });
+  assert.equal(globalThis.crypto?.subtle, undefined, 'exercise ordinary HTTP without WebCrypto');
+}
 const programDeadlines = [];
 const realSetTimeout = globalThis.setTimeout;
 if (fetchTimeout) {
@@ -100,7 +108,7 @@ const legacyModules = ['gwbasic.wasm', 'bootlogo.wasm', 'rogue.wasm', 'vz.wasm',
 const msdosFiles = ['COMMAND.COM', 'EDLIN.COM', 'DEBUG.COM', 'FIND.EXE', 'MORE.COM', 'SORT.EXE', 'FC.EXE'];
 const msdosModules = msdosFiles.map(name => `${name.split('.')[0].toLowerCase()}.wasm`);
 const vc405Modules = ['vc405.wasm', 'vcsetup405.wasm'];
-const programModules = [...legacyModules, ...msdosModules, ...vc405Modules];
+const programModules = [...legacyModules, ...msdosModules, ...vc405Modules, 'hack.wasm'];
 const programFiles = new Map(readdirSync(dirname(modulePath)).flatMap((name) => {
   const match = name.match(/^([a-z0-9]+)\.([0-9a-f]{12})\.wasm$/);
   return match && programModules.includes(`${match[1]}.wasm`) ? [[`${match[1]}.wasm`, name]] : [];
@@ -109,7 +117,9 @@ assert.equal(programFiles.size, programModules.length, 'all side modules have im
 const moduleFetches = [];
 const expectedFetches = [];
 const fileFetches = [];
-const demoDirectory = `${dirname(modulePath)}-work/demo`;
+// Mutations use isolated publication directories but the same frozen build
+// inputs. Do not infer a second demo tree next to a private test site.
+const demoDirectory = resolve(process.env.WEB_DEMO_DIRECTORY || fileURLToPath(new URL('../build/web-work/demo', import.meta.url)));
 const demoBytes = name => readFileSync(join(demoDirectory, name));
 const lazyAssetName = bytes => `file.${createHash('sha256').update(bytes).digest('hex').slice(0, 12)}.bin`;
 let heldFile = null;
@@ -519,7 +529,36 @@ async function releaseProgramFetch(name) {
   assert.equal(outputCalls, held.outputCalls, 'a held download produces no new guest output');
   assert.equal(exitCalls, 0, 'waiting for a module must not terminate VC');
   held.release();
-  console.log(`PASS lazy: ${programFiles.get(name)}?v=${buildHash} first EXEC waits quietly and yields to Node`);
+  const file = programFiles.get(name);
+  console.log(`PASS lazy: ${file}?v=${buildHash} first use waits quietly and yields to Node`);
+}
+
+async function releaseFileFetch(name, label) {
+  await until(`${label} first-open file download request`, () => heldFile?.name === name);
+  const held = heldFile;
+  await new Promise(done => setImmediate(done));
+  observe();
+  assert.equal(screen, held.screen, 'a held file download leaves the DOS screen unchanged');
+  assert.equal(inputReads, held.inputReads, 'DOS is suspended while the file downloads');
+  assert.equal(outputCalls, held.outputCalls, 'the wait emits no guest output');
+  assert.equal(exitCalls, 0, 'the file wait keeps VC alive');
+  holdFileName = null;
+  held.release();
+  console.log(`PASS lazy file: ${label} first OPEN waits quietly and yields to Node`);
+}
+
+async function viewExactFile(name, path, bytes) {
+  await selectFile(name);
+  const asset = lazyAssetName(bytes);
+  const firstFetch = !fileFetches.some(request => request.name === asset);
+  if (firstFetch) holdFileName = asset;
+  send('\x1bOR');
+  if (firstFetch) await releaseFileFetch(asset, name);
+  await until(`${name} appears in the real DOS viewer`, text =>
+    !hasPanels(text) && text.toUpperCase().includes(name.toUpperCase()));
+  assert.deepEqual(Buffer.from(vc.FS.readFile(path)), bytes, `${name}: DOS OPEN preserves every original byte`);
+  send('\x1b');
+  await until(`panels after viewing ${name}`, hasPanels);
 }
 
 async function basicLine(command) {
@@ -556,6 +595,220 @@ async function quitRogue() {
   send('y');
   await until('VC panels after Rogue Q then y', hasPanels);
   assert.equal(exitCalls, 0, 'quitting Rogue must not quit VC');
+}
+
+const hackStatus = /Level\s+(\d+)\s+Gold\s+\d+\s+Hp\s+\d+\(\d+\)\s+Ac\s+-?\d+\s+Str\s+[^\n]+Exp\s+\d+/;
+const isHack = text => hackStatus.test(text) && text.includes('@') && !hasPanels(text);
+
+async function startHack() {
+  await until('Hack asks its original experience question or restores a game', text =>
+    /Are you an experienced player\?/.test(text) || isHack(text));
+  if (!isHack(screen)) {
+    send('y');
+    await until('Hack asks for a character role', text => text.includes('what kind of character') && text.includes('? ['));
+    send('C');
+  }
+  for (let prompts = 0; prompts < 8; prompts++) {
+    await until('Hack first level, @ and Gold/Hp/Ac/Str/Exp status', text =>
+      isHack(text) || text.includes('--More--'));
+    if (!screen.includes('--More--')) break;
+    const previous = screen;
+    send(' ');
+    await until('Hack acknowledges its displayed continuation prompt', text => text !== previous);
+  }
+  assert.ok(isHack(screen), 'Hack renders its original level and status');
+  assert.equal(hackStatus.exec(screen)[1], '1', 'a fresh Hack starts on level one');
+  assert.equal(graphics, null, 'Hack uses the BIOS text display');
+}
+
+async function quitHack() {
+  send('Q');
+  await until('Hack asks Really quit?', text => text.includes('Really quit?'));
+  send('y');
+  for (let prompts = 0; prompts < 8; prompts++) {
+    await until('Hack returns to VC or asks to continue its score screen', text =>
+      hasPanels(text) || text.includes('--More--') || text.includes('Hit <') || text.includes('Press ENTER to return'));
+    if (hasPanels(screen)) break;
+    const previous = screen;
+    send(screen.includes('--More--') ? ' ' : '\r');
+    await until('Hack acknowledges its displayed exit prompt', text => text !== previous);
+  }
+  assert.ok(hasPanels(screen), 'Hack Q/y returns to VC panels');
+  assert.equal(exitCalls, 0, 'quitting Hack must not quit VC');
+}
+
+async function checkHack() {
+  stage = 'Hack lazy files';
+  const directory = '/home/vc/GAMES/HACK';
+  const shipped = ['HACK.EXE', 'data', 'help', 'hh', 'rumors', 'record', 'perm',
+    'OWLIC.TXT', 'HACKLIC.TXT', 'FENLIC.TXT'];
+  assert.deepEqual(vc.FS.readdir(directory).sort(), ['.', '..', ...shipped].sort(),
+    'every Hack executable, data file and licence is listed before the first OPEN');
+  const before = fileFetches.length;
+  for (const name of shipped) {
+    const original = demoBytes('GAMES/HACK/' + name);
+    assert.equal(vc.FS.stat(directory + '/' + name).size, original.length,
+      name + ': unopened listing carries the exact file size');
+    const asset = lazyAssetName(original);
+    assert.deepEqual(readFileSync(join(dirname(modulePath), asset)), original,
+      name + ': published first-open file is the complete reproducible asset');
+    if (original.length) assert.throws(() => vc.FS.readFile(directory + '/' + name),
+      name + ': a listing cannot expose or eagerly fetch lazy contents');
+  }
+  assert.equal(createHash('sha256').update(demoBytes('GAMES/HACK/HACK.EXE')).digest('hex'),
+    'b6f6ca8667fc8d1e37eb81fbd1c469a371312e4a39c53052985d553aaac345ee');
+  const existingPerm = 'existing session file survives lazy directory access';
+  vc.FS.writeFile(directory + '/perm', existingPerm);
+  send('cd GAMES\\HACK\r');
+  await until('VC lists every unopened Hack file', text =>
+    hasPanels(text) && commandLine(text).trimEnd() === 'H:\\GAMES\\HACK>');
+  assert.equal(fileFetches.length, before, 'entering/listing HACK fetches no contents');
+  assert.equal(vc.FS.readFile(directory + '/perm', { encoding: 'utf8' }), existingPerm,
+    'directory access never overwrites a pre-existing session file');
+  vc.FS.writeFile(directory + '/perm', demoBytes('GAMES/HACK/perm'));
+  assert.equal(moduleFetches.length, 0, 'listing the data directory never fetches translated code');
+
+  await viewExactFile('help', directory + '/help', demoBytes('GAMES/HACK/help'));
+  assert.equal(fileFetches.length, before + 1, 'opening help fetches help alone, not a directory bundle');
+
+  stage = 'Hack Enter launch';
+  await selectFile('HACK.EXE');
+  const executableAsset = lazyAssetName(demoBytes('GAMES/HACK/HACK.EXE'));
+  holdFileName = executableAsset;
+  expectedFetches.push('hack.wasm');
+  send('\r');
+  await releaseFileFetch(executableAsset, 'HACK.EXE');
+  await releaseProgramFetch('hack.wasm');
+  await startHack();
+  assert.deepEqual(Buffer.from(vc.FS.readFile(directory + '/HACK.EXE')),
+    demoBytes('GAMES/HACK/HACK.EXE'), 'EXEC reads the complete, byte-identical pinned executable');
+  await quitHack();
+
+  // Exercise the remaining read-only assets through real DOS opens. The
+  // game's record/perm files are intentionally writable, never restored over
+  // a user's score or lock data by a later first-open installation.
+  for (const name of ['data', 'hh', 'rumors', 'OWLIC.TXT', 'HACKLIC.TXT', 'FENLIC.TXT'])
+    await viewExactFile(name, directory + '/' + name, demoBytes('GAMES/HACK/' + name));
+  const cachedFiles = fileFetches.length;
+  assert.equal(fileFetches.filter(request => request.name === executableAsset).length, 1,
+    'one successful executable fetch also supplies EXEC its private reference');
+  send('cd ..\r');
+  await until('GAMES panels after Hack', text => hasPanels(text) && commandLine(text).trimEnd() === 'H:\\GAMES>');
+  send('cd ..\r');
+  await until('H: root panels after Hack', text => isPanel(text) && commandLine(text).trimEnd() === 'H:\\>');
+
+  stage = 'Hack cached typed launch';
+  send('hack\r');
+  await startHack();
+  assertFetches();
+  assert.equal(fileFetches.length, cachedFiles, 'typed Hack reuses its already opened file contents');
+  if (sourcePanel) {
+    stage = 'Source Hack function map';
+    const beforeSource = screen;
+    const sourceView = await openSource('HACK.EXE');
+    assert.equal(typeof sourceView.current.function, 'string', 'Hack reports a compiled C function');
+    assert.ok(sourceView.current.function.length > 0);
+    assert.ok(Number.isInteger(sourceView.current.offset) && sourceView.current.offset >= 0);
+    assert.equal(sourceView.current.label, 'C function (map)');
+    assert.ok(sourceView.current.line == null && sourceView.current.path == null,
+      'Hack must not invent a C source filename or line');
+    const linkerMap = readFileSync(new URL('../build/hack/HACK.MAP', import.meta.url), 'utf8');
+    const symbols = [...linkerMap.matchAll(/^([0-9a-f]{4}):([0-9a-f]{4})[*+]?\s+(\S+)\s*$/gim)];
+    assert.equal(sourceView.current.address, sourceView.snapshot.current.offset);
+    assert.ok(symbols.some(([, segment, offset, name]) => name === sourceView.current.function
+      && parseInt(segment, 16) * 16 + parseInt(offset, 16) + sourceView.current.offset === sourceView.current.address),
+    'the reported Hack function name and offset agree with its linker map');
+    assert.ok(sourceElement.textContent.includes(sourceView.current.function));
+    assert.match(sourceElement.textContent, /C function[^\n]*map/);
+    await closeSourceWithShortcut();
+    assert.equal(screen, beforeSource, 'opening and closing Source preserves Hack\'s screen');
+    console.log('PASS Source Hack: real C function name/offset and map label, unchanged game screen');
+  }
+  await quitHack();
+  await until('VC root panels after cached Hack', text =>
+    isPanel(text) && commandLine(text).trimEnd() === 'H:\\>');
+  assert.ok(!vc.FS.analyzePath('/home/vc/HACK.EXE').exists,
+    'HACK resolves through its own directory, without a root copy');
+  console.log('PASS Hack: first-screen metadata, per-OPEN exact assets/licences, Enter launch, first-level @/status, Q/y, and cached typed launch');
+}
+
+async function checkLazySources() {
+  stage = 'lazy H: source files';
+  const before = fileFetches.length;
+  assert.ok(vc.FS.lookupPath('/home/vc/SRC/VCOVL.ASM').node.vcLazyFile,
+    'the unopened source still has its per-file lazy marker');
+  await selectFile('SRC');
+  send('\x1b[17~');
+  await until('F6 offers to rename the unopened source directory', text => text.includes('Rename or move'));
+  send('SOURCE\r');
+  await until('renaming a lazy directory moves its original metadata too', text =>
+    isPanel(text) && vc.FS.analyzePath('/home/vc/SOURCE/VCOVL.ASM').exists);
+  assert.ok(!vc.FS.analyzePath('/home/vc/SRC').exists, 'F6 moved the directory, not just a copied preview');
+  assert.ok(vc.FS.lookupPath('/home/vc/SOURCE/VCOVL.ASM').node.vcLazyFile,
+    'renaming a parent retains the unopened inode marker');
+  assert.equal(fileFetches.length, before, 'an unopened directory move never downloads file contents');
+  await selectFile('SOURCE');
+  send('\x1b[17~');
+  await until('F6 can rename the source directory back', text => text.includes('Rename or move'));
+  send('SRC\r');
+  await until('the source directory is restored under its original name', text =>
+    isPanel(text) && vc.FS.analyzePath('/home/vc/SRC/VCOVL.ASM').exists);
+  assert.equal(fileFetches.length, before, 'moving the directory back is metadata-only too');
+  send('cd SRC\r');
+  await until('VC lists the still-lazy source files', text =>
+    hasPanels(text) && commandLine(text).trimEnd() === 'H:\\SRC>');
+  for (const name of ['VC.ASM', 'VCOVL.ASM']) {
+    const original = readFileSync(new URL('../asm/' + name, import.meta.url));
+    await viewExactFile(name, '/home/vc/SRC/' + name, original);
+    assert.equal(fileFetches.filter(request => request.name === lazyAssetName(original)).length, 1,
+      name + ': exactly one successful first-OPEN download');
+  }
+  send('cd ..\r');
+  await until('H: root panels after browsing sources', text => isPanel(text) && commandLine(text).trimEnd() === 'H:\\>');
+  console.log('PASS H: sources: F6 preserves unopened file metadata without downloads; later DOS opens fetch exact files once');
+}
+
+async function checkLazyDirectoryOperation() {
+  const directory = '/home/vc/GAMES/HACK';
+  assert.ok(vc.FS.lookupPath(directory + '/HACK.EXE').node.vcLazyFile,
+    'directory operation begins with a listed but unopened executable');
+  const hackAssets = new Set(['HACK.EXE', 'data', 'help', 'hh', 'rumors', 'record', 'perm',
+    'OWLIC.TXT', 'HACKLIC.TXT', 'FENLIC.TXT'].map(name => lazyAssetName(demoBytes('GAMES/HACK/' + name))));
+  assert.ok(!fileFetches.some(request => hackAssets.has(request.name)), 'no Hack file content was requested at startup');
+  if (lazyRmdir) {
+    stage = 'RMDIR of an unopened lazy directory';
+    const loads = dosLoads('COMMAND.COM');
+    expectedFetches.push('command.wasm');
+    send('COMMAND.COM /C RMDIR GAMES\\HACK\r');
+    await releaseProgramFetch('command.wasm');
+    await dosPanels('COMMAND.COM', loads);
+    await savedDosScreen('DOS refuses removal of the nonempty lazy directory', text => text.includes('directory not empty'));
+    assert.ok(vc.FS.lookupPath(directory + '/HACK.EXE').node.vcLazyFile,
+      'RMDIR preserves the still-unopened executable without downloading it');
+    assert.ok(!fileFetches.some(request => hackAssets.has(request.name)),
+      'RMDIR needs only the already-listed metadata, never Hack file bytes');
+    console.log('PASS lazy RMDIR: real DOS nonempty-directory error preserves Hack without any Hack download');
+  } else {
+    stage = 'move a parent of an unopened lazy directory';
+    await selectFile('GAMES');
+    send('\x1b[17~');
+    await until('F6 offers to rename GAMES', text => text.includes('Rename or move'));
+    send('PLAY\r');
+    await until('moving GAMES carries its still-unopened Hack subtree', text =>
+      isPanel(text) && vc.FS.analyzePath('/home/vc/PLAY/HACK/HACK.EXE').exists);
+    assert.ok(vc.FS.lookupPath('/home/vc/PLAY/HACK/HACK.EXE').node.vcLazyFile,
+      'moving an unopened ancestor preserves the executable lazy marker');
+    assert.equal(fileFetches.length, 0, 'moving an unopened ancestor performs no file downloads');
+    send('cd PLAY\\HACK\r');
+    await until('panels in the moved Hack directory', text =>
+      hasPanels(text) && commandLine(text).trimEnd() === 'H:\\PLAY\\HACK>');
+    assert.equal(fileFetches.length, 0, 'listing the moved directory remains metadata-only');
+    await viewExactFile('HACK.EXE', '/home/vc/PLAY/HACK/HACK.EXE', demoBytes('GAMES/HACK/HACK.EXE'));
+    assert.equal(fileFetches.length, 1, 'opening a moved file fetches only that file');
+    assert.equal(moduleFetches.length, 0, 'moving/viewing game files never loads their translated code');
+    console.log('PASS lazy parent move: F6 carries unopened Hack metadata; first OPEN at its new path fetches exact bytes');
+  }
+  assertFetches();
 }
 
 async function selectFile(name) {
@@ -1382,14 +1635,14 @@ try {
       };
     };
   }
-  if (!fetchFailure && !fetchTimeout && !memoryLimit && !msdosOnly) await installSourcePanel();
+  if (!fetchFailure && !fetchTimeout && !memoryLimit && !msdosOnly && !hackOnly && !sourceOnly && !lazyParentMove && !lazyRmdir) await installSourcePanel();
   const wasmBinary = await readFile(new URL('./vc.wasm', moduleURL));
   const installedAfter = Date.now();
   await createVC({
     wasmBinary,
     // Match main's declared minimum, but prohibit all growth. The pressure
     // and fragmentation scenarios then consume real allocations in this cap.
-    ...(memoryLimit ? { wasmMemory: new WebAssembly.Memory({ initial: 1280, maximum: 1280 }) } : {}),
+    ...(memoryLimit ? { wasmMemory: new WebAssembly.Memory({ initial: 1536, maximum: 1536 }) } : {}),
     instantiateWasm(imports, receiveInstance) {
       const compiled = new WebAssembly.Module(wasmBinary);
       const instance = new WebAssembly.Instance(compiled, imports);
@@ -1505,7 +1758,29 @@ try {
     await new Promise(() => {});
   }
 
+  if (sourceOnly) {
+    await checkLazySources();
+    await quitVC();
+    console.log('web H: file smoke: unopened directory move and exact cached sources passed');
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
+  if (lazyParentMove || lazyRmdir) {
+    await checkLazyDirectoryOperation();
+    await quitVC();
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
+  if (hackOnly) {
+    await checkHack();
+    await quitVC();
+    console.log('web Hack smoke: lazy files/code, exact assets, Enter and typed launches, status, quit and cache passed');
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
   await checkLazyFiles();
+  await checkHack();
+  await checkLazySources();
 
   stage = 'Source VC, F9 and unchanged screen';
   const beforeSource = screen;
@@ -1514,7 +1789,7 @@ try {
   assert.equal(screen, beforeSource, 'opening Source does not change VC or its key bar');
   assert.ok(sourceFetches.length > 1, 'opening Source fetches its maps and original source text lazily');
   const openedSources = sourceFetches.filter(({ url }) => new URL(url).pathname.endsWith('.txt'));
-  console.log(`PASS Source first open: ${openedSources.length} original text files, ${openedSources.reduce((sum, item) => sum + item.bytes, 0)} bytes; ${sourceFetches.reduce((sum, item) => sum + item.bytes, 0)} bytes including maps/index`);
+  console.log(`PASS Source VC open: ${openedSources.length} original text files, ${openedSources.reduce((sum, item) => sum + item.bytes, 0)} bytes; ${sourceFetches.reduce((sum, item) => sum + item.bytes, 0)} bytes including maps/index`);
   sourceButton.dispatch('click');
   assert.equal(sourcePanel.opened, false, 'the same Source button closes the panel');
   assert.equal(sourceElement.hidden, true);
@@ -2008,16 +2283,16 @@ try {
   send('Y');
   await until('VC panels after the second VZ child', isPanel);
   assertFetches();
-  assert.deepEqual(expectedFetches, ['command.wasm', ...legacyModules.slice(0, 4)],
-    'COMMAND and the first four legacy programs fetched exactly once');
+  assert.deepEqual(expectedFetches, ['hack.wasm', 'command.wasm', ...legacyModules.slice(0, 4)],
+    'Hack, COMMAND and the first four legacy programs fetched exactly once');
   console.log('PASS 25: typed vz NEW.TXT creates and saves a real H: file');
 
   await checkKermit();
   await checkDosUtilities();
   await checkVC405();
   assert.deepEqual([...expectedFetches].sort(), [...programModules].sort(),
-    'all fourteen programs fetched exactly once');
-  for (const name of ['GWBASIC.EXE', 'BOOTLOGO.COM', 'GAMES/ROGUE.EXE', 'VZ.COM', 'KERMIT.EXE',
+    'all fifteen programs fetched exactly once');
+  for (const name of ['GWBASIC.EXE', 'BOOTLOGO.COM', 'GAMES/ROGUE.EXE', 'GAMES/HACK/HACK.EXE', 'VZ.COM', 'KERMIT.EXE',
     'COMMAND.COM', ...msdosFiles.slice(1).map(name => `DOS/${name}`), 'VC405/VC.COM', 'VC405/VCSETUP.COM']) {
     assert.deepEqual(Buffer.from(vc.FS.readFile(`/home/vc/${name}`)), demoBytes(name),
       `${name}: a real DOS open preserved every published executable byte`);
@@ -2037,7 +2312,7 @@ try {
   const peak = wasmExports.sbrk(0);
   console.log(`PASS memory: peak ${peak} bytes; INITIAL_MEMORY ${startupHeapBytes} bytes; headroom ${startupHeapBytes - peak} bytes; heap ${startupHeapBytes} -> ${vc.HEAPU8.byteLength}`);
   assert.equal(vc.HEAPU8.byteLength, startupHeapBytes,
-    'INITIAL_MEMORY must cover loading all fourteen programs without heap growth');
+    'INITIAL_MEMORY must cover loading all fifteen programs without heap growth');
   // The measured peak depends on load order: emmalloc asks sbrk for a whole
   // new block when no free block fits. Bound every order: each load's guard
   // may take a fresh 2N + 64 KiB above the startup heap top.
@@ -2045,10 +2320,11 @@ try {
     sum + statSync(join(dirname(modulePath), name)).size, 0);
   const fileAssets = readdirSync(dirname(modulePath)).filter(name => /^file\.[0-9a-f]{12}\.bin$/.test(name));
   const fileBytes = fileAssets.reduce((sum, name) => sum + statSync(join(dirname(modulePath), name)).size, 0);
-  // References now allocate after startup. Bound an original plus a DOS
-  // candidate copy per asset, with stream/allocator bookkeeping, even if
-  // no freed block is reused. This includes unopened guides and sources.
-  const fileAllowance = 2 * fileBytes + fileAssets.length * 4096;
+  // References now allocate after startup. Bound an original, a DOS candidate
+  // and the optional no-WebCrypto SHA scratch copy per asset, plus stream/
+  // allocator bookkeeping, even if no freed block is reused. This includes
+  // unopened guides/sources and ordinary-HTTP fallback load orders too.
+  const fileAllowance = 3 * fileBytes + fileAssets.length * 4096;
   const worst = startupHeapTop + 2 * sideBytes + programFiles.size * 64 * 1024 + fileAllowance;
   assert.ok(startupHeapBytes - worst >= Math.max(4 * 1024 * 1024, worst * 0.2),
     `INITIAL_MEMORY leaves at least 4 MiB and 20% headroom above the any-order bound ${worst}`);
@@ -2063,7 +2339,7 @@ try {
   await quitVC();
   console.log('PASS 26: F10, Enter quits and fires the exit hook');
   assertFetches();
-  console.log('web smoke: legacy checks, DOS shell/utilities, Russian F3, lazy H: files, VC405, Source, and all fourteen first-use/cached module fetches passed');
+  console.log('web smoke: legacy checks, Hack, DOS shell/utilities, Russian F3, lazy H: files, VC405, Source, and all fifteen first-use/cached module fetches passed');
   exitAfterOutput(0);
 } catch (error) {
   fail(error);

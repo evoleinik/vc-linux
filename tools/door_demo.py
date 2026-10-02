@@ -1,6 +1,6 @@
 """Embed the browser's exact demo file mapping for native BBS sessions.
 
-Usage: .venv/bin/python tools/door_demo.py OUT.c GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE KERMIT_EXE
+Usage: .venv/bin/python tools/door_demo.py OUT.c GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE KERMIT_EXE [MSDOS_DIR [VC405_DIR [HACK_DIR]]]
 No directory walk of a previously generated drive: stale build files must never
 quietly enter the door. web_demo owns the complete content list and generator.
 """
@@ -58,7 +58,7 @@ def source(files: dict[str, bytes]) -> str:
 
 
 def main() -> None:
-    if len(sys.argv) != 8:
+    if len(sys.argv) not in (8, 9, 10, 11):
         raise SystemExit(__doc__)
     files = demo_files(*(Path(arg) for arg in sys.argv[2:]))
     Path(sys.argv[1]).write_text(source(files), encoding="utf-8")

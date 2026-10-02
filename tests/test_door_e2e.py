@@ -565,6 +565,74 @@ def test_door_run_rogue_starts_directly_and_exits_with_game(paths):
         assert b"10Quit" not in session.raw
 
 
+def hack_level(text):
+    """Require the game's status row and a player on the map, not its help."""
+    return (re.search(r"Level\s+1\s+Gold\s+\d+\s+Hp\s+\d+", text) is not None
+            and any("@" in line for line in text.splitlines()[1:23]))
+
+
+def hack_more_or(session, complete):
+    # Original Hack can pause on --More-- while saving/quitting. Acknowledge
+    # only a visible prompt, never send unsolicited keys on a timer.
+    for _ in range(10):
+        session.until(lambda: complete() or "--More--" in session.text(), timeout=20,
+                      description="Hack completion or message acknowledgement")
+        if complete():
+            return
+        before = session.text()
+        session.send(b" ")
+        session.until(lambda: complete() or session.text() != before,
+                      description="Hack consumes visible --More--")
+    raise AssertionError(f"too many Hack messages\n{session.text()}")
+
+
+def test_door_run_hack_starts_directly_and_exits_with_game(paths):
+    with running(paths, args=("--door", "--door-allow-unconfined", "--door-run", "HACK.EXE")) as session:
+        session.wait_for("experienced player", timeout=20)
+        session.send(b"y")
+        session.wait_for("what kind of character")
+        session.send(b"C")
+        hack_more_or(session, lambda: hack_level(session.text()) and "--More--" not in session.text())
+        drive = session.drive()
+        assert (drive / "GAMES/HACK/HACK.EXE").is_file()
+        assert b"10Quit" not in session.raw, "--door-run must not launch VC panels"
+        session.send(b"Q")
+        hack_more_or(session, lambda: "Really quit?" in session.text())
+        session.send(b"y")
+        hack_more_or(session, lambda: session.poll() is not None)
+        assert session.wait_exit() == 0
+        session.wait_clean()
+        assert not drive.exists()
+        assert b"10Quit" not in session.raw
+        assert sorted(path.name for path in paths.home.iterdir()) == ["HOST.TXT"]
+        assert sorted(path.name for path in paths.work.iterdir()) == ["HOST.TXT"]
+
+
+def test_door_vc_hack_saves_and_restores_inside_its_session(paths):
+    with running(paths) as session:
+        session.ready()
+        drive = session.drive()
+        session.send(b"hack -C", "enter")
+        hack_more_or(session, lambda: hack_level(session.text()) and "--More--" not in session.text())
+        session.send(b"S")
+        hack_more_or(session, lambda: panels(session.text()))
+        save = drive / "GAMES/HACK/HACK.SAV"
+        assert save.is_file() and save.stat().st_size > 0
+        assert not (drive / "HACK.SAV").exists(), "save belongs beside HACK.EXE"
+        session.send(b"hack", "enter")
+        hack_more_or(session, lambda: hack_level(session.text()) and not save.exists()
+                     and "--More--" not in session.text())
+        session.send(b"Q")
+        hack_more_or(session, lambda: "Really quit?" in session.text())
+        session.send(b"y")
+        hack_more_or(session, lambda: panels(session.text()))
+        session.quit_vc()
+        session.wait_clean()
+        assert not drive.exists()
+        assert sorted(path.name for path in paths.home.iterdir()) == ["HOST.TXT"]
+        assert sorted(path.name for path in paths.work.iterdir()) == ["HOST.TXT"]
+
+
 def test_door_classic_keys_drive_panels_and_no_protocol_is_requested(paths):
     with running(paths) as session:
         session.ready()

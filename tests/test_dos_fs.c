@@ -876,6 +876,87 @@ static void test_path_lease_directory_creation(void)
     dos_fs_set_process(0);
 }
 
+#ifndef __EMSCRIPTEN__
+static void test_native_playground_directory_guard(void)
+{
+    char original[PATH_MAX], moved[PATH_MAX], dos[128], absolute[144], path[PATH_MAX];
+    host_path(original, sizeof original, "GuardPlay");
+    host_path(moved, sizeof moved, "GuardOld");
+    host_require(mkdir(original, 0755) == 0, "mkdir guarded playground");
+    host_file("GuardPlay/NOTE.TXT", "original game state", 0644);
+    CHECK(dos_fs_host_short_path(original, dos, sizeof dos) == 0,
+          "native directory guard gets a drive-qualified short path");
+    DosPathLease *guard = NULL;
+    CHECK(dos_fs_guard_directory(dos, original, &guard) == 0 && guard,
+          "opt-in playground directory guard is prepared");
+    if (!guard) return;
+    dos_fs_bind_path(guard, 0x5ab0);
+    dos_fs_set_process(0x5ab0);
+    path_begin(0x3b00, dos); ok("enter a guarded playground before its rename");
+    uint16_t h = open_file("NOTE.TXT", 0);
+    if (h != 0xffff) { read_equals(h, "original game state", "guard permits ordinary relative reads"); close_file(h); }
+    host_require(rename(original, moved) == 0, "move the active guarded playground");
+    host_require(mkdir(original, 0755) == 0, "replace the active playground pathname");
+    host_file("GuardPlay/NOTE.TXT", "another player's save", 0644);
+    for (unsigned function = 0; function < 3; ++function) {
+        static const uint16_t functions[] = {0x3d02, 0x3c00, 0x4100};
+        path_begin(functions[function], "NOTE.TXT");
+        error(5, "guarded relative exact-name access refuses a replacement playground");
+    }
+    path_begin(0x3c00, "NEW.TXT");
+    error(5, "guard refuses creating a new file in a replaced current directory");
+    snprintf(absolute, sizeof absolute, "%s\\NOTE.TXT", dos);
+    path_begin(0x3c00, absolute);
+    error(5, "guard refuses absolute truncation below the replaced playground too");
+    host_equals("GuardPlay/NOTE.TXT", "another player's save", "all rejected accesses preserve the other game");
+    host_equals("GuardOld/NOTE.TXT", "original game state", "all rejected accesses preserve the held game");
+    host_path(path, sizeof path, "GuardPlay/NEW.TXT");
+    CHECK(access(path, F_OK) != 0, "guard failure leaves no replacement file behind");
+    /* Guard ownership is per DOS child, not a blanket restriction on the
+     * native file manager or another child using the replacement pathname. */
+    dos_fs_set_process(0x5ab1);
+    h = open_file("NOTE.TXT", 0);
+    if (h != 0xffff) { read_equals(h, "another player's save", "another PSP does not inherit the guard"); close_file(h); }
+    dos_fs_set_process(0x5ab0);
+    path_begin(0x3d02, "NOTE.TXT");
+    error(5, "returning to the guarded PSP restores its inode protection");
+    dos_fs_close_process(0x5ab0);
+    dos_fs_set_process(0);
+    h = open_file("NOTE.TXT", 0);
+    if (h != 0xffff) { read_equals(h, "another player's save", "child exit releases the scoped guard"); close_file(h); }
+    dos_fs_init(); /* Restore the fixture cwd without a stale game pathname. */
+
+    host_path(path, sizeof path, "GuardPlay/NOTE.TXT");
+    CHECK(dos_fs_host_short_path(path, dos, sizeof dos) == 0, "get guard's regular-file rejection fixture");
+    guard = (DosPathLease *)1;
+    CHECK(dos_fs_guard_directory(dos, path, &guard) == 5 && !guard,
+          "directory guard refuses a regular file and releases its pending lease");
+}
+
+static void test_native_host_short_path_long_unicode(void)
+{
+    char component[192], host[PATH_MAX], dos[128];
+    memset(component, 'x', 160);
+    strcpy(component + 160, "-\xf0\x9f\x98\x80.txt");
+    host_file(component, "long Unicode host name", 0644);
+    host_path(host, sizeof host, component);
+    CHECK(strlen(host) > 127, "native conversion fixture exceeds DOS scratch input capacity");
+    CHECK(dos_fs_host_short_path(host, dos, sizeof dos) == 0 && strlen(dos) < 128,
+          "resolved long Unicode host names still have a usable DOS 8.3 path");
+    DosPathLease *lease = NULL;
+    CHECK(dos_fs_pin_path(dos, host, &lease) == 0 && lease,
+          "native conversion identifies the exact long Unicode host file");
+    if (lease) {
+        dos_fs_bind_path(lease, 0x5ab2);
+        dos_fs_set_process(0x5ab2);
+        uint16_t h = open_file(dos, 0);
+        if (h != 0xffff) { read_equals(h, "long Unicode host name", "short path does not select an alias neighbor"); close_file(h); }
+        dos_fs_close_process(0x5ab2);
+        dos_fs_set_process(0);
+    }
+}
+#endif
+
 static size_t native_fd_count(void)
 {
     DIR *dir = opendir("/proc/self/fd");
@@ -3644,6 +3725,10 @@ int main(void)
     test_path_lease_parent_identity();
     test_path_lease_parent_alias();
     test_path_lease_directory_creation();
+#ifndef __EMSCRIPTEN__
+    test_native_playground_directory_guard();
+    test_native_host_short_path_long_unicode();
+#endif
     test_path_lease_lifetime_and_home();
     test_dta_state();
     test_io_and_handles();

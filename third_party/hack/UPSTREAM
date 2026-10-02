@@ -1,0 +1,9 @@
+Hack 1.0.3, maintained by NetBSD
+Repository: https://github.com/NetBSD/src
+Path: games/hack
+Commit: f037b5fcaa6db302271bbb445039a3a513b2e28c
+Commit date: 2026-08-14T17:19:04Z
+Source: all 92 files supplied in build/hack-inputs/src, copied byte-for-byte.
+Licences: COPYRIGHT (CWI, BSD-3-Clause), COPYRIGHT-JF (Jay Fenlason, BSD-3-Clause),
+and the copyright notices retained in the individual NetBSD source files.
+DOS adaptations are outside this directory in runtime/hack_dos and tools/hack_port.py.

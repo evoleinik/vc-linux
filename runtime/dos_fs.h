@@ -67,6 +67,16 @@ void dos_casemap_upper(void);
 typedef struct DosPathLease DosPathLease;
 int dos_fs_pin_path(const char *absolute_short_dos, const char *absolute_host,
                     DosPathLease **out);
+#ifndef __EMSCRIPTEN__
+/* Canonical drive-qualified short spelling for a resolved native host path;
+ * unlike a DOS scratch-buffer call, its input can include long UTF-8 names. */
+int dos_fs_host_short_path(const char *absolute_host, char *out, size_t capacity);
+/* Opt-in native playground guard: relative and exact-name accesses below
+ * this directory also fail closed if its pathname no longer names the
+ * selected inode. Binding/lifetime use the ordinary path-lease API. */
+int dos_fs_guard_directory(const char *absolute_short_dos, const char *absolute_host,
+                           DosPathLease **out);
+#endif
 void dos_fs_bind_path(DosPathLease *lease, uint16_t psp);
 void dos_fs_release_path(DosPathLease *lease);
 /* Release only a child's path leases, including on TSR exits that retain

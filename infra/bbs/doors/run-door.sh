@@ -1,9 +1,9 @@
 #!/bin/sh
-# ENiGMA abracadabra: DROP_FILE NODE {vc|rogue}. The drop file is not opened.
+# ENiGMA abracadabra: DROP_FILE NODE {vc|rogue|hack}. The drop file is not opened.
 set -eu
 
 if [ "$#" -ne 3 ]; then
-    printf '%s\n' 'Usage: run-door.sh DROP_FILE NODE {vc|rogue}' >&2
+    printf '%s\n' 'Usage: run-door.sh DROP_FILE NODE {vc|rogue|hack}' >&2
     exit 2
 fi
 vc_door_node=$2
@@ -25,8 +25,9 @@ vc_door_id=$((200000 + vc_door_node))
 case "$3" in
     vc) set -- ;;
     rogue) set -- --door-run ROGUE.EXE ;;
+    hack) set -- --door-run HACK.EXE ;;
     *)
-        printf '%s\n' 'VC door: choose vc or rogue.' >&2
+        printf '%s\n' 'VC door: choose vc, rogue, or hack.' >&2
         exit 2
         ;;
 esac

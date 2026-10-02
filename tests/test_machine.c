@@ -407,6 +407,119 @@ static void copied_image_supplement(void) {
     rt_register_supplement(&supplemented, supplement_body);
     rt_run();
 }
+
+enum {
+    COPY_ANCHOR = 0x20, COPY_TAIL = 0x80, COPY_NON_ENTRY = 0xa0,
+    COPY_WRONG = 0x100, COPY_RIGHT = 0x1c0,
+};
+static const uint8_t copy_code[512] = {
+    [COPY_ANCHOR] = 0x50, 0x51, 0x52, 0x53, 0x54, 0x55,
+                    0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b,
+    [COPY_TAIL] = 0x31, 0xc0, 0xc3, 0x5a, 0x5b, 0x90,
+                  0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
+    [COPY_NON_ENTRY] = 0x31, 0xc0, 0xc3, 0xcc, 0xcc, 0xcc,
+                       0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+    /* COMMAND's exec_com_file at 43D1h and post-close exec_set_PDB at
+     * 4491h have these seven identical leading bytes, but different JZ
+     * displacements. Their 192-byte separation matched two live copy
+     * deltas once Hack added one paragraph to the DOS environment. */
+    [COPY_WRONG] = 0x2e, 0xf6, 0x06, 0x54, 0x05, 0x02,
+                   0x74, 0x0c, 0x2e, 0xc5, 0x36, 0x50,
+    [COPY_RIGHT] = 0x2e, 0xf6, 0x06, 0x54, 0x05, 0x02,
+                   0x74, 0x03, 0xe9, 0x57, 0x01, 0x2e,
+};
+static uint32_t copied_entry;
+static unsigned copied_calls;
+static int copy_run(uint32_t off, uint16_t loadseg) {
+    if (off != COPY_ANCHOR && off != COPY_TAIL && off != COPY_WRONG && off != COPY_RIGHT)
+        return -1;
+    CHECK(loadseg == 0x2000);
+    copied_entry = off;
+    copied_calls++;
+    rt_exited = 1;
+    return 0;
+}
+static const Image copy_fixture = {
+    .name = "COPY.COM", .bytes = copy_code, .size = sizeof copy_code, .run = copy_run,
+};
+
+static void copy_setup(void) {
+    memset(&cpu, 0, sizeof cpu);
+    memset(mem, 0, sizeof mem);
+    bios_init();
+    memcpy(mem + 0x20000, copy_code, sizeof copy_code);
+    rt_register_image(&copy_fixture, 0x2000);
+    cpu.ss = 0x8000;
+    cpu.sp = 0xf000;
+}
+
+static void run_copy(uint16_t segment, uint16_t off) {
+    unsigned before = copied_calls;
+    cpu.cs = segment;
+    cpu.ip = off;
+    rt_exited = 0;
+    rt_run();
+    CHECK(copied_calls == before + 1);
+}
+
+static void copied_prefix_collision(int cached) {
+    copy_setup();
+    CHECK(COPY_RIGHT - COPY_WRONG == 192);
+    CHECK(!memcmp(copy_code + COPY_WRONG, copy_code + COPY_RIGHT, 7));
+    CHECK(copy_code[COPY_WRONG + 7] != copy_code[COPY_RIGHT + 7]);
+
+    /* Discover an old delta first, at an unambiguous instruction entry. */
+    memcpy(mem + 0x300c0, copy_code, sizeof copy_code);
+    run_copy(0x300c, COPY_ANCHOR);
+    CHECK(copied_entry == COPY_ANCHOR);
+    if (cached) {
+        run_copy(0x300c, COPY_WRONG);
+        CHECK(copied_entry == COPY_WRONG);
+    }
+
+    /* Reload the transient 192 bytes lower and discover its new delta.
+     * Its correct entry now occupies the old copy's wrong-entry address. */
+    memcpy(mem + 0x30000, copy_code, sizeof copy_code);
+    run_copy(0x3000, COPY_ANCHOR);
+    CHECK(copied_entry == COPY_ANCHOR);
+    run_copy(0x3000, COPY_RIGHT);
+    CHECK(copied_entry == COPY_RIGHT);
+    run_copy(0x3000, COPY_RIGHT); /* A stale cached entry must not win later. */
+    CHECK(copied_entry == COPY_RIGHT);
+}
+
+static void copied_delta_prefix_collision(void) { copied_prefix_collision(0); }
+static void copied_cached_prefix_collision(void) { copied_prefix_collision(1); }
+
+static void copied_short_tail(void) {
+    copy_setup();
+    memcpy(mem + 0x30000, copy_code, sizeof copy_code);
+    run_copy(0x3000, COPY_ANCHOR);
+    CHECK(copied_entry == COPY_ANCHOR);
+    /* Only the final three code bytes were copied. Unrelated following
+     * bytes cannot disqualify this known copy when no stronger match exists. */
+    memset(mem + 0x30000 + COPY_TAIL + 3, 0xcc, 9);
+    run_copy(0x3000, COPY_TAIL);
+    CHECK(copied_entry == COPY_TAIL);
+}
+
+static void copied_non_entry_falls_through(void) {
+    copy_setup();
+    memcpy(mem + 0x30000, copy_code, sizeof copy_code);
+    run_copy(0x3000, COPY_ANCHOR);
+    CHECK(copied_entry == COPY_ANCHOR);
+    memcpy(mem + 0x30020, copy_code, sizeof copy_code);
+    run_copy(0x3002, COPY_ANCHOR);
+    CHECK(copied_entry == COPY_ANCHOR);
+    /* The old delta points at twelve identical bytes, but not an allowed
+     * instruction entry. Rejecting that candidate must still try the valid
+     * three-byte tail at the newer delta without executing a guessed entry. */
+    memset(mem + 0x30020 + COPY_TAIL + 3, 0xcc, 9);
+    CHECK(!memcmp(mem + 0x30020 + COPY_TAIL, copy_code + COPY_NON_ENTRY, 12));
+    run_copy(0x3002, COPY_TAIL);
+    CHECK(copied_entry == COPY_TAIL);
+}
+
 static void changed_supplement_refused(void) {
     supplement_setup(0);
     rt_register_supplement(&supplemented, supplement_body);
@@ -436,7 +549,7 @@ static void cga_color_port(void) {
     CHECK(bios_cga_color(3) == 15);
 }
 
-enum { CATALOG_IMAGES = 6 };
+enum { CATALOG_IMAGES = 17 };
 static unsigned catalog_calls;
 static int catalog_run(uint32_t off, uint16_t loadseg) {
     if (off) return -1;
@@ -447,14 +560,16 @@ static int catalog_run(uint32_t off, uint16_t loadseg) {
     return 0;
 }
 
-static void six_program_catalog(void) {
-    /* VC, its overlay, BASIC, Logo, Rogue and VZ must coexist even after their
-     * child sessions return. Revisit each entry to check none was evicted. */
-    static const uint8_t bytes[CATALOG_IMAGES][8] = {{0x90}, {0x91}, {0x92}, {0x93}, {0x94}, {0x95}};
+static void shipped_program_catalog(void) {
+    /* VC and its overlay plus all fifteen lazy programs must coexist even
+     * after their children return. Revisit each entry so no eviction can hide
+     * a catalog overflow when Hack and both VC 4.05 images are present. */
+    uint8_t bytes[CATALOG_IMAGES][8] = {{0}};
     Image images[CATALOG_IMAGES];
     memset(&cpu, 0, sizeof cpu);
     memset(images, 0, sizeof images);
     for (unsigned i = 0; i < CATALOG_IMAGES; ++i) {
+        bytes[i][0] = (uint8_t)(0x90 + i);
         images[i].name = "CATALOG.EXE";
         images[i].bytes = bytes[i];
         images[i].size = sizeof bytes[i];
@@ -549,7 +664,18 @@ static void all_shipped_images(void) {
         {.name = "GWBASIC.EXE", .bytes = code, .size = sizeof code},
         {.name = "BOOTLOGO.COM", .bytes = code, .size = sizeof code},
         {.name = "ROGUE.EXE", .bytes = code, .size = sizeof code},
+        {.name = "HACK.EXE", .bytes = code, .size = sizeof code},
         {.name = "VZ.COM", .bytes = code, .size = sizeof code},
+        {.name = "KERMIT.EXE", .bytes = code, .size = sizeof code},
+        {.name = "COMMAND.COM", .bytes = code, .size = sizeof code},
+        {.name = "EDLIN.COM", .bytes = code, .size = sizeof code},
+        {.name = "DEBUG.COM", .bytes = code, .size = sizeof code},
+        {.name = "FIND.EXE", .bytes = code, .size = sizeof code},
+        {.name = "MORE.COM", .bytes = code, .size = sizeof code},
+        {.name = "SORT.EXE", .bytes = code, .size = sizeof code},
+        {.name = "FC.EXE", .bytes = code, .size = sizeof code},
+        {.name = "VC405.COM", .bytes = code, .size = sizeof code},
+        {.name = "VCSETUP.COM", .bytes = code, .size = sizeof code},
     };
     /* The browser smoke launches every bundled program in one VC session.
      * Exited images remain registered for their possible relocated code. */
@@ -602,14 +728,18 @@ int main(void) {
     failed += run_test("CGA color-select port and BIOS", cga_color_port, 0);
     failed += run_test("listing-proved image supplement", image_supplement, 0);
     failed += run_test("copied listing-proved supplement", copied_image_supplement, 0);
+    failed += run_test("copied delta distinguishes seven-byte branch prefix", copied_delta_prefix_collision, 0);
+    failed += run_test("stale copied cache loses to stronger byte match", copied_cached_prefix_collision, 0);
+    failed += run_test("known copied three-byte tail remains callable", copied_short_tail, 0);
+    failed += run_test("strong copied non-entry falls through to valid tail", copied_non_entry_falls_through, 0);
     failed += run_test("changed supplement bytes refused", changed_supplement_refused, 70);
     failed += run_test("supplement scoped to its image", wrong_image_supplement_refused, 70);
-    failed += run_test("all six translated programs remain callable", six_program_catalog, 0);
+    failed += run_test("all seventeen translated programs remain callable", shipped_program_catalog, 0);
     failed += run_test("same-image EXEC restores parent registration", same_image_normal_return, 0);
     failed += run_test("same-image forced exit restores parent registration", same_image_forced_return, 0);
     failed += run_test("same-image return refuses changed parent bytes", same_image_changed_parent_refused, 70);
     failed += run_test("same-image forced return refuses changed parent bytes", same_image_forced_changed_parent_refused, 70);
     failed += run_test("every shipped image in one session", all_shipped_images, 0);
-    printf("test_machine: 28 cases, %d failures\n", failed);
+    printf("test_machine: 32 cases, %d failures\n", failed);
     return failed ? 1 : 0;
 }

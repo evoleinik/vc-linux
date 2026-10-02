@@ -233,4 +233,44 @@ try {
   subtle.digest = originalDigest;
 }
 
-console.log('web lazy files: complete metadata, once-only fetch, SHA-256/immutable EXEC references, rename/delete/write/truncate, corrupt/offline/stale/body+digest-timeout recovery passed');
+// HTTP hosting without WebCrypto uses the same transport/cache and full
+// SHA-256 pin, including Adler32 collisions, empty files and retry behavior.
+const cryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+try {
+  Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true });
+  let corrupt = true;
+  let downloads = 0;
+  const plain = await createFixture({
+    wasmBinary: readFileSync(modulePath.replace(/\.mjs$/, '.wasm')),
+    vcFetchProgram: async (url) => {
+      downloads++;
+      const match = String(url).match(/file\.(\d{12})\.bin$/);
+      assert.ok(match);
+      const data = bytes(Number(match[1]));
+      if (corrupt && data.length) {
+        data[0]++; data[1] -= 2; data[2]++;
+        assert.equal(adler32(data), adler32(bytes(Number(match[1]))));
+      }
+      await tick();
+      return data;
+    },
+  });
+  plain.ccall('fixture_init', null, [], []);
+  assert.equal(plain.ccall('fixture_install', 'number', ['number', 'string'], [0, '/plain.txt']), 0);
+  const plainOpen = () => plain.ccall('fixture_open', 'number', ['string', 'number'], ['/plain.txt', 0], { async: true });
+  assert.equal(await plainOpen(), 5, 'without WebCrypto, full SHA-256 still rejects same-Adler32 corruption');
+  assert.throws(() => plain.FS.readFile('/plain.txt'));
+  corrupt = false;
+  assert.equal(await plainOpen(), 0);
+  assert.deepEqual(plain.FS.readFile('/plain.txt'), bytes(0));
+  assert.equal(await plainOpen(), 0);
+  assert.equal(downloads, 2, 'without WebCrypto, retry succeeds once and then stays cached');
+  assert.equal(plain.ccall('fixture_install', 'number', ['number', 'string'], [10, '/empty.txt']), 0);
+  assert.equal(await plain.ccall('fixture_open', 'number', ['string', 'number'], ['/empty.txt', 0], { async: true }), 0);
+  assert.equal(plain.FS.readFile('/empty.txt').length, 0);
+} finally {
+  if (cryptoDescriptor) Object.defineProperty(globalThis, 'crypto', cryptoDescriptor);
+  else delete globalThis.crypto;
+}
+
+console.log('web lazy files: complete metadata, once-only fetch, SHA-256/immutable EXEC references, rename/delete/write/truncate, corrupt/offline/stale/body+digest-timeout recovery, and no-WebCrypto integrity/cache passed');

@@ -29,12 +29,13 @@ files, and as WebAssembly in any browser. No emulator runs at run time.
 | *BASIC Computer Games*, twelve of them | David H. Ahl, 1978 | public domain (2022) |
 | bootLogo, a Logo with turtle graphics | Oscar Toledo G., 2024 | BSD-2 |
 | Rogue 5.4.4, the original roguelike | Michael Toy, Ken Arnold, Glenn Wichman, 1980-1985 | BSD-3 |
+| Hack 1.0.3, between Rogue and NetHack | Jay Fenlason, Andries Brouwer, 1982-1985; maintained by NetBSD | BSD-3 |
 | VZ Editor 1.6 | c.mos, Village Center, 1990s | BSD-3 |
 | MS-DOS Kermit 3.15 | Columbia University, 1982-1997 | BSD-3 (released 2011) |
 | MS-DOS 2.0 COMMAND.COM, EDLIN, DEBUG, FIND, MORE, SORT and FC | Microsoft, 1983 | MIT |
 
 **Try it in your browser: [notanemulator.com](https://notanemulator.com/).** VC starts at once,
-and runs MS-DOS's shell and utilities, VZ Editor, GW-BASIC, twelve classic BASIC games, bootLogo turtle graphics and Rogue
+and runs MS-DOS's shell and utilities, VZ Editor, GW-BASIC, twelve classic BASIC games, bootLogo turtle graphics, Rogue and Hack
 from its `H:` drive, the way DOS did. It is the same translated code, compiled to WebAssembly.
 
 ## How this differs from emulation and rewrites
@@ -54,7 +55,7 @@ That is one static binary for x86-64 Linux, with no dependencies. You need a ter
 80×25. Set `COLORTERM=truecolor` for the exact VGA palette.
 
 To build from source, you need gcc, make, [uv](https://docs.astral.sh/uv/), and an
-OpenWatcom 2.0 installation for the bundled 16-bit DOS C program. Set `WATCOM`
+OpenWatcom 2.0 installation for the bundled 16-bit DOS C programs. Set `WATCOM`
 to that installation's root, or fetch the pinned version below (the 524 MB
 toolchain is not in this repository):
 
@@ -66,6 +67,12 @@ toolchain is not in this repository):
 `make rogue` builds `build/rogue/ROGUE.EXE` and its verbose link map. Project-owned
 DOS shims adapt Rogue's Unix interfaces and 32-bit integer assumptions; the
 vendored Rogue and PDCurses sources are never edited.
+
+`make hack` builds Hack 1.0.3 as `build/hack/HACK.EXE` with the same pinned
+OpenWatcom and compiled-C translation path. Its unedited NetBSD source is in
+`third_party/hack`; `runtime/hack_dos` supplies the DOS-specific startup,
+terminal and file handling in place of the Unix modules. IBM PC wall glyphs
+are drawn through the BIOS. The build supplies its data files beside the EXE.
 
 `build/vc [DIRECTORY]` opens in that directory. Settings live in `~/.config/vc-linux/` and a log
 goes to `~/.cache/vc-linux/vc.log`.
@@ -93,6 +100,7 @@ goes to `~/.cache/vc-linux/vc.log`.
 | `kermit take bbs.tak, stay` (Linux), or Enter on `H:\BBS.TAK` (browser) | Dial the BBS in MS-DOS Kermit | Ctrl-] then C returns to Kermit's prompt; `HANGUP`, then `EXIT`, returns to VC |
 | `bootlogo`, or Enter on `BOOTLOGO.COM` | bootLogo turtle graphics | `QUIT`, then VC's Enter confirmation returns to the panels |
 | `rogue`, or Enter on `ROGUE.EXE` | Original Rogue 5.4.4 | `h j k l` or arrows move, `?` gives help, `Q` then `y` quits, `S` saves |
+| `hack103` (Linux), `hack` or Enter on `HACK.EXE` (browser/door) | Hack 1.0.3 | `h j k l` move, `?` gives help, `Q` then `y` quits, `S` saves |
 | Mouse | Click to move the cursor | SGR mouse reporting |
 
 Drives: `C:` is `/` and `H:` is your home directory. Names are shown in code page 866, so Cyrillic
@@ -179,6 +187,34 @@ game starts with a notice. An existing `rogue.bad` is never overwritten.
 The player name is fixed to Rogue, shell escape and Unix signals are disabled,
 and successful restore consumes the save, as in the original game.
 
+Type `hack103` on Linux for the BSD-licensed game that grew into NetHack. Its original
+experience and character-choice prompts remain; `hack103 -C` selects a Caveman
+directly. `h j k l` move, `y u b n` move diagonally, and `?` opens help.
+`S` saves to `HACK.SAV`; the next plain `hack103` restores it. `Q`, then `y`,
+quits back to VC (Space acknowledges any `--More--` prompt).
+Unlike Rogue, Hack keeps `data`, `help`, `hh`, `rumors`, `record`, `perm`, saves
+and bones beside `HACK.EXE`: in `$XDG_CONFIG_HOME/vc-linux/HACK` on Linux
+(default `~/.config/vc-linux/HACK`), never directly in your home or working
+directory. Scores, saves and bones are not reset on startup; saves and bones
+from another build are reported as out of date and deleted, as upstream did.
+The default player name is Hacker. Concurrent native VC processes lock separate
+playgrounds: the first uses `HACK`, and others use persistent `PLAY0001` through
+`PLAY0064` subdirectories with their own data, saves, levels, bones and scores.
+Each uses a read-write `VCPLAY.LCK` file with a kernel OFD lock, including on
+NFS homes. Secondary slots refresh their executable and static data under the
+lock when the installed files change; live games and scores are preserved.
+The same VC process keeps its playground when you save and relaunch. Locks are
+released when VC exits, including after a crash; saved files remain. To resume
+a secondary save later when the main playground is free, open that `PLAYnnnn`
+directory and type `dos2 /c HACK.EXE`. Existing directories and saves are not erased.
+Only the typed word `hack103` launches the installed DOS game on Linux; its
+directory is not on native DOS `PATH`. Debian and Ubuntu's `bsdgames` installs
+`/usr/games/hack`, so `hack` must retain its `/bin/sh` meaning. Other typed
+names, including `hack.exe`, also keep their host meaning. Native Enter on an
+EXE uses this same shell-command path. An explicit launch from `dos2` still
+matches complete DOS bytes, including renamed copies. Browser and door
+commands remain `hack` or Enter on `H:\GAMES\HACK\HACK.EXE`.
+
 CGA modes 4/5 (320×200, four colours) and 6 (640×200, two colours) use real interlaced B800h
 video memory. GW-BASIC's `SCREEN 1`, `PSET`, `LINE`, `CIRCLE` and `DRAW` work; `SCREEN 0`
 returns BASIC to text. Terminals display an 80×25 coloured braille reduction; a browser shows
@@ -232,7 +268,7 @@ WezTerm does too once `enable_kitty_keyboard` is on. xterm does it through modif
 
 The same translated C also compiles to WebAssembly with Emscripten. The page opens VC at once on a
 small in-memory `H:` drive holding a README, VC's history, its own assembly sources, VZ Editor,
-GW-BASIC, bootLogo, Rogue, Microsoft's DOS shell and utilities, and twelve of David Ahl's
+GW-BASIC, bootLogo, Rogue, Hack, Microsoft's DOS shell and utilities, and twelve of David Ahl's
 public-domain BASIC Computer Games. xterm.js
 shows the screen in the IBM VGA font. The page reports keys in full, so Ctrl-[, Ctrl-I and Ctrl-M
 work, and holding Shift, Ctrl or Alt swaps the key bar. Files vanish on reload.
@@ -248,11 +284,17 @@ input active.
 `H:\GAMES\ROGUE.EXE` is also on the DOS `PATH`: type `rogue` from either panel
 directory, or press Enter on that EXE. Its saves, like all browser files, vanish
 on reload.
+Hack lives at `H:\GAMES\HACK\HACK.EXE`, also on DOS `PATH`. Its executable and
+data files are listed immediately and each loads on its first DOS open;
+its translated code loads on first execution. Enter starts it, and quitting
+returns to VC. Saves, bones and scores stay in that H: directory and vanish
+on reload. The [BBS door files](infra/bbs/doors/README.md) include a direct
+HACK door as well as Hack on the VC door's private H: drive.
 
 The Source button, or Ctrl-Shift-F12, shows the original assembly behind the running code. It
 shows the line the CPU is on, with Volkov's comments and the lines around it. Below that are the
 callers that led there, found from real return addresses on the stack, and the last 32 lines that
-ran. It works for both VC versions, VCSETUP, GW-BASIC, bootLogo and VZ. For Rogue, compiled from C, it names the function.
+ran. It works for both VC versions, VCSETUP, GW-BASIC, bootLogo and VZ. For Rogue and Hack, compiled from C, it names the function.
 The sources load the first time the panel opens.
 
 The page first downloads VC and its startup settings. H: immediately lists all
@@ -269,7 +311,7 @@ To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
     make test-web     # Node checks VC, DOS shell/utilities, editors, games, Kermit, graphics and sound
 
 Serve `build/web/` over HTTPS, or HTTP on localhost, to open it. Lazy-file SHA-256 verification
-uses WebCrypto, which requires a secure context. The design is in `docs/plans/2026-10-01-browser-build.md`.
+uses WebCrypto when available and a portable fallback otherwise. The design is in `docs/plans/2026-10-01-browser-build.md`.
 
 ## Why shouldn't I use it?
 
@@ -327,9 +369,10 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 
 | Suite | What it proves |
 |---|---|
-| `test-translator` | Every distinct instruction in both VCs, VCSETUP, GW-BASIC, bootLogo, Rogue, VZ, Kermit and MS-DOS matches Unicorn from 32 random states each. All 15 earlier generated C files stay byte-identical. One whole routine matches the original on all 131,072 inputs. |
+| `test-translator` | Every distinct instruction in both VCs, VCSETUP, GW-BASIC, bootLogo, Rogue, Hack, VZ, Kermit and MS-DOS matches Unicorn from 32 random states each. All 17 earlier generated C files stay byte-identical. One whole routine matches the original on all 131,072 inputs. |
 | `test-vc405-build` | Unedited licensed 4.05 sources and reproducible VC.COM/VCSETUP.COM bytes identical to the TASM builds. |
 | `test-rogue-build` | The original Rogue/PDCurses DOS build, linked runtime licence and reproducible EXE bytes. |
+| `test-hack-build` | Unedited NetBSD Hack source, DOS shims and data files, a reproducible EXE and its pinned SHA-256. |
 | `test-vz-build` | Exact shipped US COM bytes, reproducible map/listings, and the build-time MASM compatibility layer. |
 | `test-fs` | The DOS file layer, DOS 1.x FCB calls, and per-process short-path leases: over 4,400 checks against a temporary tree. |
 | `test-exec` | Byte-identical EXEC, DOS search order, command tails, safe F4/associations, VZ path/temp limits and child cleanup. |
@@ -338,13 +381,13 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 | `test-msdos2-build` | Unedited Microsoft sources, reproducible COMMAND.COM and six utilities, and per-program shipped-binary comparisons. |
 | `test-modem`, `test-serial-machine` | UART registers, DLAB, real IRQ 4/8259 EOI, INT 14h, Hayes commands, guard timing, 14400-bps pacing and exact telnet replies to the captured BBS. |
 | `test-modem-transport` | Real nonblocking TCP on loopback, including failure and disconnect behavior. |
-| `test-embed` | Exact native/web DOS-file round trips, VC image deduplication, and bounded startup decompression with corruption checks. |
+| `test-embed` | Exact native/web DOS-file round trips, VC image deduplication, native-only lazy-asset exclusion, and bounded startup decompression with corruption checks. |
 | `test-process` | Child fault recovery, parent interrupt/device state, and fatal no-translation faults in VC itself. |
 | `test-term` | Key parsing, the screen renderer, and BIOS video, keyboard and mouse: about 5,600 checks. |
 | `test-cga` | Every CGA mode and pixel address, palette, XOR/readback, graphics glyphs, cursor and scrolling: over 823,000 checks. |
 | `test-ini` | The shipped `VC.INI` passes VC's own checksum and suits Linux. |
-| `test-web` | The WebAssembly build under Node: VC, COMMAND.COM DIR/batch commands and all seven lazy DOS modules, VZ F4/edit/save/quit with MEMFS readback, Rogue play/save/restore, GW-BASIC, bootLogo, Kermit BBS dial/type/hangup/EXIT, exact CGA pixels, canvas transitions and sound. Needs Emscripten. |
-| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real DOS launches, identity/injection checks, VZ editing and backups, Rogue play/save/restore, Kermit's full BBS workflow, Ctrl-Break, every shipped BASIC game's first prompt, Logo drawings and BASIC graphics. |
+| `test-web` | The WebAssembly build under Node: VC, COMMAND.COM DIR/batch commands and all seven lazy DOS utilities, VZ F4/edit/save/quit with MEMFS readback, Rogue play/save/restore, lazy Hack startup/status, GW-BASIC, bootLogo, Kermit BBS dial/type/hangup/EXIT, exact CGA pixels, canvas transitions and sound. Needs Emscripten. |
+| `test-e2e` | VC in a pseudo-terminal: file operations and keys, real DOS launches, identity/injection checks, VZ editing and backups, Rogue and Hack play/save/restore, Kermit's full BBS workflow, Ctrl-Break, every shipped BASIC game's first prompt, Logo drawings and BASIC graphics. |
 
 Every finding from the three code reviews was fixed with a test that failed on the old code first.
 
@@ -448,6 +491,13 @@ Kisseberth's portable save and platform code (BSD-3-Clause; `third_party/rogue`)
 PDCurses is public domain (`third_party/pdcurses`). OpenWatcom's linked C runtime
 uses the Sybase Open Watcom Public License. `ROGUELIC.TXT`, `PDCLIC.TXT`, and
 `OWLIC.TXT` accompany the installed game and its browser copy.
+
+Hack 1.0.3 descends from Jay Fenlason's 1982 Hack and Andries Brouwer's 1985
+release, maintained in NetBSD's `games/hack`. The unedited vendored snapshot
+is NetBSD commit `f037b5fcaa6db302271bbb445039a3a513b2e28c` (2026-08-14), with
+the CWI Amsterdam and Jay Fenlason BSD-3-Clause notices in `third_party/hack`.
+`HACKLIC.TXT`, `FENLIC.TXT` and OpenWatcom's `OWLIC.TXT` accompany every installed
+copy. DOS adaptations live separately under `runtime/hack_dos`.
 
 VZ Editor 1.6 is by c.mos (Village Center), BSD-3-Clause (`third_party/vzeditor/LICENSE`).
 The pinned US executable is reproduced byte-for-byte, with its original English definitions

@@ -16,8 +16,9 @@ from test_gwbasic_e2e import ROOT, VcSession, panels, running_vc, until
 
 
 MSDOS_PROGRAMS = ("COMMAND.COM", "EDLIN.COM", "DEBUG.COM", "FIND.EXE", "MORE.COM", "SORT.EXE", "FC.EXE")
-PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE",
+PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE", "HACK/HACK.EXE", "VZ.COM", "KERMIT.EXE",
             "VC405.COM", "VC405/VCSETUP.COM", "DOS2.COM", *(f"DOS2/{name}" for name in MSDOS_PROGRAMS))
+HACK_DATA = ("data", "help", "hh", "rumors", "record", "perm")
 
 
 @contextmanager
@@ -46,6 +47,34 @@ def test_install_vc405_is_separate_from_current_vc():
         assert (config / "VC.COM").read_bytes() == (ROOT / "build/VC.COM").read_bytes()
         assert not (config / "VCSETUP.COM").exists(), "only vc405 may add a new Linux command name"
         assert not (work / "VC.INI").exists()
+
+
+def test_install_hack_keeps_executable_data_and_user_state_together():
+    with running_vc() as (_, work, config):
+        directory = config / "HACK"
+        assert directory.is_dir(), "Hack must have its own directory beside Rogue"
+        assert (directory / "HACK.EXE").read_bytes() == (ROOT / "build/hack/HACK.EXE").read_bytes()
+        assert not (config / "HACK.EXE").exists(), "Hack's executable must stay beside its data"
+        for name in HACK_DATA:
+            assert (directory / name).read_bytes() == (ROOT / "build/hack" / name).read_bytes()
+        assert (directory / "HACKLIC.TXT").read_bytes() == (ROOT / "third_party/hack/COPYRIGHT").read_bytes()
+        assert (directory / "FENLIC.TXT").read_bytes() == (ROOT / "third_party/hack/COPYRIGHT-JF").read_bytes()
+        assert (directory / "OWLIC.TXT").read_bytes() == (ROOT / "build/hack/OWLIC.TXT").read_bytes()
+        # Once installed, game data and saves are the user's files. Another
+        # startup may refresh the image but must not reset scores or bones.
+        state = {name: b"user-owned " + name.encode() + b"\n"
+                 for name in (*HACK_DATA, "HACK.SAV", "bones.1")}
+        for name, contents in state.items():
+            (directory / name).write_bytes(contents)
+        before = {name: (directory / name).stat() for name in state}
+        with another_vc(work, config) as second:
+            second.wait_for("10Quit", timeout=15)
+            until(second, lambda: panels(second.text()))
+            for name, contents in state.items():
+                path = directory / name
+                assert path.read_bytes() == contents
+                assert (path.stat().st_ino, path.stat().st_mtime_ns) == (
+                    before[name].st_ino, before[name].st_mtime_ns)
 
 
 def test_install_msdos_programs_in_config_without_home_writes():
@@ -311,6 +340,19 @@ def test_web_demo_installs_real_rogue_and_licenses_in_games(tmp_path):
     assert (tmp_path / "GAMES/OWLIC.TXT").read_bytes() == (ROOT / "build/rogue/OWLIC.TXT").read_bytes()
     readme = (tmp_path / "README.TXT").read_text()
     assert all(text in readme for text in ("ROGUE.EXE", "Q then y", "S then y", "h (left)"))
+
+
+def test_web_demo_installs_hack_and_data_together(tmp_path):
+    result = web_demo(tmp_path)
+    assert result.returncode == 0, result.stderr
+    directory = tmp_path / "GAMES/HACK"
+    assert (directory / "HACK.EXE").read_bytes() == (ROOT / "build/hack/HACK.EXE").read_bytes()
+    for name in HACK_DATA:
+        assert (directory / name).read_bytes() == (ROOT / "build/hack" / name).read_bytes()
+    assert (directory / "HACKLIC.TXT").read_bytes() == (ROOT / "third_party/hack/COPYRIGHT").read_bytes()
+    assert (directory / "FENLIC.TXT").read_bytes() == (ROOT / "third_party/hack/COPYRIGHT-JF").read_bytes()
+    assert (directory / "OWLIC.TXT").read_bytes() == (ROOT / "build/hack/OWLIC.TXT").read_bytes()
+    assert not (tmp_path / "HACK.EXE").exists()
 
 
 def test_web_demo_installs_source_built_dos_shell_and_utilities(tmp_path):

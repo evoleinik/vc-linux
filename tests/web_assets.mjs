@@ -13,7 +13,7 @@ const sources = Object.fromEntries([
 const failures = [];
 const versions = new Set();
 const referenced = new Set();
-const programs = ["gwbasic", "bootlogo", "rogue", "vz", "kermit",
+const programs = ["gwbasic", "bootlogo", "rogue", "hack", "vz", "kermit",
   "command", "edlin", "debug", "find", "more", "sort", "fc", "vc405", "vcsetup405"];
 const programPattern = programs.join('|');
 const sideFiles = readdirSync(dir).filter(file => file.endsWith(".wasm") && file !== "vc.wasm").sort();
@@ -49,6 +49,8 @@ else if (sideFiles.length === programs.length) {
 // separate manifest: a header/main rebuild missed by make must fail here.
 // C strings end at NUL; the smoke test additionally checks actual EXEC URLs.
 const main = readFileSync(join(dir, "vc.wasm")).toString("latin1");
+if (readdirSync(dir).some(file => /^(?:hack|source)-files.*\.bin$/.test(file)))
+  failures.push('obsolete directory bundles must not replace per-file first-open assets');
 const requestedSides = [...new Set([...main.matchAll(new RegExp(`(?:${programPattern})(?:\\.[A-Za-z0-9_-]+)?\\.wasm(?=\\0)`, 'g'))]
   .map(([file]) => file))].sort();
 if (requestedSides.length !== programs.length || JSON.stringify(requestedSides) !== JSON.stringify(sideFiles))
@@ -60,8 +62,9 @@ if (!requestedFiles.length || JSON.stringify(requestedFiles) !== JSON.stringify(
   failures.push('main lazy-file names differ from the published file assets');
 for (const file of fileAssets) {
   const match = file.match(/^file\.([0-9a-f]{12})\.bin$/);
-  const hash = createHash('sha256').update(readFileSync(join(dir, file))).digest('hex').slice(0, 12);
-  if (!match || match[1] !== hash) failures.push(`${file}: lazy-file hash differs from its actual bytes`);
+  const hash = createHash('sha256').update(readFileSync(join(dir, file))).digest('hex');
+  if (!match || match[1] !== hash.slice(0, 12)) failures.push(`${file}: lazy-file hash differs from its actual bytes`);
+  if (!main.includes(`${hash}\0`)) failures.push(`${file}: main does not pin its full SHA-256`);
 }
 for (const [file, text] of Object.entries(sources)) {
   if (text.includes("__V__")) failures.push(`${file}: placeholder __V__ was not replaced`);

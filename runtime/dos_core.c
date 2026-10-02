@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* DOS kernel pieces that are about processes and memory, not files:
  * the MCB chain, PSPs, environments, EXEC and terminate, interrupt vectors,
  * version and system info, plus the minor BIOS and multiplex interrupts.
@@ -44,6 +45,9 @@ static int door_mode;
  * directory may legitimately contain another byte-matched VC.COM. */
 static char builtin_dos[2][128], builtin_short[2][128], builtin_host[2][4096];
 static char vc405_directory[128];
+#ifndef __EMSCRIPTEN__
+static char native_hack_program[256];
+#endif
 
 void dos_core_set_door(int enabled) { door_mode = !!enabled; }
 
@@ -56,7 +60,10 @@ typedef struct {
     Cpu parent;        /* parent registers at its EXEC call */
     uint16_t dta_seg, dta_off;
     char temp_dir[32]; /* Private, short VZ swap directory; not guest memory. */
-    char vc_startup[128]; /* DOS2 loader finishes PSP/env after AH55. */
+    char program_startup[128]; /* DOS2 loader finishes PSP/env after AH55. */
+#ifndef __EMSCRIPTEN__
+    struct HackPlayground *hack_playground;
+#endif
 } Proc;
 static Proc procs[8];
 static int nprocs;
@@ -464,7 +471,7 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
 static const Image *const images[] = {
     &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue, &image_vz,
     &image_kermit, &image_command, &image_edlin, &image_debug, &image_find, &image_more,
-    &image_sort, &image_fc, &image_vc405, &image_vcsetup405
+    &image_sort, &image_fc, &image_vc405, &image_vcsetup405, &image_hack
 };
 #define IMAGE_COUNT (sizeof images / sizeof images[0])
 #endif
@@ -478,7 +485,8 @@ static const EmbeddedFile *image_file(size_t index) {
 #else
     const Image *img = images[index];
     const char *name = img == &image_bootlogo ? "BOOTLOGO.COM" :
-                       img == &image_vcsetup405 ? "VC405/VCSETUP.COM" : img->name;
+                       img == &image_vcsetup405 ? "VC405/VCSETUP.COM" :
+                       img == &image_hack ? "HACK/HACK.EXE" : img->name;
 #endif
     for (int i = 0; i < embedded_file_count; i++)
         if (!strcmp(embedded_files[i].name, name)) return &embedded_files[i];
@@ -983,7 +991,14 @@ static int dos_program_command(const uint8_t *cmd, size_t len) {
     }
 #endif
     char dos[256], host[4096];
-    int found = find_program(word, dos, sizeof dos, host, sizeof host);
+    const char *lookup = word;
+#ifndef __EMSCRIPTEN__
+    /* Keep the real EXE beside its data without putting HACK on native
+     * DOS PATH: Debian/Ubuntu's bsdgames owns the host command "hack". */
+    if (!door_mode && !strcasecmp(word, "hack103") && native_hack_program[0])
+        lookup = native_hack_program;
+#endif
+    int found = find_program(lookup, dos, sizeof dos, host, sizeof host);
     /* Typed commands only belong to DOS after a complete byte match.
      * Shipped association words remain DOS-only even when lookup fails:
      * their tails can contain file names with shell metacharacters. */
@@ -1003,6 +1018,10 @@ static int dos_program_command(const uint8_t *cmd, size_t len) {
      * Direct DOS EXEC (including COMMAND's loader) still matches by bytes. */
     if (!door_mode && (img == &image_vc405 || img == &image_vcsetup405) &&
         strcasecmp(word, "vc405"))
+        return association ? command_error(11) : -1;
+    /* As with vc405, suffixes and renamed copies do not claim new host
+     * commands. Direct DOS EXEC still identifies complete bytes. */
+    if (!door_mode && img == &image_hack && strcasecmp(word, "hack103"))
         return association ? command_error(11) : -1;
 #endif
     if (association) {
@@ -1458,11 +1477,345 @@ static int vc_environment(const Image *img, char *env, size_t *length, size_t ca
     return 0;
 }
 
+#ifndef __EMSCRIPTEN__
+/* The preserved EXE uses fixed HACK.SAV/HACK.n names. Give every live native
+ * VC its own playground without patching DOS bytes. The first VC keeps the
+ * original directory; contenders use persistent PLAY0001..PLAY0064 copies.
+ * A separate regular-file OFD lock works on NFS and is independent of the
+ * guest's perm file. Keep the directory descriptor too, so every refresh
+ * acts on the directory that was locked, not a replacement at its pathname.
+ * Keep ownership through S/Q and release it on process exit (including kill),
+ * so repeated launches in this VC always find this VC's own saved game. */
+typedef struct HackPlayground {
+    struct HackPlayground *next;
+    dev_t source_dev, dev;
+    ino_t source_ino, ino;
+    int fd, directory, source;
+    char slot[9];
+} HackPlayground;
+static HackPlayground *hack_playgrounds;
+static const char hack_slot_marker[] = "vc-linux Hack playground 1\n";
+
+static int hack_playground_active(const HackPlayground *playground) {
+    for (int i = 0; i < nprocs; ++i)
+        if (procs[i].hack_playground == playground) return 1;
+    return 0;
+}
+
+static void close_hack_playgrounds(void) {
+    while (hack_playgrounds) {
+        HackPlayground *old = hack_playgrounds;
+        hack_playgrounds = old->next;
+        close(old->fd);
+        close(old->directory);
+        if (old->source != old->directory) close(old->source);
+        free(old);
+    }
+}
+
+static int hack_slot_lock_current(int directory, int fd) {
+    struct stat held, named;
+    return !fstat(fd, &held) && S_ISREG(held.st_mode) &&
+        !fstatat(directory, "VCPLAY.LCK", &named, AT_SYMLINK_NOFOLLOW) &&
+        S_ISREG(named.st_mode) && held.st_dev == named.st_dev && held.st_ino == named.st_ino;
+}
+
+static int hack_slot_lock(int directory, int *busy) {
+    *busy = 0;
+    /* NFS implements record locks on regular files; an exclusive lock
+     * needs write access. OFD ownership survives unrelated guest closes. */
+    int fd = openat(directory, "VCPLAY.LCK",
+                    O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); return -1; }
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    if (fcntl(fd, F_OFD_SETLK, &lock)) {
+        *busy = errno == EAGAIN || errno == EACCES;
+        close(fd);
+        return -1;
+    }
+    /* The lock might have been unlinked/replaced between open and fcntl.
+     * Never claim the slot while holding an obsolete lock-file inode. */
+    if (!hack_slot_lock_current(directory, fd)) { close(fd); return -1; }
+    return fd;
+}
+
+static int hack_slot_owned(int directory) {
+    int fd = openat(directory, "VCPLAY.ID", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char marker[sizeof hack_slot_marker];
+    struct stat st;
+    int valid = !fstat(fd, &st) && S_ISREG(st.st_mode) &&
+        read(fd, marker, sizeof marker) == sizeof hack_slot_marker - 1 &&
+        !memcmp(marker, hack_slot_marker, sizeof hack_slot_marker - 1);
+    close(fd);
+    return valid;
+}
+
+static int hack_slot_write(int directory, const char *name, const void *data, size_t size) {
+    int fd = openat(directory, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return 5;
+    FILE *out = fdopen(fd, "wb");
+    if (!out) { close(fd); return 5; }
+    int error = fwrite(data, 1, size, out) == size ? 0 : 5;
+    if (fclose(out)) error = 5;
+    return error;
+}
+
+static int hack_slot_seed(int directory) {
+    /* Only new, exclusively locked directories reach here. Never copy the
+     * first player's live save, bones, levels or scores into another game.
+     * Publish the ownership marker last: an interrupted initialization is
+     * left recoverable and is never mistaken for a complete playground. */
+    unsigned count = 0;
+    for (int i = 0; i < embedded_file_count; ++i) {
+        const EmbeddedFile *file = &embedded_files[i];
+        if (strncmp(file->name, "HACK/", 5)) continue;
+        if (!file->data || strchr(file->name + 5, '/')) return 5;
+        int error = hack_slot_write(directory, file->name + 5, file->data, file->size);
+        if (error) return error;
+        count++;
+    }
+    if (count != 10) return 2; /* EXE, six data files and three notices. */
+    return hack_slot_write(directory, "VCPLAY.ID", hack_slot_marker, sizeof hack_slot_marker - 1);
+}
+
+static int hack_asset_read(int source, const EmbeddedFile *file, off_t offset,
+                            uint8_t *buffer, size_t size) {
+    if (source < 0) { memcpy(buffer, file->data + offset, size); return 0; }
+    size_t used = 0;
+    while (used < size) {
+        ssize_t n = pread(source, buffer + used, size - used, offset + (off_t)used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return 5;
+        used += (size_t)n;
+    }
+    return 0;
+}
+
+static int hack_slot_matches(int directory, const EmbeddedFile *file, int source, off_t length) {
+    int fd = openat(directory, file->name + 5, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return 0;
+    struct stat st;
+    int same = !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_size == length;
+    off_t offset = 0;
+    uint8_t buffer[8192], installed[8192];
+    while (same && offset < length) {
+        size_t size = length - offset > (off_t)sizeof buffer ? sizeof buffer : (size_t)(length - offset);
+        ssize_t n = read(fd, buffer, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0 || hack_asset_read(source, file, offset, installed, (size_t)n) ||
+            memcmp(buffer, installed, (size_t)n)) same = 0;
+        else offset += n;
+    }
+    close(fd);
+    return same;
+}
+
+static int hack_slot_replace(int directory, const EmbeddedFile *file, int source, off_t length) {
+    static unsigned serial;
+    char temporary[64];
+    int fd = -1;
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        snprintf(temporary, sizeof temporary, ".VCHACK.%ld.%u", (long)getpid(), serial++);
+        fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0) break;
+        if (errno != EEXIST) return 5;
+    }
+    if (fd < 0) return 5;
+    FILE *out = fdopen(fd, "wb");
+    int error = 0;
+    if (!out) { close(fd); error = 5; }
+    else {
+        uint8_t buffer[8192];
+        for (off_t offset = 0; offset < length;) {
+            size_t size = length - offset > (off_t)sizeof buffer ? sizeof buffer : (size_t)(length - offset);
+            if (hack_asset_read(source, file, offset, buffer, size) ||
+                fwrite(buffer, 1, size, out) != size) { error = 5; break; }
+            offset += (off_t)size;
+        }
+        if (fclose(out)) error = 5;
+    }
+    /* Publishing a complete replacement also avoids following/truncating
+     * an old symlink or hard link into an unrelated host file. */
+    if (!error && renameat(directory, temporary, directory, file->name + 5)) error = 5;
+    if (error) unlinkat(directory, temporary, 0);
+    return error;
+}
+
+static int hack_slot_refresh(int directory, int installed) {
+    for (int i = 0; i < embedded_file_count; ++i) {
+        const EmbeddedFile *file = &embedded_files[i];
+        if (strncmp(file->name, "HACK/", 5)) continue;
+        const char *name = file->name + 5;
+        if (!file->data || strchr(name, '/')) return 5;
+        /* record is the live score table; perm is Hack's own lock file.
+         * Saves, bones, levels and these two files are never upgraded. */
+        if (!strcmp(name, "record") || !strcmp(name, "perm")) continue;
+        int source = -1;
+        off_t length = (off_t)file->size;
+        /* The EXE must match this process's translation, even when its
+         * primary executable was renamed. Read installed static data from
+         * the primary, preserving customized help/rumors in all slots.
+         * An absent data file uses the bundled installation default. */
+        if (strcmp(name, "HACK.EXE")) {
+            /* The installer preserves user-symlinked static data. Follow
+             * that read-only reference, just as the primary game does;
+             * never follow links on the destination or lock-file opens. */
+            source = openat(installed, name, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+            if (source < 0 && errno != ENOENT) return 5;
+            if (source >= 0) {
+                struct stat st;
+                if (fstat(source, &st) || !S_ISREG(st.st_mode) || st.st_size < 0) {
+                    close(source); return 5;
+                }
+                length = st.st_size;
+            }
+        }
+        int error = hack_slot_matches(directory, file, source, length) ? 0 :
+                    hack_slot_replace(directory, file, source, length);
+        if (source >= 0) close(source);
+        if (error) return error;
+    }
+    return 0;
+}
+
+static int prepare_hack_playground(const char *program, char result[128],
+                                   HackPlayground **selected, DosPathLease **lease,
+                                   DosPathLease **directory) {
+    char host[4096], source[4096], chosen[4096], slot[9] = "";
+    if (dos_path_host(program, host, sizeof host)) return file_error();
+    int error = 0;
+    strcpy(source, host);
+    char *slash = strrchr(source, '/');
+    if (!slash) return 3;
+    if (slash == source) slash[1] = 0;
+    else *slash = 0;
+    int root = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root < 0) return file_error();
+    struct stat original, actual;
+    if (fstat(root, &original)) { close(root); return 5; }
+    HackPlayground *playground = NULL;
+    unsigned retained = 0;
+    for (HackPlayground *p = hack_playgrounds; p; p = p->next) {
+        retained++;
+        if (hack_playground_active(p)) continue;
+        if (original.st_dev == p->dev && original.st_ino == p->ino) {
+            playground = p; /* Explicit EXEC of this process's copied EXE. */
+            break;
+        }
+        if (original.st_dev == p->source_dev && original.st_ino == p->source_ino) {
+            strcpy(slot, p->slot);
+            playground = p;
+            break;
+        }
+    }
+    int owned = -1, locked = -1;
+    if (!playground) {
+        if (retained >= 64) { close(root); return 4; }
+        int busy;
+        locked = hack_slot_lock(root, &busy);
+        if (locked >= 0) owned = root;
+        else if (!busy) error = 5;
+        for (unsigned number = 1; owned < 0 && !error && number <= 64; ++number) {
+            snprintf(slot, sizeof slot, "PLAY%04u", number);
+            int created = mkdirat(root, slot, 0700) == 0;
+            if (!created && errno != EEXIST) { error = 5; break; }
+            int candidate = openat(root, slot, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (candidate < 0) continue; /* An unrelated file/symlink is not ours. */
+            /* Inspect ownership before creating a lock file: unrelated
+             * directories must stay untouched. An allocator still seeding
+             * a new slot publishes its marker last, so contenders skip it. */
+            if (!created && !hack_slot_owned(candidate)) { close(candidate); continue; }
+            locked = hack_slot_lock(candidate, &busy);
+            if (locked < 0) {
+                close(candidate);
+                if (!busy) error = 5;
+                continue;
+            }
+            if (!created && !hack_slot_owned(candidate)) {
+                close(locked); close(candidate); continue;
+            }
+            if (created && (error = hack_slot_seed(candidate))) {
+                close(locked); close(candidate); break;
+            }
+            owned = candidate;
+        }
+        if (owned < 0) { close(root); return error ? error : 5; }
+        if (fstat(owned, &actual)) {
+            close(locked); if (owned != root) close(owned); close(root); return 5;
+        }
+        playground = calloc(1, sizeof *playground);
+        if (!playground) {
+            close(locked); if (owned != root) close(owned); close(root); return 8;
+        }
+        playground->source_dev = original.st_dev; playground->source_ino = original.st_ino;
+        playground->dev = actual.st_dev; playground->ino = actual.st_ino;
+        playground->fd = locked;
+        playground->directory = owned;
+        playground->source = root;
+        strcpy(playground->slot, slot);
+        playground->next = hack_playgrounds;
+        hack_playgrounds = playground;
+    }
+    if (owned < 0) close(root); /* Reusing a retained slot's descriptors. */
+    int length = snprintf(chosen, sizeof chosen, "%s%s%s", source, *slot ? "/" : "", slot);
+    if (length < 0 || (size_t)length >= sizeof chosen || stat(chosen, &actual) ||
+        actual.st_dev != playground->dev || actual.st_ino != playground->ino ||
+        !hack_slot_lock_current(playground->directory, playground->fd)) return 5;
+    if (*playground->slot && (error = hack_slot_refresh(playground->directory, playground->source))) return error;
+    if (*slot) {
+        length = snprintf(host, sizeof host, "%s/HACK.EXE", chosen);
+        if (length < 0 || (size_t)length >= sizeof host) return 3;
+        const Image *copied = NULL;
+        error = known_image(host, &copied);
+        if (error || copied != &image_hack) return error ? error : 11;
+    }
+    /* Ask the filesystem for drive-qualified aliases, without roundtripping
+     * long/Unicode host names through DOS's 128-byte scratch input. */
+    error = dos_fs_host_short_path(host, result, 128);
+    if (!error) error = dos_fs_pin_path(result, host, lease);
+    if (!error) {
+        char parent[128];
+        strcpy(parent, result);
+        char *end = strrchr(parent, '\\');
+        if (!end) error = 3;
+        else if (end > parent + 2) {
+            *end = 0;
+            error = dos_fs_guard_directory(parent, chosen, directory);
+        }
+    }
+    /* The guard, executable lease and regular-file lock must still name
+     * the selected directory and lock inode after setup. */
+    if (!error && (stat(chosen, &actual) || actual.st_dev != playground->dev ||
+                   actual.st_ino != playground->ino ||
+                   !hack_slot_lock_current(playground->directory, playground->fd))) error = 5;
+    if (error) {
+        dos_fs_release_path(*directory);
+        dos_fs_release_path(*lease);
+        *directory = *lease = NULL;
+    }
+    if (error) return error;
+    *selected = playground;
+    rt_log("native Hack playground: %s", chosen);
+    return 0;
+}
+#endif
+
 static int start_child(const Image *img, const char *dos_prog, const uint8_t *tail, uint16_t envseg) {
     if (nprocs == (int)(sizeof procs / sizeof procs[0])) return 8;
     char short_program[128];
     uint8_t short_tail[128] = {0};
     DosPathLease *executable = NULL, *directory = NULL;
+#ifndef __EMSCRIPTEN__
+    HackPlayground *playground = NULL;
+    if (!door_mode && img == &image_hack) {
+        int err = prepare_hack_playground(dos_prog, short_program, &playground, &executable, &directory);
+        if (err) return err;
+        dos_prog = short_program;
+    }
+#endif
     if (is_vz_image(img)) {
         /* VZ derives its DEF name from this environment path with the same
          * 8.3 parser it uses for documents. Host config directories can
@@ -1485,7 +1838,10 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     rt_log("load %s: translation %s", dos_prog, img->name);
     Proc *p = &procs[nprocs];
     p->temp_dir[0] = 0;
-    p->vc_startup[0] = 0;
+    p->program_startup[0] = 0;
+#ifndef __EMSCRIPTEN__
+    p->hack_playground = playground;
+#endif
     const Image *parent_image = nprocs ? procs[nprocs - 1].image : &image_vc_com;
     p->machine = rt_save_process_state(parent_image);
     if (!p->machine) {
@@ -1580,18 +1936,32 @@ static int adopt_dos2_child(uint16_t child) {
         else loadseg = high;
     }
     if (nprocs == (int)(sizeof procs / sizeof procs[0])) err = 8;
-    char vc_program[128] = {0};
+    char startup_program[128] = {0};
     if (!err && (is_vc405_image(img) || img == &image_vc_com)) {
         Cpu caller = dos2_saved_frame(cur_psp);
         char program[260];
         get_str(caller.ds, caller.d.x, program, sizeof program);
-        err = short_dos_path(program, vc_program);
-        if (!err && is_vc405_image(img) && strlen(vc_program) >= 68) err = 3;
+        err = short_dos_path(program, startup_program);
+        if (!err && is_vc405_image(img) && strlen(startup_program) >= 68) err = 3;
     }
+#ifndef __EMSCRIPTEN__
+    HackPlayground *playground = NULL;
+    DosPathLease *hack_executable = NULL, *hack_directory = NULL;
+    if (!err && !door_mode && img == &image_hack) {
+        Cpu caller = dos2_saved_frame(cur_psp);
+        char program[260];
+        get_str(caller.ds, caller.d.x, program, sizeof program);
+        err = prepare_hack_playground(program, startup_program, &playground, &hack_executable, &hack_directory);
+    }
+#endif
     RtProcessState *machine = NULL;
     const Image *parent_image = nprocs ? procs[nprocs - 1].image : loader;
     if (!err && !(machine = rt_save_process_state(parent_image))) err = 8;
     if (err) {
+#ifndef __EMSCRIPTEN__
+        dos_fs_release_path(hack_executable);
+        dos_fs_release_path(hack_directory);
+#endif
         /* AH=55h has no error convention. Restore the original EXEC caller's
          * saved frame, returning the ordinary DOS error there instead of
          * letting an unapproved loader target run (or killing its shell). */
@@ -1611,7 +1981,12 @@ static int adopt_dos2_child(uint16_t child) {
     Proc *p = &procs[nprocs++];
     memset(p, 0, sizeof *p);
     p->child = child; p->image = img; p->machine = machine;
-    memcpy(p->vc_startup, vc_program, sizeof vc_program);
+    memcpy(p->program_startup, startup_program, sizeof startup_program);
+#ifndef __EMSCRIPTEN__
+    p->hack_playground = playground;
+    dos_fs_bind_path(hack_executable, child);
+    dos_fs_bind_path(hack_directory, child);
+#endif
     p->parent = dos2_saved_frame(cur_psp);
     p->break_vector = lin(vec_seg(0x1B), vec_off(0x1B));
     get_dta(&p->dta_seg, &p->dta_off);
@@ -1795,35 +2170,36 @@ static void abort_child(Proc *p, uint8_t code, uint8_t how) {
  * executable trailer VC needs, and writes PSP:2Ch after AH55. Wait until
  * the first DOS call from the actual child, then replace only its copy.
  * Normal native EXEC already prepared this environment in start_child. */
-static int finish_vc_environment(void) {
+static int finish_program_environment(void) {
     Proc *p = nprocs ? &procs[nprocs - 1] : NULL;
-    if (!p || !p->vc_startup[0] || cur_psp != p->child) return 0;
+    if (!p || !p->program_startup[0] || cur_psp != p->child) return 0;
     uint16_t ip = rd16(cpu.ss, cpu.sp), cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
     if (rt_image_return("COMMAND.COM", cs, ip)) return 0;
     static char envbuf[32768];
     uint16_t old_env = rd16(cur_psp, 0x2C);
     size_t length = env_strings(old_env, envbuf, sizeof envbuf);
-    int err = vc_environment(p->image, envbuf, &length, sizeof envbuf);
+    int err = is_vc405_image(p->image) || p->image == &image_vc_com ?
+        vc_environment(p->image, envbuf, &length, sizeof envbuf) : 0;
     uint16_t env = 0;
-    if (!err) env = make_env(envbuf, length, p->vc_startup, cur_psp);
+    if (!err) env = make_env(envbuf, length, p->program_startup, cur_psp);
     if (!err && !env) {
         /* A COM owns all remaining DOS memory. Return enough of its high
          * allocation for the new environment while retaining its full
          * 64 KiB segment/stack, and keep the public PSP bound accurate. */
         uint16_t size = mcb_size((uint16_t)(cur_psp - 1)), largest;
-        size_t paras = ((length ? length : 1) + 4 + strlen(p->vc_startup) + 15) / 16;
+        size_t paras = ((length ? length : 1) + 4 + strlen(p->program_startup) + 15) / 16;
         if (size > 0x1000u + paras + 1 &&
             !mem_resize(cur_psp, (uint16_t)(size - paras - 1), &largest)) {
             wr16(cur_psp, 2, (uint16_t)(cur_psp + mcb_size((uint16_t)(cur_psp - 1))));
-            env = make_env(envbuf, length, p->vc_startup, cur_psp);
+            env = make_env(envbuf, length, p->program_startup, cur_psp);
         }
         if (!env) err = 8;
     }
-    p->vc_startup[0] = 0;
+    p->program_startup[0] = 0;
     if (err) {
         char message[96];
         int n = snprintf(message, sizeof message,
-                         "\r\nCannot prepare VC environment (DOS error %d).\r\n", err);
+                         "\r\nCannot prepare program environment (DOS error %d).\r\n", err);
         con_write((const uint8_t *)message, (size_t)n);
         term_render();
         abort_child(p, (uint8_t)err, 0);
@@ -1895,6 +2271,10 @@ static void init_dos_data(void) {
 }
 
 void dos_core_init(void) {
+#ifndef __EMSCRIPTEN__
+    close_hack_playgrounds();
+    native_hack_program[0] = 0;
+#endif
     memset(builtin_dos, 0, sizeof builtin_dos);
     memset(builtin_short, 0, sizeof builtin_short);
     memset(builtin_host, 0, sizeof builtin_host);
@@ -1925,7 +2305,7 @@ int dos_run_psp(void) {
 /* ---- INT 21h -------------------------------------------------------------- */
 
 int dos_core_int21(void) {
-    if (finish_vc_environment()) return 1;
+    if (finish_program_environment()) return 1;
     uint16_t seg, largest, maxp;
     int err;
     switch (cpu.a.h) {
@@ -2144,14 +2524,17 @@ static int start_first(const Image *image, const char *dos_prog,
     if (vc405_length < 0 || (size_t)vc405_length >= sizeof vc405_directory) return 3;
 #endif
 #ifdef __EMSCRIPTEN__
-    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\DOS;H:\\GAMES;%s;C:\\", program_dir) + 1;
+    n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\DOS;H:\\GAMES;H:\\GAMES\\HACK;%s;C:\\", program_dir) + 1;
 #else
     native_dos2_directory[0] = 0;
+    native_hack_program[0] = 0;
     if (door_mode)
-        n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\GAMES;H:\\.VC") + 1;
+        n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\GAMES;H:\\GAMES\\HACK;H:\\.VC") + 1;
     else {
         int size = snprintf(native_dos2_directory, sizeof native_dos2_directory, "%sDOS2", program_dir);
         if (size < 0 || (size_t)size >= sizeof native_dos2_directory) return 3;
+        size = snprintf(native_hack_program, sizeof native_hack_program, "%sHACK\\HACK.EXE", program_dir);
+        if (size < 0 || (size_t)size >= sizeof native_hack_program) return 3;
         n += (size_t)snprintf(env + n, sizeof env - n, "PATH=%s;C:\\", program_dir) + 1;
     }
 #endif
@@ -2189,7 +2572,7 @@ int dos_door_start(const char *program) {
     char dos_prog[256] = "H:\\.VC\\VC.COM", host[4096];
     static const uint8_t vc_tail[] = " /std /notsr";
     if (program) {
-        int found = find_program_path(program, "H:\\;H:\\GAMES", dos_prog, sizeof dos_prog,
+        int found = find_program_path(program, "H:\\;H:\\GAMES;H:\\GAMES\\HACK", dos_prog, sizeof dos_prog,
                                       host, sizeof host);
         if (found <= 0) return found < 0 ? -found : 2;
         int err = known_image(host, &image);

@@ -1,4 +1,4 @@
-# Volkov Commander and Rogue doors on axis
+# Volkov Commander, Rogue and Hack doors on axis
 
 These are files for the sysop to apply, not an automated deployment. No BBS,
 network service, live menu, or container was changed while preparing them.
@@ -114,23 +114,23 @@ memory use. Exceeding that memory limit can cause an OOM kill. Adjust caller
 concurrency against this shared budget after observing real usage.
 
 The same manifest mounts `/run/vc-doors` as an `emptyDir` with `medium: Memory`
-and `sizeLimit: 128Mi`. It keeps anonymous caller files off persistent host
+and `sizeLimit: 192Mi`. It keeps anonymous caller files off persistent host
 disks and bounds aggregate scratch storage across nodes, including sessions
 whose cleanup was interrupted. The sizing:
 
 - One session holds at most 8 MiB of tmpfs pages. Every file, seeded or
   created, open or deleted-but-open, is charged in whole 4 KiB pages.
   Directories and inodes take no tmpfs pages.
-- The two doors allow `nodeMax: 4` each, so at most 8 sessions run at once:
-  8 × 8 MiB = 64 MiB.
-- 128 MiB therefore holds every live session plus 64 MiB, room for 8 more
+- The three doors allow `nodeMax: 4` each, so at most 12 sessions run at once:
+  12 × 8 MiB = 96 MiB.
+- 192 MiB therefore holds every live session plus 96 MiB, room for 12 more
   sessions whose cleanup was interrupted, before writes fail.
 - This assumes tmpfs without huge pages, the kernel default. If the node
   enables shmem huge pages, one file could take 2 MiB.
-- If you raise `nodeMax`, keep the total of both doors' `nodeMax` × 8 MiB
+- If you raise `nodeMax`, keep the total of all doors' `nodeMax` × 8 MiB
   at or below half the `sizeLimit`. `tests/test_door_packaging.py` checks it.
 
-Tmpfs pages count toward the container memory budget; its 128 MiB maximum is
+Tmpfs pages count toward the container memory budget; its 192 MiB maximum is
 not extra memory beyond the 1 GiB limit. Each session's up to 4096 inodes
 also cost kernel memory (roughly 1 KiB each) inside that limit. Data
 survives a container restart within the same pod but is discarded with pod
@@ -147,16 +147,24 @@ are supported as well as the default 60 minutes.
 ## Menus
 
 Back up the board's existing `notanemulator_bbs-doors.hjson` on its config
-volume. Merge the two entries from the adjacent file into its existing menu
-map. Add visible choices named **Volkov Commander** and **Rogue** pointing to
-`doorVolkovCommander` and `doorRogue`, using that menu's existing selection
+volume. Merge the three entries from the adjacent file into its existing menu
+map. Add visible choices named **Volkov Commander**, **Rogue** and **HACK** pointing to
+`doorVolkovCommander`, `doorRogue` and `doorHack`, using that menu's existing selection
 pattern. Do not replace the entire menu file. Each door allows four concurrent
 nodes (`nodeMax: 4`); adjust this to the container's CPU/memory budget.
 
-Both entries use `abracadabra` and `io: stdio`. The wrapper expects the drop-file
-path, node number, and `vc` or `rogue`; it never opens the drop file. Rogue uses
+All entries use `abracadabra` and `io: stdio`. The wrapper expects the drop-file
+path, node number, and `vc`, `rogue` or `hack`; it never opens the drop file. Rogue uses
 `vc --door --door-run ROGUE.EXE` and returns to the BBS when Rogue ends. VC uses
 `vc --door` and returns to the BBS when the caller quits VC.
+
+Hack uses `vc --door --door-run HACK.EXE`. Answer the original experience/role
+prompts, then use `h j k l` to move and `Q`, then `y`, to return to the BBS.
+The same real executable and its `data`, `help`, `hh`, `rumors`, `record` and
+`perm` files are available at `H:\GAMES\HACK` in all three doors; type `hack`
+from VC's command line to start it there. `S` saves as `HACK.SAV` beside the
+executable; another `hack` during the same VC visit restores it. Saves, bones
+and scores remain inside that private session and disappear when it ends.
 
 No local abracadabra source/manual or existing live menu was found in this
 repository, nearby source/tool caches, `/opt`, `/usr/share/doc`, or `/tmp`.
@@ -183,6 +191,6 @@ doorAbracadabraExample: {
 ```
 
 Reload menus using the board's existing procedure, or arrange a restart when
-no callers are connected. On a test call, check both choices, F-keys/arrows,
-Rogue quit, and carrier drop; confirm that the matching node's session
+no callers are connected. On a test call, check all three choices, F-keys/arrows,
+Rogue and Hack quit, and carrier drop; confirm that the matching node's session
 directory vanishes. Leave the existing WebSocket/Tailscale Funnel unchanged.

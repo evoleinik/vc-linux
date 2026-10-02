@@ -123,12 +123,13 @@ class Runner:
             raise RuntimeError(f"expected exit {want} and {diagnostic!r}")
 
     def compile(self, directory: Path, changed: str, copied: Path) -> Path:
-        sources = ["tests/web_files_fixture.c", "runtime/web_files.c", "runtime/web_programs.c", "runtime/embed_lzma.c"]
+        sources = ["tests/web_files_fixture.c", "runtime/web_files.c", "runtime/web_programs.c",
+                   "runtime/web_sha256.c", "runtime/embed_lzma.c"]
         output = directory / "files-test.mjs"
         self.run([self.emcc, "-O2", "-flto", "-sASYNCIFY", "-sASYNCIFY_IGNORE_INDIRECT=1",
                   "-sMODULARIZE", "-sEXPORT_ES6", "-sENVIRONMENT=node",
                   '-sEXPORTED_RUNTIME_METHODS=["FS","ccall"]',
-                  '-sEXPORTED_FUNCTIONS=["_fixture_init","_fixture_install","_fixture_open","_fixture_reference"]',
+                  '-sEXPORTED_FUNCTIONS=["_fixture_init","_fixture_install","_fixture_open","_fixture_reference","_malloc","_free"]',
                   "--no-entry", "-Iruntime", f"-I{self.work}",
                   *(str(copied) if name == changed else name for name in sources), "-o", str(output)], want=0)
         return output

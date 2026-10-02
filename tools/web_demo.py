@@ -1,6 +1,6 @@
 """Assemble the shared, offline H: drive for the browser and native BBS doors.
 
-Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE KERMIT_EXE [MSDOS_DIR [VC405_DIR]]
+Usage: .venv/bin/python tools/web_demo.py DESTINATION GWBASIC.EXE GAMES_DIR BOOTLOGO_IMAGE ROGUE_EXE VZ_IMAGE KERMIT_EXE [MSDOS_DIR [VC405_DIR [HACK_DIR]]]
 The original VC sources stay in asm/ and asm405/; this only copies build inputs.
 """
 from pathlib import Path
@@ -15,10 +15,11 @@ from vz_defaults import installed_definition
 ROOT = Path(__file__).resolve().parent.parent
 # Keep the pre-Kermit programs within their original 600 KB raw-drive budget.
 # Later programs add real DOS executables; the whole drive has a finite cap.
-# First-load HTTP gzip remains independently limited to 1.3 MB by web_size.
+# First-load HTTP gzip remains independently gated against main by web_size.
 LEGACY_LIMIT = 600_000
-LIMIT = 1_000_000
+LIMIT = 1_500_000
 MSDOS_PROGRAMS = ("COMMAND.COM", "EDLIN.COM", "DEBUG.COM", "FIND.EXE", "MORE.COM", "SORT.EXE", "FC.EXE")
+HACK_FILES = ("HACK.EXE", "data", "help", "hh", "rumors", "record", "perm", "OWLIC.TXT")
 
 
 def history_text(readme: str) -> bytes:
@@ -40,7 +41,7 @@ def history_text(readme: str) -> bytes:
 
 def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
                vz: Path, kermit: Path, msdos: Path | None = None,
-               vc405: Path | None = None) -> dict[str, bytes]:
+               vc405: Path | None = None, hack: Path | None = None) -> dict[str, bytes]:
     """The sole content list/generator for both demo environments.
 
     Keep pathnames as UTF-8 host names and DOS text in its original encoding.
@@ -52,6 +53,8 @@ def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
         msdos = kermit.parent.parent / "msdos2"
     if vc405 is None:
         vc405 = kermit.parent.parent / "vc405"
+    if hack is None:
+        hack = kermit.parent.parent / "hack"
     files = {
         "README.TXT": (ROOT / "web/README.TXT").read_text(encoding="ascii").encode("ascii"),
         # Keep a readable UTF-8 source in git; only Russian has a complete
@@ -80,7 +83,11 @@ def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
         "VC405/VC.COM": (vc405 / "VC.COM").read_bytes(),
         "VC405/VCSETUP.COM": (vc405 / "VCSETUP.COM").read_bytes(),
         "VC405/LICENSE.TXT": (ROOT / "asm405/LICENSE.TXT").read_bytes(),
+        "GAMES/HACK/HACKLIC.TXT": (ROOT / "third_party/hack/COPYRIGHT").read_bytes(),
+        "GAMES/HACK/FENLIC.TXT": (ROOT / "third_party/hack/COPYRIGHT-JF").read_bytes(),
     }
+    for name in HACK_FILES:
+        files[f"GAMES/HACK/{name}"] = (hack / name).read_bytes()
     for name in MSDOS_PROGRAMS:
         files[name if name == "COMMAND.COM" else f"DOS/{name}"] = (msdos / name).read_bytes()
     for name in ("VZFLE.DEF", "HELPE.DEF", "BLOCK.DEF", "PALET.DEF", "BW.DEF"):
@@ -93,7 +100,7 @@ def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
     total = sum(map(len, files.values()))
     later_files = {"KERMIT.EXE", "BBS.TAK", "KERMIT.TXT", "KERMLIC.TXT", "COMMAND.COM"}
     legacy = sum(len(data) for name, data in files.items()
-                 if name not in later_files and not name.startswith(("DOS/", "VC405/")))
+                 if name not in later_files and not name.startswith(("DOS/", "VC405/", "GAMES/HACK/")))
     if legacy >= LEGACY_LIMIT:
         raise SystemExit(f"Pre-Kermit demo is {legacy:,} bytes; it must stay below {LEGACY_LIMIT:,}")
     if total >= LIMIT:
@@ -102,7 +109,7 @@ def demo_files(gwbasic: Path, games: Path, bootlogo: Path, rogue: Path,
 
 
 def main() -> None:
-    if len(sys.argv) not in (8, 9, 10):
+    if len(sys.argv) not in (8, 9, 10, 11):
         raise SystemExit(__doc__)
     destination = Path(sys.argv[1])
     files = demo_files(*(Path(arg) for arg in sys.argv[2:]))

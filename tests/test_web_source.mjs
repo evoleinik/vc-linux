@@ -86,6 +86,42 @@ for (const offset of [19, 28, 29, functions.at(-1)[1]])
 assert.equal(sourceLocation({ ...cMap, functions }, 20).function, 'fn0_');
 assert.equal(sourceLocation({ ...cMap, functions }, 36).function, 'fn1_');
 assert.equal(sourceLocation({ ...cMap, functions: [] }, 20), null);
+
+// VC.OVL's declared stack ends at 0900h. The live smoke regression had
+// genuine callers below that bound, then old VC/Hack-looking words above
+// it. Retained image bytes are valid copied-code evidence, not permission
+// to scan beyond the active image's original stack allocation.
+const stackMap = { ...fixture, image: 'STACK.EXE', stack: { segment: 0x300, top: 0x900 } };
+const oldHack = { image: 'HACK.EXE', kind: 'functions', functions: [[0x1f000, 0x20000, 'buzz_']],
+  calls: [[0x1f2c2, 0x1f2bd, 'far']] };
+const stackAddress = offset => ({ image: stackMap.image, offset });
+const boundedStack = { raw: { cs: 0x2000, ip: 160, ss: 0x2300, sp: 0x8c2 },
+  current: { image: stackMap.image, cs: 0x2000, ip: 160, offset: 160 }, stack: [
+    { sp: 0x8ca, word: 103, far: stackAddress(103), near: null },
+    { sp: 0x8cc, word: 0x2000, far: null, near: null },
+    { sp: 0x8f6, word: 153, far: null, near: stackAddress(153) },
+    { sp: 0x976, word: 153, far: null, near: stackAddress(153) },
+    { sp: 0xa64, word: 0xf302, far: { image: oldHack.image, offset: 0x1f2c2 }, near: null },
+    { sp: 0xa66, word: 0x14b6, far: null, near: null },
+  ] };
+const stackMaps = name => name === stackMap.image ? stackMap : name === oldHack.image ? oldHack : null;
+lifecycleCheck('declared MZ stack excludes stale VC/Hack caller words beyond its top', () => {
+  assert.deepEqual(walkCallers(boundedStack, stackMaps, () => null)
+    .map(row => [row.image, row.offset ?? row.address]),
+  [[stackMap.image, 100], [stackMap.image, 150]]);
+});
+lifecycleCheck('a far return cannot read its CS beyond the declared stack top', () => {
+  const straddling = { ...boundedStack, stack: [
+    { sp: 0x8fe, word: 103, far: stackAddress(103), near: null },
+    { sp: 0x900, word: 0x2000, far: null, near: null },
+  ] };
+  assert.deepEqual(walkCallers(straddling, stackMaps, () => null), []);
+});
+lifecycleCheck('an alternate stack segment is not bounded by the initial MZ stack', () => {
+  const alternate = { ...boundedStack, raw: { ...boundedStack.raw, ss: 0x2400 },
+    stack: [{ sp: 0xa00, word: 153, far: null, near: stackAddress(153) }] };
+  assert.deepEqual(walkCallers(alternate, stackMaps, () => null).map(row => row.offset), [150]);
+});
 const included = { file: 'VCSUBS.INC', line: 2806, via: [{ name: 'VCOVL.ASM', line: 3482 }], text: 'RET' };
 lifecycleCheck('source labels show only the actual file and line', () =>
   assert.equal(formatSourceLine(included), 'VCSUBS.INC:2806  RET'));

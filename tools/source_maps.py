@@ -305,9 +305,16 @@ def call_rows(layout) -> list[list]:
     return calls
 
 
+def stack_metadata(image) -> dict:
+    """The initial MZ stack is bounded only while its load-relative SS is live."""
+    if not image.is_exe:
+        return {}
+    return {"stack": {"segment": image.hdr_ss, "top": image.hdr_sp or 0x10000}}
+
+
 def assembly_map(name: str, layout, origin_at, destination: Path) -> dict:
     result = {"version": 1, "image": name, "kind": "asm", "files": [],
-              "lines": [], "calls": call_rows(layout)}
+              "lines": [], "calls": call_rows(layout), **stack_metadata(layout.image)}
     file_ids = {}
     source_data = {}
     seen = set()
@@ -408,10 +415,12 @@ def bootlogo(build: Path, destination: Path) -> dict:
     return assembly_map("LOGO.COM", layout, lambda record: origins.get(record.line.lineno), destination)
 
 
-def rogue(build: Path) -> dict:
-    path = build / "rogue/ROGUE.MAP"
+def compiled_map(build: Path, program: str) -> dict:
+    """Publish real Watcom CODE symbols, not inferred C source lines."""
+    image_name = program.upper() + ".EXE"
+    path = build / program / (program.upper() + ".MAP")
     link = parse_compiled_map(path)
-    layout = build_compiled_layout(load_image(build / "rogue/ROGUE.EXE"), path)
+    layout = build_compiled_layout(load_image(build / program / image_name), path)
     starts = {record.off for record in layout.instructions}
     functions = []
     for piece in link.segments.values():
@@ -428,8 +437,8 @@ def rogue(build: Path) -> dict:
         for index, address in enumerate(addresses):
             end = addresses[index + 1] if index + 1 < len(addresses) else piece.address + piece.size
             functions.append([address, end, grouped[address]])
-    return {"version": 1, "image": "ROGUE.EXE", "kind": "functions",
-            "functions": sorted(functions), "calls": call_rows(layout)}
+    return {"version": 1, "image": image_name, "kind": "functions",
+            "functions": sorted(functions), "calls": call_rows(layout), **stack_metadata(layout.image)}
 
 
 GENERATED_ASSET = re.compile(r"(?:source-index|source-map-[a-z0-9-]+|source-[a-z0-9_-]+)\.([0-9a-f]{12})\.(?:json|txt)")
@@ -482,7 +491,8 @@ def publish(build: Path, destination: Path, work: Path) -> str:
                 ("VC.OVL", lambda: single_vc(build, destination, "VC.OVL")),
                 ("GWBASIC.EXE", lambda: linked_assembly(build, destination, "basic")),
                 ("LOGO.COM", lambda: bootlogo(build, destination)),
-                ("ROGUE.EXE", lambda: rogue(build)),
+                ("ROGUE.EXE", lambda: compiled_map(build, "rogue")),
+                ("HACK.EXE", lambda: compiled_map(build, "hack")),
                 ("VZ.COM", lambda: linked_assembly(build, destination, "vz")),
                 ("VC405.COM", lambda: single_vc405(build, destination, "VC.COM")),
                 ("VCSETUP.COM", lambda: single_vc405(build, destination, "VCSETUP.COM")))

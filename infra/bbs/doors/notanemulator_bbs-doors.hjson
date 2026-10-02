@@ -27,3 +27,17 @@ doorRogue: {
         io: stdio
     }
 }
+
+doorHack: {
+    desc: HACK
+    module: abracadabra
+    config: {
+        name: HACK
+        dropFileType: DOOR
+        cmd: /enigma-bbs/mods/vc-door/run-door.sh
+        args: [ "{dropFilePath}", "{node}", "hack" ]
+        nodeMax: 4
+        tooManyArt: DOORMANY
+        io: stdio
+    }
+}

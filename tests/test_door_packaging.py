@@ -59,7 +59,12 @@ def test_native_embedded_drive_is_the_exact_browser_demo(tmp_path):
     assert native == expected
     assert "ПРОЧТИ.TXT" in native
     assert "GAMES/ROGUE.EXE" in native
-    assert sum(map(len, native.values())) < 1_000_000
+    assert native["VC405/VC.COM"] == (ROOT / "build/vc405/VC.COM").read_bytes()
+    assert native["VC405/VCSETUP.COM"] == (ROOT / "build/vc405/VCSETUP.COM").read_bytes()
+    assert native["GAMES/HACK/HACK.EXE"] == (ROOT / "build/hack/HACK.EXE").read_bytes()
+    for name in ("data", "help", "hh", "rumors", "record", "perm"):
+        assert native[f"GAMES/HACK/{name}"] == (ROOT / "build/hack" / name).read_bytes()
+    assert sum(map(len, native.values())) < 1_500_000
     assert source.read_bytes() == (ROOT / "build/gen/door_demo.c").read_bytes()
 
 
@@ -196,6 +201,7 @@ def wrapper_harness(tmp_path):
 @pytest.mark.parametrize("program,expected", [
     ("vc", ["--door"]),
     ("rogue", ["--door", "--door-run", "ROGUE.EXE"]),
+    ("hack", ["--door", "--door-run", "HACK.EXE"]),
 ])
 def test_wrapper_drops_privileges_and_passes_only_the_checked_node(wrapper_harness,
                                                                  program, expected):
@@ -331,7 +337,7 @@ def test_enigma_pod_bounds_ephemeral_door_storage_and_compute_resources():
     assert re.search(r"(?m)^        - name: door-sessions\n"
                      r"          emptyDir:\n"
                      r"            medium: Memory\n"
-                     r"            sizeLimit: 128Mi$", deployment)
+                     r"            sizeLimit: 192Mi$", deployment)
     assert re.search(r"(?m)^          resources:\n"
                      r"            requests: \{cpu: 250m, memory: 256Mi\}\n"
                      r"            limits: \{cpu: 2, memory: 1Gi\}$", deployment)
@@ -346,14 +352,14 @@ def test_enigma_pod_reaps_orphaned_door_janitors():
 
 
 def test_door_tmpfs_holds_every_live_session_twice_over():
-    """Both doors' nodeMax x the per-session page quota fits half the emptyDir."""
+    """All doors' nodeMax x the per-session page quota fits half the emptyDir."""
     menus = (DOORS / "notanemulator_bbs-doors.hjson").read_text()
     sessions = sum(int(n) for n in re.findall(r"(?m)^\s*nodeMax:\s*(\d+)\s*$", menus))
     quota = re.search(r"#define DOOR_QUOTA \(UINT64_C\((\d+)\) \* 1024 \* 1024\)",
                       (ROOT / "runtime/door.c").read_text())
     manifest = (ROOT / "infra/bbs/enigma.yaml").read_text()
     size_limit = re.search(r"(?m)^            sizeLimit: (\d+)Mi$", manifest)
-    assert sessions == 8 and quota and size_limit
+    assert sessions == 12 and quota and size_limit
     assert 2 * sessions * int(quota.group(1)) <= int(size_limit.group(1))
 
 
@@ -361,9 +367,10 @@ def test_enigma_entries_follow_the_available_stdio_example():
     menus = (DOORS / "notanemulator_bbs-doors.hjson").read_text()
     for fragment in ("module: abracadabra", "io: stdio", "dropFileType: DOOR",
                      "cmd: /enigma-bbs/mods/vc-door/run-door.sh"):
-        assert menus.count(fragment) == 2
+        assert menus.count(fragment) == 3
     assert 'args: [ "{dropFilePath}", "{node}", "vc" ]' in menus
     assert 'args: [ "{dropFilePath}", "{node}", "rogue" ]' in menus
+    assert 'args: [ "{dropFilePath}", "{node}", "hack" ]' in menus
 
 
 def test_arm_build_is_static_isolated_and_released_with_the_pinned_zig():

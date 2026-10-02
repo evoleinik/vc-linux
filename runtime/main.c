@@ -205,7 +205,7 @@ static void install_files(const char *dir) {
         exit(1);
     }
 #ifndef __EMSCRIPTEN__
-    char dos_directory[4096];
+    char dos_directory[4096], hack_directory[4096];
     int dos_length = snprintf(dos_directory, sizeof dos_directory, "%s/DOS2", dir);
     if (dos_length < 0 || (size_t)dos_length >= sizeof dos_directory) {
         fputs("vc: DOS2 program path is too long\n", stderr);
@@ -213,6 +213,15 @@ static void install_files(const char *dir) {
     }
     if (mkdirs(dos_directory)) {
         fprintf(stderr, "vc: cannot create %s: %s\n", dos_directory, strerror(errno));
+        exit(1);
+    }
+    int hack_length = snprintf(hack_directory, sizeof hack_directory, "%s/HACK", dir);
+    if (hack_length < 0 || (size_t)hack_length >= sizeof hack_directory) {
+        fputs("vc: Hack program path is too long\n", stderr);
+        exit(1);
+    }
+    if (mkdirs(hack_directory)) {
+        fprintf(stderr, "vc: cannot create %s: %s\n", hack_directory, strerror(errno));
         exit(1);
     }
 #endif
@@ -269,7 +278,8 @@ static void install_files(const char *dir) {
 #endif
         int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL") ||
                       !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
-                      !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "VZ.COM") ||
+                      !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "HACK/HACK.EXE") ||
+                      !strcmp(f->name, "VZ.COM") ||
                       !strcmp(f->name, "KERMIT.EXE") || msdos_program(f->name) ||
                       !strcmp(f->name, "VC405.COM") || !strcmp(f->name, "VC405/VCSETUP.COM");
         struct stat existing;
@@ -310,11 +320,12 @@ int main(int argc, char **argv) {
     char dos_directory[] = "/home/vc/DOS";
     char source_directory[] = "/home/vc/SRC";
     char games_directory[] = "/home/vc/GAMES";
+    char hack_directory[] = "/home/vc/GAMES/HACK";
     if (setenv("HOME", "/home/vc", 1) ||
         setenv("XDG_CONFIG_HOME", "/var/vc/config", 1) ||
         setenv("XDG_CACHE_HOME", cache, 1) ||
         mkdirs(cache) || mkdirs(dos_directory) || mkdirs(source_directory) ||
-        mkdirs(games_directory) || chdir("/home/vc")) {
+        mkdirs(games_directory) || mkdirs(hack_directory) || chdir("/home/vc")) {
         fprintf(stderr, "vc: cannot prepare browser home: %s\n", strerror(errno));
         return 1;
     }

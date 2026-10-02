@@ -36,6 +36,7 @@ extern const Image image_vc_ovl;
 extern const Image image_gwbasic;
 extern const Image image_bootlogo;
 extern const Image image_rogue;
+extern const Image image_hack;
 extern const Image image_vz;
 extern const Image image_kermit;
 extern const Image image_command;

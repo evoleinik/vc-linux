@@ -11,10 +11,13 @@ import sys
 import tempfile
 
 
-PROGRAMS = ("gwbasic", "bootlogo", "rogue", "vz", "kermit",
+PROGRAMS = ("gwbasic", "bootlogo", "rogue", "hack", "vz", "kermit",
             "command", "edlin", "debug", "find", "more", "sort", "fc",
             "vc405", "vcsetup405")
 GENERATED_NAME = re.compile(r"(?:" + "|".join(PROGRAMS) + r")(?:\.[0-9a-f]{12})?\.wasm")
+# Retire old brief-33 bundles on incremental builds too. DOS file assets
+# now all come from embed.py's single per-file, first-open mechanism.
+LEGACY_ASSET_NAME = re.compile(r"(?:hack|source)-files\.[0-9a-f]{12}\.bin")
 
 
 def update(path: Path, data: bytes) -> None:
@@ -58,7 +61,8 @@ def publish(work: Path, destination: Path) -> str:
     # local build. Retire ONLY our recognized generated names, and keep
     # their bytes outside the publish directory for recovery if needed.
     for path in sorted(destination.iterdir()):
-        if path.name in names.values() or not GENERATED_NAME.fullmatch(path.name):
+        if (path.name in names.values() or
+                not (GENERATED_NAME.fullmatch(path.name) or LEGACY_ASSET_NAME.fullmatch(path.name))):
             continue
         if not path.is_file() or path.is_symlink():
             raise ValueError(f"Refusing to retire non-regular generated module: {path}")

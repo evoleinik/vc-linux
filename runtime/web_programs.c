@@ -12,6 +12,7 @@
 
 #include "rt.h"
 #include "web_programs.h"
+#include "web_sha256.h"
 #include "web_program_names.h"
 
 typedef struct {
@@ -25,6 +26,7 @@ static WebImage images[WEB_IMAGE_COUNT] = {
     [WEB_GWBASIC] = {"GWBASIC.EXE", WEB_MODULE_GWBASIC, "image_gwbasic", NULL},
     [WEB_BOOTLOGO] = {"BOOTLOGO.COM", WEB_MODULE_BOOTLOGO, "image_bootlogo", NULL},
     [WEB_ROGUE] = {"ROGUE.EXE", WEB_MODULE_ROGUE, "image_rogue", NULL},
+    [WEB_HACK] = {"GAMES/HACK/HACK.EXE", WEB_MODULE_HACK, "image_hack", NULL},
     [WEB_VZ] = {"VZ.COM", WEB_MODULE_VZ, "image_vz", NULL},
     [WEB_KERMIT] = {"KERMIT.EXE", WEB_MODULE_KERMIT, "image_kermit", NULL},
     [WEB_COMMAND] = {"COMMAND.COM", WEB_MODULE_COMMAND, "image_command", NULL},
@@ -37,6 +39,19 @@ static WebImage images[WEB_IMAGE_COUNT] = {
     [WEB_VC405] = {"VC405.COM", WEB_MODULE_VC405, "image_vc405", NULL},
     [WEB_VCSETUP405] = {"VC405/VCSETUP.COM", WEB_MODULE_VCSETUP405, "image_vcsetup405", NULL},
 };
+
+/* Ordinary HTTP pages may lack WebCrypto. Keep the same full content pin
+ * there, without introducing another lazy-files mechanism or transport. */
+EMSCRIPTEN_KEEPALIVE
+int web_verify_sha256(const uint8_t *bytes, size_t size, const char *expected) {
+    uint8_t digest[32];
+    static const char hex[] = "0123456789abcdef";
+    web_sha256(bytes, size, digest);
+    for (unsigned i = 0; i < 32; i++)
+        if (expected[2 * i] != hex[digest[i] >> 4] ||
+            expected[2 * i + 1] != hex[digest[i] & 15]) return 0;
+    return expected[64] == '\0';
+}
 
 EM_ASYNC_JS(int, fetch_program, (const char *name, const char *path, const char *sha256), {
     const controller = new AbortController();
@@ -69,9 +84,21 @@ EM_ASYNC_JS(int, fetch_program, (const char *name, const char *path, const char 
                 // Snapshot before the asynchronous hash: a transport-owned
                 // buffer must not change between verification and staging.
                 bytes = new Uint8Array(bytes);
-                const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes));
-                const actualHash = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join("");
-                if (actualHash !== expectedHash) throw new Error('file content hash mismatch');
+                if (globalThis.crypto?.subtle) {
+                    const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes));
+                    const actualHash = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join("");
+                    if (actualHash !== expectedHash) throw new Error('file content hash mismatch');
+                } else {
+                    const pointer = _malloc(bytes.length || 1);
+                    if (!pointer) throw new Error('file verification allocation failed');
+                    try {
+                        HEAPU8.set(bytes, pointer);
+                        if (!_web_verify_sha256(pointer, bytes.length, sha256))
+                            throw new Error('file content hash mismatch');
+                    } finally {
+                        _free(pointer);
+                    }
+                }
             }
             return bytes;
         };

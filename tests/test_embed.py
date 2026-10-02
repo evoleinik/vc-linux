@@ -42,14 +42,14 @@ def mz(payload: bytes, tail: bytes = b"", magic: bytes = b"MZ") -> bytes:
     return bytes(header) + payload + tail
 
 
-def generate(tmp_path, pairs, *, check=True, web_only=(), web_lazy=()):
+def generate(tmp_path, pairs, *, check=True, web_only=(), web_lazy=(), native_only=()):
     output = tmp_path / "files.c"
     command = [sys.executable, str(ROOT / "tools/embed.py"), str(output)]
     for index, (name, data) in enumerate(pairs):
         source = tmp_path / f"input-{index}.bin"
         source.write_bytes(data)
         prefix = ("--web-only-lazy=" if name in web_lazy else "--web-only=") if name in web_only else (
-            "--web-lazy=" if name in web_lazy else "")
+            "--web-lazy=" if name in web_lazy else "--native-only=" if name in native_only else "")
         command.append(prefix + f"{name}={source}")
     result = subprocess.run(command, capture_output=True, text=True)
     if check:
@@ -182,6 +182,62 @@ def test_vc_startup_files_cannot_be_lazy(tmp_path, name):
     _, result = generate(tmp_path, [(name, b"startup")], web_lazy=(name,), check=False)
     assert result.returncode != 0
     assert "startup files must remain eager" in result.stderr
+
+
+@pytest.mark.parametrize("web", [False, True], ids=["native", "web"])
+@pytest.mark.parametrize("data", [b"", b"lazy Hack asset\0\xff" * 100], ids=["empty", "data"])
+def test_native_only_assets_stay_out_of_browser_table_binary_and_packed_payload(tmp_path, web, data):
+    pairs = [("VC.COM", b"\xc3"), ("VC.OVL", mz(bytes(range(200)))),
+             ("KEPT.TXT", b"both builds"), ("HACK/HACK.EXE", data),
+             ("AFTER.TXT", b"offset after excluded bytes")]
+    source, _ = generate(tmp_path, pairs, native_only=("HACK/HACK.EXE",))
+    obj, result = compile_fixture(tmp_path, source, pairs, web=web)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"".join(contents for name, contents in pairs
+                                      if not web or name != "HACK/HACK.EXE")
+    packed = re.search(r"static const uint8_t embedded_packed\[\d+\] = \{([\s\S]*?)\n\};",
+                       source.read_text())
+    assert packed
+    compressed = bytes(int(value) for value in re.findall(r"\d+", packed[1]))
+    unpacked = lzma.decompress(compressed, format=lzma.FORMAT_RAW, filters=[LZMA_FILTER])
+    assert unpacked == x86_16_filter(pairs[2][1] + pairs[4][1]), (
+        "native-only assets must not consume any first-load browser bytes")
+    if web:
+        assert b"HACK/HACK.EXE" not in obj.read_bytes()
+
+
+def test_builtin_files_cannot_be_native_only(tmp_path):
+    _, result = generate(tmp_path, [("VC.COM", b"\xc3")], native_only=("VC.COM",), check=False)
+    assert result.returncode != 0
+    assert "built-in files must exist in both builds" in result.stderr
+
+
+@pytest.mark.parametrize("web", [False, True], ids=["native", "web"])
+def test_native_and_lazy_browser_paths_share_bytes_without_duplicate_installation(tmp_path, web):
+    native_name, browser_name = "HACK/HACK.EXE", "GAMES/HACK/HACK.EXE"
+    asset = b"MZoriginal Hack bytes\0\xff" * 100
+    pairs = [("VC.COM", b"\xc3"), ("VC.OVL", mz(bytes(range(200)))),
+             (native_name, asset), (browser_name, asset), ("AFTER.TXT", b"eager offset")]
+    source, _ = generate(tmp_path, pairs, native_only=(native_name,),
+                         web_only=(browser_name,), web_lazy=(browser_name,))
+    obj, result = compile_fixture(tmp_path, source, pairs, web=web)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == pairs[0][1] + pairs[1][1] + (b"" if web else asset) + pairs[4][1]
+    manifest = json.loads(source.with_suffix(".web.json").read_text())
+    assert [entry["name"] for entry in manifest["files"]] == [browser_name]
+    # The H: metadata remains visible before download, but its bytes are not
+    # packed into startup and its native installation path cannot leak there.
+    packed = re.search(r"static const uint8_t embedded_packed\[\d+\] = \{([\s\S]*?)\n\};",
+                       source.read_text())
+    assert packed
+    compressed = bytes(int(value) for value in re.findall(r"\d+", packed[1]))
+    unpacked = lzma.decompress(compressed, format=lzma.FORMAT_RAW, filters=[LZMA_FILTER])
+    assert unpacked == x86_16_filter(pairs[4][1])
+    if web:
+        assert browser_name.encode() + b"\0" in obj.read_bytes()
+        assert asset not in obj.read_bytes()
+    else:
+        assert browser_name.encode() not in obj.read_bytes()
 
 
 @pytest.mark.parametrize("name,data,message", [
@@ -400,7 +456,12 @@ def test_generated_initializer_refuses_corrupt_packed_files(tmp_path, corruption
 @pytest.mark.parametrize("web", [False, True], ids=["native", "web"])
 @pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy-references"])
 def test_every_real_embedded_file_round_trips_byte_for_byte(tmp_path, web, lazy):
-    browser_sources = ("SRC/VC.ASM", "SRC/VCOVL.ASM", *(f"GAMES/{name}" for name in game_files()))
+    hack_names = ("HACK.EXE", "data", "help", "hh", "rumors", "record", "perm",
+                  "HACKLIC.TXT", "FENLIC.TXT", "OWLIC.TXT")
+    native_assets = tuple(f"HACK/{name}" for name in hack_names)
+    browser_assets = tuple(f"GAMES/HACK/{name}" for name in hack_names)
+    browser_sources = ("SRC/VC.ASM", "SRC/VCOVL.ASM", *(f"GAMES/{name}" for name in game_files()),
+                       *browser_assets)
     paths = [
         ("VC.COM", "build/VC.COM"), ("VC.OVL", "build/VC.OVL"),
         ("GWBASIC.EXE", "build/gwbasic/GWBASIC.EXE"),
@@ -409,6 +470,10 @@ def test_every_real_embedded_file_round_trips_byte_for_byte(tmp_path, web, lazy)
         ("ROGUELIC.TXT", "third_party/rogue/LICENSE.TXT"),
         ("PDCLIC.TXT", "third_party/pdcurses/README.md"),
         ("OWLIC.TXT", "build/rogue/OWLIC.TXT"),
+        *((f"HACK/{name}", f"build/hack/{name}") for name in
+          ("HACK.EXE", "data", "help", "hh", "rumors", "record", "perm", "OWLIC.TXT")),
+        ("HACK/HACKLIC.TXT", "third_party/hack/COPYRIGHT"),
+        ("HACK/FENLIC.TXT", "third_party/hack/COPYRIGHT-JF"),
         ("VZ.COM", "build/vz/VZ.COM"), ("VZ.DEF", "build/vz/VZ.DEF"),
         *((name, f"third_party/vzeditor/VZ-IBM/{name}")
           for name in ("VZFLE.DEF", "HELPE.DEF", "BLOCK.DEF", "PALET.DEF", "BW.DEF")),
@@ -418,22 +483,27 @@ def test_every_real_embedded_file_round_trips_byte_for_byte(tmp_path, web, lazy)
         *((name, f"build/msdos2/{name}") for name in
           ("COMMAND.COM", "EDLIN.COM", "DEBUG.COM", "FIND.EXE", "MORE.COM", "SORT.EXE", "FC.EXE")),
         ("DOS.TXT", "data/DOS.TXT"), ("DOSLIC.TXT", "third_party/msdos2/LICENSE"),
+        ("VC405.COM", "build/vc405/VC.COM"), ("VC405/VCSETUP.COM", "build/vc405/VCSETUP.COM"),
         *((name, f"data/{name}") for name in ("VC.INI", "VC.EXT", "VCEDIT.EXT", "VC.HLP")),
         ("SRC/VC.ASM", "asm/VC.ASM"), ("SRC/VCOVL.ASM", "asm/VCOVL.ASM"),
         *((f"GAMES/{name}", f"build/games/{name}") for name in game_files()),
     ]
+    paths += [(f"GAMES/{name}", path) for name, path in paths if name in native_assets]
     pairs = [(name, (ROOT / path).read_bytes()) for name, path in paths]
     lazy_names = tuple(name for name, _ in pairs
-                       if name not in ("VC.COM", "VC.OVL", "VC.INI", "VC.EXT", "VCEDIT.EXT")) if lazy else ()
-    source, _ = generate(tmp_path, pairs, web_only=browser_sources, web_lazy=lazy_names)
+                       if name not in ("VC.COM", "VC.OVL", "VC.INI", "VC.EXT", "VCEDIT.EXT", *native_assets)) if lazy else ()
+    source, _ = generate(tmp_path, pairs, web_only=browser_sources,
+                         web_lazy=lazy_names, native_only=native_assets)
     if web:
         text = source.read_text()
         match = re.search(r"static const uint8_t embedded_packed\[\d+\] = \{([\s\S]*?)\n\};", text)
         assert match
         packed = bytes(map(int, re.findall(r"\d+", match[1])))
         assert lzma.decompress(packed, format=lzma.FORMAT_RAW, filters=[LZMA_FILTER]) == x86_16_filter(b"".join(
-            data for name, data in pairs if name not in ("VC.COM", "VC.OVL") and name not in lazy_names))
+            data for name, data in pairs
+            if name not in ("VC.COM", "VC.OVL", *native_assets) and name not in lazy_names))
     _, result = compile_fixture(tmp_path, source, pairs, web=web)
     assert result.returncode == 0, result.stderr
     assert result.stdout == b"".join(data for name, data in pairs
-                                    if (name not in lazy_names if web else name not in browser_sources))
+                                    if (name not in (*lazy_names, *native_assets)
+                                        if web else name not in browser_sources))

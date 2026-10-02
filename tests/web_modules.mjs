@@ -89,6 +89,7 @@ const programs = [
   ['gwbasic', ['rt_halted', 'port_in8', 'port_out8'], ['run_gwbasic_graphics']],
   ['bootlogo', [], []],
   ['rogue', [], []],
+  ['hack', [], []],
   ['vz', ['port_in8', 'port_out8', 'rt_fault'], []],
   ['kermit', ['port_in8', 'port_out8', 'port_in16', 'port_out16'], []],
   ['command', [], []],

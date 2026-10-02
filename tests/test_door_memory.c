@@ -28,6 +28,7 @@ const Image image_vc_ovl = {
 const Image image_gwbasic = {.name = "GWBASIC.EXE"};
 const Image image_bootlogo = {.name = "BOOTLOGO.COM"};
 const Image image_rogue = {.name = "ROGUE.EXE"};
+const Image image_hack = {.name = "HACK.EXE"};
 const Image image_vz = {.name = "VZ.COM"};
 const Image image_kermit = {.name = "KERMIT.EXE"};
 const Image image_command = {.name = "COMMAND.COM"};

@@ -21,6 +21,7 @@ all: $(B)/vc
 include tools/gwbasic.mk
 include tools/bootlogo.mk
 include tools/rogue.mk
+include tools/hack.mk
 include tools/vz.mk
 include tools/kermit.mk
 include tools/msdos.mk
@@ -77,6 +78,7 @@ gen: $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c 
 gen: $(B)/gen/kermit.c
 gen: $(MSDOS_GEN)
 gen: $(VC405_GEN)
+gen: $(B)/gen/hack.c
 
 test-translator: gen
 	$(PY) -m pytest -q tests/test_translator_*.py
@@ -156,7 +158,7 @@ test-process: $(B)/test_rt_process
 # ---- the native binary -----------------------------------------------------
 RT_SRC := runtime/rt.c runtime/dos_core.c runtime/main.c runtime/cpu.c runtime/dos_fs.c \
           runtime/cp866.c runtime/bios.c runtime/term.c runtime/modem.c runtime/modem_transport.c
-GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/vz.c $(B)/gen/kermit.c $(MSDOS_GEN) $(VC405_GEN) $(B)/gen/files.c
+GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/hack.c $(B)/gen/vz.c $(B)/gen/kermit.c $(MSDOS_GEN) $(VC405_GEN) $(B)/gen/files.c
 GEN_OBJ := $(patsubst $(B)/gen/%.c,$(B)/obj/%.o,$(GEN_SRC))
 NATIVE_RT_SRC := $(RT_SRC) runtime/door.c runtime/door_confinement.c
 NATIVE_GEN_SRC := $(GEN_SRC) $(B)/gen/door_demo.c
@@ -169,10 +171,13 @@ KERMIT_EMBED := KERMIT.EXE=$(B)/kermit/KERMIT.EXE BBS.TAK=data/BBS.TAK KERMIT.TX
 # Browser references keep names/sizes in main, but fetch immutable contents
 # only when a DOS open reaches the dispatcher's narrow Asyncify chain.
 WEB_SOURCE_EMBED := --web-only-lazy=SRC/VC.ASM=asm/VC.ASM --web-only-lazy=SRC/VCOVL.ASM=asm/VCOVL.ASM
+# Native Hack's installation and browser playground have different paths.
+# The browser files enter the same per-file lazy manifest via WEB_LAZY_EXTRA.
+HACK_EMBED := --native-only=HACK/HACK.EXE=$(B)/hack/HACK.EXE $(foreach f,data help hh rumors record perm,--native-only=HACK/$(f)=$(B)/hack/$(f)) --native-only=HACK/HACKLIC.TXT=third_party/hack/COPYRIGHT --native-only=HACK/FENLIC.TXT=third_party/hack/COPYRIGHT-JF --native-only=HACK/OWLIC.TXT=$(B)/hack/OWLIC.TXT
 
-$(B)/gen/files.c $(B)/gen/files.web.json &: $(EMBED_INPUTS) $(B)/kermit/KERMIT.EXE $(KERMIT_DATA) $(MSDOS_IMAGES) $(MSDOS_DATA) $(VC405_IMAGES) translator/image.py asm/VC.ASM asm/VCOVL.ASM
+$(B)/gen/files.c $(B)/gen/files.web.json &: $(EMBED_INPUTS) $(B)/kermit/KERMIT.EXE $(KERMIT_DATA) $(MSDOS_IMAGES) $(MSDOS_DATA) $(VC405_IMAGES) $(B)/hack/HACK.EXE $(HACK_DATA) translator/image.py asm/VC.ASM asm/VCOVL.ASM
 	@mkdir -p $(B)/gen
-	$(PY) tools/embed.py $(B)/gen/files.c VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL $(addprefix --web-lazy=,GWBASIC.EXE=$(B)/gwbasic/GWBASIC.EXE BOOTLOGO.COM=$(B)/bootlogo/LOGO.COM ROGUE.EXE=$(B)/rogue/ROGUE.EXE ROGUELIC.TXT=third_party/rogue/LICENSE.TXT PDCLIC.TXT=third_party/pdcurses/README.md OWLIC.TXT=$(B)/rogue/OWLIC.TXT $(VZ_EMBED) $(KERMIT_EMBED) $(MSDOS_EMBED) VC405.COM=$(B)/vc405/VC.COM VC405/VCSETUP.COM=$(B)/vc405/VCSETUP.COM VC.HLP=data/VC.HLP) VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT $(WEB_SOURCE_EMBED) $(WEB_GAME_EMBED) $(WEB_LAZY_EXTRA)
+	$(PY) tools/embed.py $(B)/gen/files.c VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL $(addprefix --web-lazy=,GWBASIC.EXE=$(B)/gwbasic/GWBASIC.EXE BOOTLOGO.COM=$(B)/bootlogo/LOGO.COM ROGUE.EXE=$(B)/rogue/ROGUE.EXE ROGUELIC.TXT=third_party/rogue/LICENSE.TXT PDCLIC.TXT=third_party/pdcurses/README.md OWLIC.TXT=$(B)/rogue/OWLIC.TXT $(VZ_EMBED) $(KERMIT_EMBED) $(MSDOS_EMBED) VC405.COM=$(B)/vc405/VC.COM VC405/VCSETUP.COM=$(B)/vc405/VCSETUP.COM VC.HLP=data/VC.HLP) $(HACK_EMBED) VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT $(WEB_SOURCE_EMBED) $(WEB_GAME_EMBED) $(WEB_LAZY_EXTRA)
 
 $(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h
 	@mkdir -p $(B)/obj
@@ -224,12 +229,16 @@ games: $(BASIC_GAME_FILES)
 test-e2e: $(B)/vc $(B)/vc-pipe-modem games
 	$(PY) -m pytest -q tests/test_e2e.py tests/test_gwbasic_e2e.py tests/test_install_e2e.py tests/test_command_e2e.py tests/test_logo_e2e.py tests/test_rogue_e2e.py tests/test_vz_e2e.py tests/test_kermit_e2e.py tests/test_msdos_e2e.py tests/test_vc405_e2e.py
 	$(PY) -m pytest -q tests/test_command_nested_e2e.py tests/test_command_io_e2e.py
+	$(PY) -m pytest -q tests/test_hack_e2e.py tests/test_hack_playgrounds.py
 
 test-ini: $(B)/VC.OVL
 	$(PY) -m pytest -q tests/test_setup_ini.py
 
 test-rogue-build: rogue
 	$(PY) -m pytest -q tests/test_rogue_build.py
+
+test-hack-build: hack
+	$(PY) -m pytest -q tests/test_hack_build.py
 
 test: test-translator test-fs test-exec test-machine test-process test-term test-cga test-ini test-rogue-build test-vz-build test-e2e
 test: test-kermit-build test-modem test-serial-machine test-modem-transport
@@ -238,6 +247,7 @@ test: test-embed
 test: test-door-packaging
 test: test-msdos2-build
 test: test-vc405-build
+test: test-hack-build
 
 test-embed:
 	$(PY) -m pytest -q tests/test_embed.py tests/test_web_files.py
@@ -318,7 +328,7 @@ test-modem-transport-unit: $(B)/test_modem_transport_unit
 clean:
 	rm -rf $(B)
 
-.PHONY: test-e2e test-rogue-build games
+.PHONY: test-e2e test-rogue-build test-hack-build games
 
 # ---- the browser toy -------------------------------------------------------
 # Needs Emscripten on PATH (emsdk_env.sh). Native targets never call emcc.
@@ -333,18 +343,18 @@ WEB_DEMO := $(WEB_WORK)/demo
 # PIC expands inlined translation helpers. Keeping them out of line makes
 # -O2 smaller than -Os/-Oz here without editing the generated C. Side modules
 # retain their ordinary -O2 build. Measurements are in the mobile plan.
-# 80 MiB covers all fourteen modules plus retained lazy-file references in
+# 96 MiB covers all fifteen modules plus retained lazy-file references in
 # any load order, with headroom. test-web prints and checks that bound.
 WEB_FLAGS := $(WEB_OPT) -flto -fno-inline-functions -sMALLOC=emmalloc -sMAIN_MODULE=2 -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 \
-             -sSTACK_SIZE=1048576 -sINITIAL_MEMORY=83886080 -sALLOW_MEMORY_GROWTH=1 -sABORTING_MALLOC=0 \
+             -sSTACK_SIZE=1048576 -sINITIAL_MEMORY=100663296 -sALLOW_MEMORY_GROWTH=1 -sABORTING_MALLOC=0 \
              -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,node -sFORCE_FILESYSTEM \
              -sEXPORTED_RUNTIME_METHODS='["FS","ENV"]' \
              -sEXPORTED_FUNCTIONS='["_main","_cpu","_mem","_cpu_int","_flags_get","_flags_set","_port_in8","_port_out8","_port_in16","_port_out16","_rt_budget","_rt_code_delta","_rt_fault","_rt_halted","_rt_yield","_sbrk"]'
 # Retain only the host ABI the unedited side modules import. MAIN_MODULE=1
 # would keep all of libc; linking side files into the main link would make
 # them eager dylink dependencies. tests/web_modules.mjs guards both choices.
-WEB_MAIN_SRC := $(RT_SRC) runtime/web_programs.c runtime/web_files.c runtime/embed_lzma.c $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/files.c
-WEB_PROGRAMS := gwbasic bootlogo rogue vz kermit $(MSDOS_PROGRAMS) vc405 vcsetup405
+WEB_MAIN_SRC := $(RT_SRC) runtime/web_programs.c runtime/web_files.c runtime/web_sha256.c runtime/embed_lzma.c $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/files.c
+WEB_PROGRAMS := gwbasic bootlogo rogue hack vz kermit $(MSDOS_PROGRAMS) vc405 vcsetup405
 # Unversioned side binaries are build inputs only, never published. Their
 # content-derived generation hash is independent of the page's ?v= hash:
 # putting the latter into main's strings would create a circular hash.
@@ -356,18 +366,21 @@ WEB_DEMO_INPUT := web/README.TXT web/README-RU.TXT web/BOOTLOGO.TXT web/GAMES/SP
 WEB_DEMO_INPUT += $(B)/kermit/KERMIT.EXE $(KERMIT_DATA)
 WEB_DEMO_INPUT += $(MSDOS_IMAGES) $(MSDOS_DATA)
 WEB_DEMO_INPUT += $(VC405_IMAGES) asm405/LICENSE.TXT
+WEB_DEMO_INPUT += $(B)/hack/HACK.EXE $(HACK_DATA)
 
 # Native packaging calls the very same generator and uses the browser inputs.
 # It never invokes emcc and never embeds a separately curated demo file list.
 $(B)/gen/door_demo.c: $(WEB_DEMO_INPUT) tools/door_demo.py tools/embed.py tools/vcini.py runtime/door_demo.h data/VC.INI $(B)/gen/VC.OVL.lst
 	@mkdir -p $(B)/gen
-	$(PY) tools/door_demo.py $@ $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/vz/VZ.COM $(B)/kermit/KERMIT.EXE
+	$(PY) tools/door_demo.py $@ $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/vz/VZ.COM $(B)/kermit/KERMIT.EXE $(B)/msdos2 $(B)/vc405 $(B)/hack
 
 WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT ПРОЧТИ.TXT HISTORY.TXT SRC/VC.ASM SRC/VCOVL.ASM SRC/LICENSE.TXT GWBASIC.EXE GWBASIC.TXT BOOTLOGO.COM BOOTLOGO.TXT LOGOLIC.TXT GAMES/SPIRAL.BAS GAMES/ROGUE.EXE GAMES/ROGUELIC.TXT GAMES/PDCLIC.TXT GAMES/OWLIC.TXT VZ.COM VZ.DEF $(VZ_DEF_NAMES) VZLIC.TXT) $(patsubst $(B)/games/%,$(WEB_DEMO)/GAMES/%,$(BASIC_GAME_FILES))
 WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,KERMIT.EXE BBS.TAK KERMIT.TXT KERMLIC.TXT)
 WEB_MSDOS_FILES := COMMAND.COM DOS/EDLIN.COM DOS/DEBUG.COM DOS/FIND.EXE DOS/MORE.COM DOS/SORT.EXE DOS/FC.EXE DOS/DOS.TXT DOS/DOSLIC.TXT
 WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,$(WEB_MSDOS_FILES))
 WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,VC405/VC.COM VC405/VCSETUP.COM VC405/LICENSE.TXT)
+WEB_HACK_FILES := $(addprefix GAMES/HACK/,HACK.EXE data help hh rumors record perm HACKLIC.TXT FENLIC.TXT OWLIC.TXT)
+WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,$(WEB_HACK_FILES))
 # main.c already installs these exact files from gen/files.c. Do not embed
 # a second copy in MEMFS's startup package. Keep the complete demo directory
 # for the packaging/content gates, including the byte-matched executables.
@@ -390,6 +403,7 @@ WEB_SOURCE_INPUTS := $(B)/VC.COM $(B)/VC.OVL $(B)/gen/VC.COM.lst $(B)/gen/VC.OVL
                     $(B)/gwbasic/GWBASIC.EXE $(B)/gwbasic/GWBASIC.MAP $(GWB_LISTINGS) \
                     $(B)/bootlogo/LOGO.COM $(B)/bootlogo/LOGO.lst \
                     $(B)/rogue/ROGUE.EXE $(B)/rogue/ROGUE.MAP \
+                    $(B)/hack/HACK.EXE $(B)/hack/HACK.MAP \
                     $(B)/vz/VZ.COM $(B)/vz/VZ.MAP $(VZ_LISTINGS) \
                     $(wildcard asm/* third_party/gwbasic/* third_party/vzeditor/SRC/*) \
                     third_party/bootlogo/bootlogo.asm tools/source_maps.py tools/web_modules.py \
@@ -405,7 +419,7 @@ $(WEB_SOURCE_INDEX): $(WEB_SOURCE_INPUTS)
 # Grouped targets keep both the demo preparation and the single emcc link safe
 # under make -j.
 $(WEB_DEMO_FILES) &: $(WEB_DEMO_INPUT)
-	$(PY) tools/web_demo.py $(WEB_DEMO) $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/vz/VZ.COM $(B)/kermit/KERMIT.EXE $(B)/msdos2
+	$(PY) tools/web_demo.py $(WEB_DEMO) $(B)/gwbasic/GWBASIC.EXE $(B)/games $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/vz/VZ.COM $(B)/kermit/KERMIT.EXE $(B)/msdos2 $(B)/vc405 $(B)/hack
 
 $(WEB_MODULE_HEADER): $(WEB_MODULES) tools/web_modules.py
 	$(PY) tools/web_modules.py $(WEB_WORK) $(WEB_OUT)
@@ -428,6 +442,10 @@ $(WEB_WORK)/bootlogo.wasm: $(B)/gen/bootlogo.c runtime/cpu.h runtime/image.h Mak
 $(WEB_WORK)/rogue.wasm: $(B)/gen/rogue.c runtime/cpu.h runtime/image.h Makefile
 	@mkdir -p $(WEB_WORK)
 	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_rogue"]' -o $@
+
+$(WEB_WORK)/hack.wasm: $(B)/gen/hack.c runtime/cpu.h runtime/image.h Makefile
+	@mkdir -p $(WEB_WORK)
+	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_hack"]' -o $@
 
 $(WEB_WORK)/vz.wasm: $(B)/gen/vz.c runtime/cpu.h runtime/image.h Makefile
 	@mkdir -p $(WEB_WORK)
@@ -464,13 +482,22 @@ $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/source-runtime.wasm &: tests/source_r
 	$(EMCC) -O2 -sENVIRONMENT=node -sMODULARIZE -sEXPORT_ES6 -sASSERTIONS \
 	  -sSTACK_SIZE=1048576 -Iruntime tests/source_runtime.c -o $(WEB_WORK)/source-runtime.mjs
 
-$(WEB_WORK)/files-test.mjs $(WEB_WORK)/files-test.wasm &: tests/web_files_fixture.c runtime/web_files.c runtime/web_programs.c runtime/embed_lzma.c $(wildcard runtime/*.h) $(WEB_MODULE_HEADER)
+$(WEB_WORK)/files-test.mjs $(WEB_WORK)/files-test.wasm &: tests/web_files_fixture.c runtime/web_files.c runtime/web_programs.c runtime/web_sha256.c runtime/embed_lzma.c $(wildcard runtime/*.h) $(WEB_MODULE_HEADER)
 	$(EMCC) -O2 -flto -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=node \
 	  -sEXPORTED_RUNTIME_METHODS='["FS","ccall"]' \
-	  -sEXPORTED_FUNCTIONS='["_fixture_init","_fixture_install","_fixture_open","_fixture_reference"]' \
-	  --no-entry -Iruntime -I$(WEB_WORK) tests/web_files_fixture.c runtime/web_files.c runtime/web_programs.c runtime/embed_lzma.c -o $(WEB_WORK)/files-test.mjs
+	  -sEXPORTED_FUNCTIONS='["_fixture_init","_fixture_install","_fixture_open","_fixture_reference","_malloc","_free"]' \
+	  --no-entry -Iruntime -I$(WEB_WORK) tests/web_files_fixture.c runtime/web_files.c runtime/web_programs.c runtime/web_sha256.c runtime/embed_lzma.c -o $(WEB_WORK)/files-test.mjs
 
-test-web: web $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/files-test.mjs
+$(B)/test_web_sha256: tests/test_web_sha256.c runtime/web_sha256.c runtime/web_sha256.h
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -std=c11 -Wextra -Iruntime tests/test_web_sha256.c runtime/web_sha256.c -o $@
+
+test-web-sha256: $(B)/test_web_sha256
+	./$(B)/test_web_sha256
+
+test: test-web-sha256
+
+test-web: web $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/files-test.mjs test-web-sha256
 	$(NODE) tests/web_assets.mjs $(WEB_OUT)
 	$(NODE) tests/web_size.mjs $(WEB_OUT)
 	$(NODE) tests/test_source_maps.mjs $(WEB_OUT)
@@ -487,10 +514,14 @@ test-web: web $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/files-test.mjs
 	$(NODE) tests/test_web_graphics.mjs
 	$(NODE) tests/test_web_modem.mjs
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --hack-only --no-webcrypto
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --source-only --no-webcrypto
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --lazy-parent-move --no-webcrypto
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --lazy-rmdir --no-webcrypto
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --fetch-failure
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --fetch-timeout
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --memory-limit
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --file-fetch-failure
 	$(NODE) tests/web_command_fixes.mjs $(WEB_OUT)/vc.mjs
 
-.PHONY: web test-web
+.PHONY: web test-web test-web-sha256

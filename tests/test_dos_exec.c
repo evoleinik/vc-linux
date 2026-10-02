@@ -49,6 +49,7 @@ const Image image_rogue = {
     .name = "ROGUE.EXE", .is_exe = 1, .bytes = rogue_file + 8, .size = sizeof rogue_file - 8,
     .hdr_sp = 0x200, .min_alloc = 0x20, .max_alloc = 0x30,
 };
+const Image image_hack = {.name = "HACK.EXE"}; /* Not executed by this fixture. */
 const Image image_vz = {.name = "VZ.COM", .bytes = vz_file, .size = sizeof vz_file};
 const Image image_kermit = {
     .name = "KERMIT.EXE", .is_exe = 1, .bytes = kermit_file + 8, .size = sizeof kermit_file - 8,

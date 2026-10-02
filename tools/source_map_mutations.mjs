@@ -3,7 +3,7 @@
 // mutated map/index so coverage and provenance defects reach their own oracle,
 // rather than merely tripping the immutable-name check first.
 import assert from 'node:assert/strict';
-import { readFile, writeFile, mkdir, mkdtemp, symlink, rm } from 'node:fs/promises';
+import { readFile, writeFile, readdir, mkdir, mkdtemp, open, symlink, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -23,7 +23,9 @@ for (const [name, item] of Object.entries(originalIndex.images)) {
   }
 }
 const builder = await readFile(join(root, 'tools/source_maps.py'), 'utf8');
+const makefile = await readFile(join(root, 'Makefile'), 'utf8');
 const gate = await readFile(join(root, 'tests/test_source_maps.mjs'), 'utf8');
+const sourcePanel = await readFile(join(output, 'vc-source.js'));
 const hash = data => createHash('sha256').update(data).digest('hex').slice(0, 12);
 const serialize = value => Buffer.from(`${JSON.stringify(value)}\n`);
 const seedOffset = { 'VC.COM': 10, 'VC.OVL': 12 };
@@ -37,6 +39,11 @@ function firstOrdinary(map) {
 }
 
 const mutations = [
+  { name: 'Hack map rebuild dependency', expected: /HACK.MAP: Hack changes must invalidate the published Source map/,
+    mutate: state => {
+      assert.ok(state.makefile.includes('$(B)/hack/HACK.MAP'));
+      state.makefile = state.makefile.replace('$(B)/hack/HACK.MAP', '');
+    } },
   ...['VC.COM', 'VC.OVL'].map(image => ({
     name: `${image}: missing instruction`, expected: /listed instruction has no source mapping/,
     mutate: ({ maps }) => { const row = firstOrdinary(maps[image]); maps[image].lines = maps[image].lines.filter(item => item !== row); },
@@ -59,8 +66,10 @@ const mutations = [
     } },
   { name: 'Truthful include breadcrumb', expected: /include breadcrumb must name an actual parent INCLUDE line/,
     mutate: ({ maps }) => { maps['VC.OVL'].files.find(file => file.name === 'VCKEYB.INC').via[0].line++; } },
-  { name: 'Rogue cannot invent C lines', expected: /compiled C must not claim invented C line numbers/,
-    mutate: ({ maps }) => { maps['ROGUE.EXE'].lines = [[0, 0, 1, 1]]; } },
+  ...['ROGUE.EXE', 'HACK.EXE'].map(image => ({
+    name: `${image}: cannot invent C lines`, expected: /compiled C must not claim invented C line numbers/,
+    mutate: ({ maps }) => { maps[image].lines = [[0, 0, 1, 1]]; },
+  })),
   { name: 'Content-addressed source names', expected: /source asset hash disagrees with bytes/,
     mutate: ({ maps, sources }) => {
       const file = maps['VC.COM'].files.find(file => file.name === 'VC.ASM');
@@ -75,27 +84,50 @@ const mutations = [
 ];
 
 const temporary = await mkdtemp(join(tmpdir(), 'vc-source-mutations-'));
+
+async function runGate(repository, site, name, env = process.env) {
+  // Like the VC405 mutation harness, use private files: nested Node pipe
+  // capture may report EPERM in the managed sandbox and lose diagnostics.
+  const stdoutPath = join(temporary, `${name}-stdout`), stderrPath = join(temporary, `${name}-stderr`);
+  const stdout = await open(stdoutPath, 'wx'), stderr = await open(stderrPath, 'wx');
+  let result;
+  try {
+    result = spawnSync(process.execPath, [join(repository, 'tests/test_source_maps.mjs'), site], {
+      cwd: repository, timeout: 60000, stdio: ['ignore', stdout.fd, stderr.fd], env,
+    });
+  } finally {
+    await stdout.close();
+    await stderr.close();
+  }
+  assert.ifError(result.error);
+  assert.equal(result.signal, null, `${name}: source gate was killed instead of asserting`);
+  return { ...result, stdout: await readFile(stdoutPath, 'utf8'), stderr: await readFile(stderrPath, 'utf8') };
+}
+
 try {
   const repo = join(temporary, 'repo');
   await mkdir(join(repo, 'tests'), { recursive: true });
   await mkdir(join(repo, 'tools'), { recursive: true });
   await writeFile(join(repo, 'tests/test_source_maps.mjs'), gate);
-  for (const name of ['asm', 'third_party', 'translator', '.venv', 'build']) {
+  for (const name of ['asm', 'asm405', 'third_party', 'translator', '.venv', 'build']) {
     await symlink(join(root, name), join(repo, name));
   }
-  for (const name of ['build_gwbasic.py', 'build_vz.py', 'web_modules.py', 'jwasm']) {
+  const makeIncludes = (await readdir(join(root, 'tools'))).filter(name => name.endsWith('.mk'));
+  for (const name of ['build_gwbasic.py', 'build_vz.py', 'basic_games.py', 'web_modules.py', 'jwasm', ...makeIncludes]) {
     await symlink(join(root, 'tools', name), join(repo, 'tools', name));
   }
   for (let sequence = 0; sequence < mutations.length; sequence++) {
     const mutation = mutations[sequence];
-    const state = { maps: structuredClone(originalMaps), sources: new Map(originalSources), builder };
+    const state = { maps: structuredClone(originalMaps), sources: new Map(originalSources), builder, makefile };
     mutation.mutate(state);
     await writeFile(join(repo, 'tools/source_maps.py'), state.builder);
+    await writeFile(join(repo, 'Makefile'), state.makefile);
     // Python bytecode cache timestamps have one-second granularity. A changed
     // implementation must not accidentally reuse the preceding mutant's pyc.
     const site = join(temporary, `site-${sequence}`);
     await mkdir(site);
     await mkdir(`${site}-work`);
+    await writeFile(join(site, 'vc-source.js'), sourcePanel);
     const index = structuredClone(originalIndex);
     for (const [image, map] of Object.entries(state.maps)) {
       const data = serialize(map);
@@ -108,18 +140,15 @@ try {
     const name = `source-index.${hash(indexData)}.json`;
     await writeFile(join(site, name), indexData);
     await writeFile(`${site}-work/source-index-name.txt`, `${name}\n`);
-    const run = spawnSync(process.execPath, [join(repo, 'tests/test_source_maps.mjs'), site], {
-      cwd: repo, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
-      env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONPYCACHEPREFIX: join(temporary, `pycache-${sequence}`) },
+    const run = await runGate(repo, site, `mutant-${sequence}`, {
+      ...process.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONPYCACHEPREFIX: join(temporary, `pycache-${sequence}`),
     });
     assert.notEqual(run.status, 0, `${mutation.name}: planted defect unexpectedly passed`);
     assert.match(run.stdout + run.stderr, mutation.expected, `${mutation.name}: failed for an unrelated reason`);
     const diagnostic = (run.stdout + run.stderr).split('\n').find(line => mutation.expected.test(line));
     console.log(`RED ${mutation.name}: ${diagnostic.trim()}`);
   }
-  const restored = spawnSync(process.execPath, [join(root, 'tests/test_source_maps.mjs'), output], {
-    cwd: root, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
-  });
+  const restored = await runGate(root, output, 'restored');
   assert.equal(restored.status, 0, restored.stdout + restored.stderr);
   console.log(`GREEN restored originals: ${mutations.length} isolated defects rejected; live implementation and output were never modified.`);
   process.stdout.write(restored.stdout);
