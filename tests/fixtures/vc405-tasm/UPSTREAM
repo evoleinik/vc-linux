@@ -1,0 +1,11 @@
+VC 4.05 genuine TASM build references, vendored offline 2026-10-02.
+Repository: https://github.com/ddanila/vc
+Release: latest-build (supplied in build/vc405-inputs/)
+Builder: Danila Sukharev; TASM 4.1 and TLINK 7.1 under MS-DOS 4.0.
+Original commands in asm405/MAKE.BAT: TASMX /z/m9/kh10000; TLINK /t/x.
+Source: archives/vc405.zip at dbbb60578dc3a7e4cbc719f2376a3ad685d99040.
+Harness from the supplied SHA256SUMS-4.05:
+51460b384e4a569c23df2d377714c44dff5ca365d2a21ece2dc48f589bd8463f
+
+These files carry the BSD 2-Clause licence reproduced in asm405/LICENSE.TXT.
+They are comparison fixtures only; installed programs are built from source.

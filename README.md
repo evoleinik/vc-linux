@@ -11,7 +11,7 @@
 Most DOS software survives as a binary inside an emulator, and lives only as long as that emulator
 is maintained. vc-linux preserves programs a different way. Each one is kept as three things:
 
-1. **The original source, unedited.** Volkov Commander's own assembly is in `asm/`. The other
+1. **The original source, unedited.** Volkov Commander's own assembly is in `asm/` and `asm405/`. The other
    programs are in `third_party/`, each with its licence and the upstream commit it came from.
 2. **A reproducible build of that source,** assembled or compiled the way it was originally.
 3. **A machine translation to C,** made instruction by instruction and checked against a
@@ -24,6 +24,7 @@ files, and as WebAssembly in any browser. No emulator runs at run time.
 | Preserved so far | Author, year | Licence |
 |---|---|---|
 | Volkov Commander 4.99.09, the file manager | Vsevolod Volkov, 1991-2000 | BSD-2 (released 2026) |
+| Volkov Commander 4.05 and VCSETUP | Vsevolod Volkov, 1991-2000 | BSD-2 (released 2026) |
 | GW-BASIC | Microsoft, 1983 | MIT (released 2020) |
 | *BASIC Computer Games*, twelve of them | David H. Ahl, 1978 | public domain (2022) |
 | bootLogo, a Logo with turtle graphics | Oscar Toledo G., 2024 | BSD-2 |
@@ -87,6 +88,7 @@ goes to `~/.cache/vc-linux/vc.log`.
 | Alt-letter | Speed search | takes a `*` wildcard |
 | Command line | Translated DOS programs; `/bin/sh` on Linux, COMMAND.COM in the browser | Searches the current DOS directory and DOS `PATH` for `.COM`/`.EXE`; Linux keeps its host shell |
 | `dos2` (Linux), `command` (browser) | Microsoft's original MS-DOS 2.0 shell | `DIR`, `TYPE`, `COPY`, `ECHO` and `.BAT` files; `EXIT` restores VC's panels |
+| `vc405` (Linux), Enter on `H:\VC405\VC.COM` (browser/door) | Volkov Commander 4.05 inside 4.99.09 | F3 views a file; F10 returns to the newer VC |
 | Enter on `.BAS` | GW-BASIC | `SYSTEM` returns to VC; Ctrl-Pause or Ctrl-Shift-B stops BASIC |
 | `kermit take bbs.tak, stay` (Linux), or Enter on `H:\BBS.TAK` (browser) | Dial the BBS in MS-DOS Kermit | Ctrl-] then C returns to Kermit's prompt; `HANGUP`, then `EXIT`, returns to VC |
 | `bootlogo`, or Enter on `BOOTLOGO.COM` | bootLogo turtle graphics | `QUIT`, then VC's Enter confirmation returns to the panels |
@@ -121,13 +123,26 @@ repository commit and MIT licence; the build's per-program comparison report
 [`third_party/msdos2/IDENTITY.md`](third_party/msdos2/IDENTITY.md) records where
 the sources postdate or differ from Microsoft's shipped binaries.
 
+Type `vc405` on Linux to open Volkov Commander 4.05 inside the newer VC. Its
+unedited COM installs as `VC405.COM` in the config directory; no other command
+name changes meaning. In the browser and BBS doors, open `H:\VC405\VC.COM`.
+F3 uses 4.05's own viewer, and F10 returns to 4.99.09. Its companion setup
+program lives in `VC405/VCSETUP.COM`. Both older programs receive their own
+`VC=` directory (`$XDG_CONFIG_HOME/vc-linux/VC405` on Linux, `H:\VC405` in the
+browser and doors), so their `VC.INI` cannot replace 4.99.09's settings.
+Renamed byte-identical copies still select the same translations. `make vc405`
+builds both from the unedited `asm405/` sources with an isolated JWasm
+TASM-compatibility mode; provenance and build comparison are in
+[`asm405/UPSTREAM`](asm405/UPSTREAM).
+
 Type `gwbasic` to run the original 1983 interpreter, translated ahead of time just like VC.
 Try `PRINT 2+2`, then `SYSTEM`. The installed `GWBASIC.EXE` is a real DOS file: EXEC reads it
 and selects a translation by its complete bytes, not its name. Renamed copies work. Direct DOS
 EXEC rejects changed or untranslated executables; typed commands fall back to the Linux shell.
 The shipped association's `gwbasic` command never falls back, so a BASIC file name cannot become
-shell syntax when the interpreter is missing or changed. VC.COM and VC.OVL are internal parts
-of VC: they always use their built-in translations, independently of the installed files.
+shell syntax when the interpreter is missing or changed. The installed 4.99.09 VC.COM and VC.OVL
+paths always use their built-in translations, independently of those files. Other paths,
+including 4.05's VC.COM, select their translations by complete bytes.
 Linux installs the interpreter in the config directory; bring your own `.bas` files. Linux sound
 stays silent. A `CALL` or `USR` into code without a translation stops that BASIC session with a
 short message and returns to VC.
@@ -237,10 +252,12 @@ on reload.
 The Source button, or Ctrl-Shift-F12, shows the original assembly behind the running code. It
 shows the line the CPU is on, with Volkov's comments and the lines around it. Below that are the
 callers that led there, found from real return addresses on the stack, and the last 32 lines that
-ran. It works for VC, GW-BASIC, bootLogo and VZ. For Rogue, compiled from C, it names the function.
+ran. It works for both VC versions, VCSETUP, GW-BASIC, bootLogo and VZ. For Rogue, compiled from C, it names the function.
 The sources load the first time the panel opens.
 
-The page first downloads VC alone, about 1.3 MB gzipped. Each translated program is a separate
+The page first downloads VC and its startup settings. H: immediately lists all
+files with their full names, sizes and dates; contents download on the first
+DOS open and stay cached for the session. Each translated program is still a separate
 wasm module, fetched the first time DOS runs it and kept for the session. On a phone held upright,
 a key pad appears under the screen with F1 to F10, arrows, Esc, Tab, Ins, Enter, sticky Ctrl, Alt
 and Shift, and a button that opens the phone's keyboard. The page text follows the browser's
@@ -251,7 +268,8 @@ To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
     make web          # build/web/: index.html, vc.mjs, vc.wasm and one wasm per program
     make test-web     # Node checks VC, DOS shell/utilities, editors, games, Kermit, graphics and sound
 
-Serve `build/web/` over HTTP to open it. The design is in `docs/plans/2026-10-01-browser-build.md`.
+Serve `build/web/` over HTTPS, or HTTP on localhost, to open it. Lazy-file SHA-256 verification
+uses WebCrypto, which requires a secure context. The design is in `docs/plans/2026-10-01-browser-build.md`.
 
 ## Why shouldn't I use it?
 
@@ -309,7 +327,8 @@ The full design and every decision are in `docs/plans/2026-09-30-native-port.md`
 
 | Suite | What it proves |
 |---|---|
-| `test-translator` | Every distinct instruction in VC, GW-BASIC, bootLogo, Rogue, VZ and Kermit matches Unicorn from 32 random states each. One whole routine matches the original on all 131,072 inputs. |
+| `test-translator` | Every distinct instruction in both VCs, VCSETUP, GW-BASIC, bootLogo, Rogue, VZ, Kermit and MS-DOS matches Unicorn from 32 random states each. All 15 earlier generated C files stay byte-identical. One whole routine matches the original on all 131,072 inputs. |
+| `test-vc405-build` | Unedited licensed 4.05 sources and reproducible VC.COM/VCSETUP.COM bytes identical to the TASM builds. |
 | `test-rogue-build` | The original Rogue/PDCurses DOS build, linked runtime licence and reproducible EXE bytes. |
 | `test-vz-build` | Exact shipped US COM bytes, reproducible map/listings, and the build-time MASM compatibility layer. |
 | `test-fs` | The DOS file layer, DOS 1.x FCB calls, and per-process short-path leases: over 4,400 checks against a temporary tree. |
@@ -335,10 +354,14 @@ server. Restricted environments that deny `socket()` cannot run the TCP gate.
 Supplemental native syscall and pipe-transport tests exercise the same modem and
 translated Kermit without network access, but do not count as the TCP gate.
 
-The browser keeps the same 1.3 MB first-load limit. Startup reconstructs VC's
-files from its linked image bytes and losslessly unpacks the other DOS files
-with a bounded, fixed-profile decoder. Checksums and byte-for-byte tests cover
-this packaging; every file is complete before DOS starts, without another fetch.
+The browser keeps the same 1.3 MB first-load limit, with a gate requiring at
+least 150 KB less than the previous 1,299,288 gzip bytes. Startup reconstructs
+the newer VC's files from its linked image bytes and keeps `VC.INI`, `VC.EXT`
+and `VCEDIT.EXT` inside main. Other contents use immutable hashed filenames and
+the same bounded asynchronous fetch as program modules. A failed fetch returns
+a DOS error without ending VC. EXEC compares complete file bytes against a
+private original reference, never mutable guest data or a filename guess.
+Native Linux and door files remain fully embedded and need no downloads.
 
 ## Debugging
 
@@ -354,6 +377,7 @@ this packaging; every file is complete before DOS starts, without another fetch.
 
 - `asm/` VC 4.99.09 sources by Vsevolod V. Volkov, BSD-2, from the
   [ddanila/vc](https://github.com/ddanila/vc) build branch.
+- `asm405/` unedited VC 4.05 and VCSETUP sources, with their BSD-2 licence and pinned provenance.
 - `translator/` Python: JWasm/NASM listing plus linked image to C.
 - `runtime/` C: machine state, dispatcher, loader, DOS and BIOS services, terminal.
 - `data/` default `VC.INI` (written by VC itself), `VCEDIT.EXT`, `VC.HLP`.
@@ -383,6 +407,13 @@ VC 4 fits in one COM file under 64 KB. It added keys that later file managers co
 Ctrl-] put a panel's path on the command line. Ctrl-I puts the selected names there. Nikolai
 Bezroukov, who ran Softpanorama, tells the story in
 [Volkov Commander: a masterpiece of assembler programming](https://softpanorama.org/OFM/Paradigm/Ch03/volkov_commander.shtml).
+
+The preserved 4.05 main source is dated 16 June 2000, and its separate
+VCSETUP source 14 June. It builds one tiny-model VC.COM with its internal
+editor included. The 4.99.09 alpha sources are dated 16 July 2000: the main
+program is split between a resident VC.COM and a medium-model VC.OVL, its file
+layer handles long names, and the internal editor code is commented out.
+These are differences visible in the two source trees, not inferred release notes.
 
 ## Citing and archives
 

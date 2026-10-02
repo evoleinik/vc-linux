@@ -24,6 +24,7 @@ include tools/rogue.mk
 include tools/vz.mk
 include tools/kermit.mk
 include tools/msdos.mk
+include tools/vc405.mk
 
 MSDOS_GEN := $(addprefix $(B)/gen/,$(addsuffix .c,$(MSDOS_PROGRAMS)))
 MSDOS_DATA := data/DOS.TXT third_party/msdos2/LICENSE
@@ -75,6 +76,7 @@ $(B)/gen/vc_ovl.c: $(B)/VC.OVL $(B)/gen/VC.OVL.lst $(wildcard translator/*.py)
 gen: $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/vz.c
 gen: $(B)/gen/kermit.c
 gen: $(MSDOS_GEN)
+gen: $(VC405_GEN)
 
 test-translator: gen
 	$(PY) -m pytest -q tests/test_translator_*.py
@@ -154,23 +156,23 @@ test-process: $(B)/test_rt_process
 # ---- the native binary -----------------------------------------------------
 RT_SRC := runtime/rt.c runtime/dos_core.c runtime/main.c runtime/cpu.c runtime/dos_fs.c \
           runtime/cp866.c runtime/bios.c runtime/term.c runtime/modem.c runtime/modem_transport.c
-GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/vz.c $(B)/gen/kermit.c $(MSDOS_GEN) $(B)/gen/files.c
+GEN_SRC := $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/gwbasic.c $(B)/gen/bootlogo.c $(B)/gen/gwbasic_graphics.c $(B)/gen/rogue.c $(B)/gen/vz.c $(B)/gen/kermit.c $(MSDOS_GEN) $(VC405_GEN) $(B)/gen/files.c
 GEN_OBJ := $(patsubst $(B)/gen/%.c,$(B)/obj/%.o,$(GEN_SRC))
 NATIVE_RT_SRC := $(RT_SRC) runtime/door.c runtime/door_confinement.c
 NATIVE_GEN_SRC := $(GEN_SRC) $(B)/gen/door_demo.c
 NATIVE_GEN_OBJ := $(GEN_OBJ) $(B)/obj/door_demo.o
 
-$(B)/gen/files.c: $(B)/VC.COM $(B)/VC.OVL $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/rogue/OWLIC.TXT third_party/rogue/LICENSE.TXT third_party/pdcurses/README.md $(B)/vz/VZ.COM $(VZ_DATA) data/VC.INI data/VC.EXT data/VCEDIT.EXT data/VC.HLP tools/embed.py Makefile
+EMBED_INPUTS := $(B)/VC.COM $(B)/VC.OVL $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/rogue/OWLIC.TXT third_party/rogue/LICENSE.TXT third_party/pdcurses/README.md $(B)/vz/VZ.COM $(VZ_DATA) data/VC.INI data/VC.EXT data/VCEDIT.EXT data/VC.HLP tools/embed.py Makefile
 
 KERMIT_DATA := data/BBS.TAK data/KERMIT.TXT third_party/mskermit/LICENSE
 KERMIT_EMBED := KERMIT.EXE=$(B)/kermit/KERMIT.EXE BBS.TAK=data/BBS.TAK KERMIT.TXT=data/KERMIT.TXT KERMLIC.TXT=third_party/mskermit/LICENSE
-# The same original H:\SRC files share the bounded startup LZMA stream.
-# Keep them out of native arrays and out of MEMFS's duplicate raw package.
-WEB_SOURCE_EMBED := --web-only=SRC/VC.ASM=asm/VC.ASM --web-only=SRC/VCOVL.ASM=asm/VCOVL.ASM
+# Browser references keep names/sizes in main, but fetch immutable contents
+# only when a DOS open reaches the dispatcher's narrow Asyncify chain.
+WEB_SOURCE_EMBED := --web-only-lazy=SRC/VC.ASM=asm/VC.ASM --web-only-lazy=SRC/VCOVL.ASM=asm/VCOVL.ASM
 
-$(B)/gen/files.c: $(B)/kermit/KERMIT.EXE $(KERMIT_DATA) $(MSDOS_IMAGES) $(MSDOS_DATA) translator/image.py asm/VC.ASM asm/VCOVL.ASM
+$(B)/gen/files.c $(B)/gen/files.web.json &: $(EMBED_INPUTS) $(B)/kermit/KERMIT.EXE $(KERMIT_DATA) $(MSDOS_IMAGES) $(MSDOS_DATA) $(VC405_IMAGES) translator/image.py asm/VC.ASM asm/VCOVL.ASM
 	@mkdir -p $(B)/gen
-	$(PY) tools/embed.py $@ VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL GWBASIC.EXE=$(B)/gwbasic/GWBASIC.EXE BOOTLOGO.COM=$(B)/bootlogo/LOGO.COM ROGUE.EXE=$(B)/rogue/ROGUE.EXE ROGUELIC.TXT=third_party/rogue/LICENSE.TXT PDCLIC.TXT=third_party/pdcurses/README.md OWLIC.TXT=$(B)/rogue/OWLIC.TXT $(VZ_EMBED) $(KERMIT_EMBED) $(MSDOS_EMBED) VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT VC.HLP=data/VC.HLP $(WEB_SOURCE_EMBED) $(WEB_GAME_EMBED)
+	$(PY) tools/embed.py $(B)/gen/files.c VC.COM=$(B)/VC.COM VC.OVL=$(B)/VC.OVL $(addprefix --web-lazy=,GWBASIC.EXE=$(B)/gwbasic/GWBASIC.EXE BOOTLOGO.COM=$(B)/bootlogo/LOGO.COM ROGUE.EXE=$(B)/rogue/ROGUE.EXE ROGUELIC.TXT=third_party/rogue/LICENSE.TXT PDCLIC.TXT=third_party/pdcurses/README.md OWLIC.TXT=$(B)/rogue/OWLIC.TXT $(VZ_EMBED) $(KERMIT_EMBED) $(MSDOS_EMBED) VC405.COM=$(B)/vc405/VC.COM VC405/VCSETUP.COM=$(B)/vc405/VCSETUP.COM VC.HLP=data/VC.HLP) VC.INI=data/VC.INI VC.EXT=data/VC.EXT VCEDIT.EXT=data/VCEDIT.EXT $(WEB_SOURCE_EMBED) $(WEB_GAME_EMBED) $(WEB_LAZY_EXTRA)
 
 $(B)/obj/%.o: $(B)/gen/%.c runtime/cpu.h runtime/image.h
 	@mkdir -p $(B)/obj
@@ -212,7 +214,7 @@ $(B)/vc-door-aarch64: $(DOOR_GEN_OBJ) $(DOOR_RT_OBJ)
 	$(DOOR_CC) -pthread -s -o $@ $(DOOR_GEN_OBJ) $(DOOR_RT_OBJ)
 
 BASIC_GAME_FILES := $(addprefix $(B)/games/,$(shell $(PY) tools/basic_games.py --names))
-WEB_GAME_EMBED := $(foreach f,$(BASIC_GAME_FILES),--web-only=GAMES/$(notdir $(f))=$(f))
+WEB_GAME_EMBED := $(foreach f,$(BASIC_GAME_FILES),--web-only-lazy=GAMES/$(notdir $(f))=$(f))
 $(B)/gen/files.c: $(BASIC_GAME_FILES)
 $(BASIC_GAME_FILES) &: tools/basic_games.py $(wildcard third_party/basic-computer-games/*/*.bas) third_party/basic-computer-games/LICENSE
 	$(PY) tools/basic_games.py $(B)/games
@@ -220,7 +222,7 @@ $(BASIC_GAME_FILES) &: tools/basic_games.py $(wildcard third_party/basic-compute
 games: $(BASIC_GAME_FILES)
 
 test-e2e: $(B)/vc $(B)/vc-pipe-modem games
-	$(PY) -m pytest -q tests/test_e2e.py tests/test_gwbasic_e2e.py tests/test_install_e2e.py tests/test_command_e2e.py tests/test_logo_e2e.py tests/test_rogue_e2e.py tests/test_vz_e2e.py tests/test_kermit_e2e.py tests/test_msdos_e2e.py
+	$(PY) -m pytest -q tests/test_e2e.py tests/test_gwbasic_e2e.py tests/test_install_e2e.py tests/test_command_e2e.py tests/test_logo_e2e.py tests/test_rogue_e2e.py tests/test_vz_e2e.py tests/test_kermit_e2e.py tests/test_msdos_e2e.py tests/test_vc405_e2e.py
 	$(PY) -m pytest -q tests/test_command_nested_e2e.py tests/test_command_io_e2e.py
 
 test-ini: $(B)/VC.OVL
@@ -235,9 +237,10 @@ test: test-modem-transport-unit
 test: test-embed
 test: test-door-packaging
 test: test-msdos2-build
+test: test-vc405-build
 
 test-embed:
-	$(PY) -m pytest -q tests/test_embed.py
+	$(PY) -m pytest -q tests/test_embed.py tests/test_web_files.py
 
 .PHONY: test-embed
 
@@ -330,18 +333,18 @@ WEB_DEMO := $(WEB_WORK)/demo
 # PIC expands inlined translation helpers. Keeping them out of line makes
 # -O2 smaller than -Os/-Oz here without editing the generated C. Side modules
 # retain their ordinary -O2 build. Measurements are in the mobile plan.
-# 64 MiB covers the guard's 2N + 64 KiB for all twelve modules in any load order,
-# with headroom. test-web prints that bound and fails if memory would grow.
+# 80 MiB covers all fourteen modules plus retained lazy-file references in
+# any load order, with headroom. test-web prints and checks that bound.
 WEB_FLAGS := $(WEB_OPT) -flto -fno-inline-functions -sMALLOC=emmalloc -sMAIN_MODULE=2 -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 \
-             -sSTACK_SIZE=1048576 -sINITIAL_MEMORY=67108864 -sALLOW_MEMORY_GROWTH=1 -sABORTING_MALLOC=0 \
+             -sSTACK_SIZE=1048576 -sINITIAL_MEMORY=83886080 -sALLOW_MEMORY_GROWTH=1 -sABORTING_MALLOC=0 \
              -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,node -sFORCE_FILESYSTEM \
              -sEXPORTED_RUNTIME_METHODS='["FS","ENV"]' \
-             -sEXPORTED_FUNCTIONS='["_main","_cpu","_mem","_cpu_int","_flags_get","_flags_set","_port_in8","_port_out8","_port_in16","_port_out16","_rt_budget","_rt_code_delta","_rt_fault","_rt_halted","_sbrk"]'
+             -sEXPORTED_FUNCTIONS='["_main","_cpu","_mem","_cpu_int","_flags_get","_flags_set","_port_in8","_port_out8","_port_in16","_port_out16","_rt_budget","_rt_code_delta","_rt_fault","_rt_halted","_rt_yield","_sbrk"]'
 # Retain only the host ABI the unedited side modules import. MAIN_MODULE=1
 # would keep all of libc; linking side files into the main link would make
 # them eager dylink dependencies. tests/web_modules.mjs guards both choices.
-WEB_MAIN_SRC := $(RT_SRC) runtime/web_programs.c runtime/embed_lzma.c $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/files.c
-WEB_PROGRAMS := gwbasic bootlogo rogue vz kermit $(MSDOS_PROGRAMS)
+WEB_MAIN_SRC := $(RT_SRC) runtime/web_programs.c runtime/web_files.c runtime/embed_lzma.c $(B)/gen/vc_com.c $(B)/gen/vc_ovl.c $(B)/gen/files.c
+WEB_PROGRAMS := gwbasic bootlogo rogue vz kermit $(MSDOS_PROGRAMS) vc405 vcsetup405
 # Unversioned side binaries are build inputs only, never published. Their
 # content-derived generation hash is independent of the page's ?v= hash:
 # putting the latter into main's strings would create a circular hash.
@@ -352,6 +355,7 @@ WEB_SIDE_FLAGS := $(WEB_OPT) -sSIDE_MODULE=2 -std=gnu11 -Iruntime
 WEB_DEMO_INPUT := web/README.TXT web/README-RU.TXT web/BOOTLOGO.TXT web/GAMES/SPIRAL.BAS README.md asm/VC.ASM asm/VCOVL.ASM asm/LICENSE.TXT tools/web_demo.py tools/vz_defaults.py $(BASIC_GAME_FILES) $(B)/gwbasic/GWBASIC.EXE $(B)/bootlogo/LOGO.COM $(B)/rogue/ROGUE.EXE $(B)/rogue/OWLIC.TXT third_party/rogue/LICENSE.TXT third_party/pdcurses/README.md $(B)/vz/VZ.COM $(VZ_DATA) third_party/gwbasic/LICENSE third_party/bootlogo/LICENSE
 WEB_DEMO_INPUT += $(B)/kermit/KERMIT.EXE $(KERMIT_DATA)
 WEB_DEMO_INPUT += $(MSDOS_IMAGES) $(MSDOS_DATA)
+WEB_DEMO_INPUT += $(VC405_IMAGES) asm405/LICENSE.TXT
 
 # Native packaging calls the very same generator and uses the browser inputs.
 # It never invokes emcc and never embeds a separately curated demo file list.
@@ -363,18 +367,22 @@ WEB_DEMO_FILES := $(addprefix $(WEB_DEMO)/,README.TXT ПРОЧТИ.TXT HISTORY.T
 WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,KERMIT.EXE BBS.TAK KERMIT.TXT KERMLIC.TXT)
 WEB_MSDOS_FILES := COMMAND.COM DOS/EDLIN.COM DOS/DEBUG.COM DOS/FIND.EXE DOS/MORE.COM DOS/SORT.EXE DOS/FC.EXE DOS/DOS.TXT DOS/DOSLIC.TXT
 WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,$(WEB_MSDOS_FILES))
+WEB_DEMO_FILES += $(addprefix $(WEB_DEMO)/,VC405/VC.COM VC405/VCSETUP.COM VC405/LICENSE.TXT)
 # main.c already installs these exact files from gen/files.c. Do not embed
 # a second copy in MEMFS's startup package. Keep the complete demo directory
 # for the packaging/content gates, including the byte-matched executables.
 WEB_INSTALLED := GWBASIC.EXE BOOTLOGO.COM GAMES/ROGUE.EXE GAMES/ROGUELIC.TXT GAMES/PDCLIC.TXT GAMES/OWLIC.TXT VZ.COM VZ.DEF $(VZ_DEF_NAMES) VZLIC.TXT
 WEB_INSTALLED += KERMIT.EXE BBS.TAK KERMIT.TXT KERMLIC.TXT
 WEB_INSTALLED += $(WEB_MSDOS_FILES)
+WEB_INSTALLED += VC405/VC.COM VC405/VCSETUP.COM
 WEB_INSTALLED += SRC/VC.ASM SRC/VCOVL.ASM
 WEB_INSTALLED += $(patsubst $(B)/games/%,GAMES/%,$(BASIC_GAME_FILES))
 WEB_PACKED_FILES := $(filter-out $(addprefix $(WEB_DEMO)/,$(WEB_INSTALLED)),$(WEB_DEMO_FILES))
-# Emscripten 4.0.2's file_packager emits invalid assembler symbols for a
-# Cyrillic destination. Use an ASCII staging name, renamed before DOS starts.
-WEB_EMBED_FLAGS := $(foreach f,$(WEB_PACKED_FILES),--embed-file $(f)@/home/vc/$(subst ПРОЧТИ.TXT,READMERU.TXT,$(patsubst $(WEB_DEMO)/%,%,$(f))))
+# UTF-8 DOS pathnames stay metadata; no Emscripten file-packager symbols or
+# duplicate raw files are emitted into the startup wasm.
+WEB_LAZY_EXTRA := $(foreach f,$(WEB_PACKED_FILES),--web-only-lazy=$(patsubst $(WEB_DEMO)/%,%,$(f))=$(f))
+# Also applies to native packaging: generating references never invokes emcc.
+$(B)/gen/files.c $(B)/gen/files.web.json: $(WEB_DEMO_FILES)
 WEB_ASSETS := web/index.html web/vc-web.js web/vc-layout.js web/vc-source.js web/vc-keypad.js web/vc-language.js web/speaker.js web/graphics.js web/modem.js $(wildcard web/vendor/*)
 WEB_COPIES := $(patsubst web/%,$(WEB_OUT)/%,$(WEB_ASSETS))
 WEB_SOURCE_INDEX := $(WEB_WORK)/source-index-name.txt
@@ -386,6 +394,7 @@ WEB_SOURCE_INPUTS := $(B)/VC.COM $(B)/VC.OVL $(B)/gen/VC.COM.lst $(B)/gen/VC.OVL
                     $(wildcard asm/* third_party/gwbasic/* third_party/vzeditor/SRC/*) \
                     third_party/bootlogo/bootlogo.asm tools/source_maps.py tools/web_modules.py \
                     tools/build_gwbasic.py tools/build_vz.py $(wildcard translator/*.py)
+WEB_SOURCE_INPUTS += $(VC405_IMAGES) $(VC405_LISTINGS) $(wildcard asm405/*)
 
 # Source data is never embedded in the main wasm or eagerly imported by the
 # page. Every map and original-text payload, including its index, is immutable.
@@ -404,7 +413,7 @@ $(WEB_MODULE_HEADER): $(WEB_MODULES) tools/web_modules.py
 $(WEB_OUT)/vc.mjs $(WEB_OUT)/vc.wasm &: $(WEB_MAIN_SRC) $(wildcard runtime/*.h) $(FONT_HEADERS) $(WEB_DEMO_FILES) $(WEB_MODULE_HEADER) Makefile
 	@mkdir -p $(WEB_OUT)
 	$(EMCC) $(WEB_FLAGS) \
-	  -std=gnu11 -Iruntime -I$(WEB_WORK) $(WEB_MAIN_SRC) $(WEB_EMBED_FLAGS) -o $(WEB_OUT)/vc.mjs
+	  -std=gnu11 -Iruntime -I$(WEB_WORK) $(WEB_MAIN_SRC) -o $(WEB_OUT)/vc.mjs
 
 # Translated code never suspends. BASIC's source-proved graphics supplement
 # travels with its image; VC.COM and VC.OVL stay in the main wasm above.
@@ -428,7 +437,7 @@ $(WEB_WORK)/kermit.wasm: $(B)/gen/kermit.c runtime/cpu.h runtime/image.h Makefil
 	@mkdir -p $(WEB_WORK)
 	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_kermit"]' -o $@
 
-$(addprefix $(WEB_WORK)/,$(addsuffix .wasm,$(MSDOS_PROGRAMS))): $(WEB_WORK)/%.wasm: $(B)/gen/%.c runtime/cpu.h runtime/image.h Makefile
+$(addprefix $(WEB_WORK)/,$(addsuffix .wasm,$(MSDOS_PROGRAMS) vc405 vcsetup405)): $(WEB_WORK)/%.wasm: $(B)/gen/%.c runtime/cpu.h runtime/image.h Makefile
 	@mkdir -p $(WEB_WORK)
 	$(EMCC) $(WEB_SIDE_FLAGS) $< -sEXPORTED_FUNCTIONS='["_image_$*"]' -o $@
 
@@ -447,6 +456,7 @@ $(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_BINARIES) $(WEB_ASSETS) $(WEB_SOURCE
 
 web: $(WEB_BINARIES) $(WEB_COPIES)
 	@$(PY) tools/web_modules.py $(WEB_WORK) $(WEB_OUT)
+	@$(PY) tools/web_files.py $(B)/gen/files.web.json $(WEB_OUT) $(WEB_WORK)
 	@$(PY) tools/source_maps.py --restore --out $(WEB_OUT) --work $(WEB_WORK)
 
 $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/source-runtime.wasm &: tests/source_runtime.c runtime/rt.c $(wildcard runtime/*.h)
@@ -454,7 +464,13 @@ $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/source-runtime.wasm &: tests/source_r
 	$(EMCC) -O2 -sENVIRONMENT=node -sMODULARIZE -sEXPORT_ES6 -sASSERTIONS \
 	  -sSTACK_SIZE=1048576 -Iruntime tests/source_runtime.c -o $(WEB_WORK)/source-runtime.mjs
 
-test-web: web $(WEB_WORK)/source-runtime.mjs
+$(WEB_WORK)/files-test.mjs $(WEB_WORK)/files-test.wasm &: tests/web_files_fixture.c runtime/web_files.c runtime/web_programs.c runtime/embed_lzma.c $(wildcard runtime/*.h) $(WEB_MODULE_HEADER)
+	$(EMCC) -O2 -flto -sASYNCIFY -sASYNCIFY_IGNORE_INDIRECT=1 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=node \
+	  -sEXPORTED_RUNTIME_METHODS='["FS","ccall"]' \
+	  -sEXPORTED_FUNCTIONS='["_fixture_init","_fixture_install","_fixture_open","_fixture_reference"]' \
+	  --no-entry -Iruntime -I$(WEB_WORK) tests/web_files_fixture.c runtime/web_files.c runtime/web_programs.c runtime/embed_lzma.c -o $(WEB_WORK)/files-test.mjs
+
+test-web: web $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/files-test.mjs
 	$(NODE) tests/web_assets.mjs $(WEB_OUT)
 	$(NODE) tests/web_size.mjs $(WEB_OUT)
 	$(NODE) tests/test_source_maps.mjs $(WEB_OUT)
@@ -462,6 +478,7 @@ test-web: web $(WEB_WORK)/source-runtime.mjs
 	$(NODE) tests/test_web_layout.mjs $(WEB_OUT)
 	$(NODE) tests/test_web_source_wiring.mjs $(WEB_OUT)
 	$(NODE) tests/source_runtime.mjs $(WEB_WORK)/source-runtime.mjs
+	$(NODE) tests/test_web_files.mjs $(WEB_WORK)/files-test.mjs
 	$(NODE) tests/web_modules.mjs $(WEB_OUT)
 	$(NODE) tests/test_web_keypad.mjs $(WEB_OUT)
 	$(NODE) tests/web_language.mjs $(WEB_DEMO)
@@ -472,6 +489,7 @@ test-web: web $(WEB_WORK)/source-runtime.mjs
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --fetch-failure
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --fetch-timeout
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --memory-limit
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --file-fetch-failure
 	$(NODE) tests/web_command_fixes.mjs $(WEB_OUT)/vc.mjs
 
 .PHONY: web test-web

@@ -69,6 +69,7 @@ def load_cases() -> tuple[InstructionCase, ...]:
     from translator.supplement import build_gwbasic_graphics_layout
     from translator.compiled import build_compiled_layout
     from translator.msdos import build_msdos_layout
+    from translator.vc405 import build_vc405_layout
     from tools.build_gwbasic import modules
     from tools.build_vz import modules as vz_modules
     from tools.build_kermit import modules as kermit_modules
@@ -83,7 +84,7 @@ def load_cases() -> tuple[InstructionCase, ...]:
     result = []
     seen = set()
     for name in ("VC.COM", "VC.OVL", "GWBASIC.EXE", "LOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE",
-                 *msdos_programs):
+                 *msdos_programs, "VC405.COM", "VCSETUP.COM"):
         if name == "ROGUE.EXE":
             directory = ROOT / "build" / "rogue"
             loaded = load_image(directory / name)
@@ -109,6 +110,12 @@ def load_cases() -> tuple[InstructionCase, ...]:
             loaded = load_image(directory / name)
             layout = build_linked_layout(loaded, [directory / (module + ".lst") for module in kermit_modules()],
                                          directory / "KERMIT.MAP")
+        elif name in ("VC405.COM", "VCSETUP.COM"):
+            directory = ROOT / "build" / "vc405"
+            file_name = "VC.COM" if name == "VC405.COM" else name
+            loaded = load_image(directory / file_name)
+            layout = build_vc405_layout(loaded, parse_listing(directory / (file_name + ".lst"),
+                                                               physical_lines=True))
         elif name in msdos_programs:
             directory = ROOT / "build" / "msdos2"
             loaded = load_image(directory / name)

@@ -5,6 +5,9 @@
 #include "dos_fs.h"
 #include "cp866.h"
 #include "guest_mem.h"
+#ifdef __EMSCRIPTEN__
+#include "web_files.h"
+#endif
 
 #include <dirent.h>
 #include <errno.h>
@@ -270,6 +273,9 @@ static int fs_stat(const char *path, struct stat *st, bool nofollow)
 
 static int fs_open(const char *path, int flags, mode_t mode)
 {
+#ifdef __EMSCRIPTEN__
+    if (door_root_fd < 0) return web_files_open(path, flags, mode);
+#endif
     if (door_root_fd < 0) return open(path, flags, mode);
     char leaf[NAME_MAX + 1];
     int parent = door_parent(path, leaf);

@@ -213,9 +213,15 @@ def _metadata(text: str) -> tuple[dict[str, Segment], dict[str, Label], dict[str
     return segments, labels, constants
 
 
-def parse_listing(path: str | Path, *, linked: bool = False, flat: bool = False) -> Listing:
+def parse_listing(path: str | Path, *, linked: bool = False, flat: bool = False,
+                  physical_lines: bool = False) -> Listing:
     path = Path(path)
-    text = path.read_text(encoding="utf-8", errors="replace")
+    # VC 4.05 quotes DOS control characters in DB strings. Python splitlines()
+    # treats some as line breaks; its default text reader also rewrites bare
+    # CRs. Opt in to actual LF-delimited listing lines, retaining all earlier
+    # programs' established parsing and generated C byte-for-byte.
+    text = (path.read_bytes().decode("utf-8", errors="replace") if physical_lines else
+            path.read_text(encoding="utf-8", errors="replace"))
     segments, labels, constants = _metadata(text)
     if flat:
         # A flat COM may put executable source in WORK/BASE/INIT as well as
@@ -245,7 +251,10 @@ def parse_listing(path: str | Path, *, linked: bool = False, flat: bool = False)
     generated = False
     comment_delimiter = None
     pending_labels: list[tuple[str, str, str | None]] = []
-    for lineno, raw in enumerate(source_text.splitlines(), 1):
+    source_lines = source_text.split("\n") if physical_lines else source_text.splitlines()
+    for lineno, raw in enumerate(source_lines, 1):
+        if physical_lines:
+            raw = raw.removesuffix("\r")
         if len(raw) < 32:
             continue
         source = raw[32:]

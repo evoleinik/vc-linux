@@ -14,7 +14,7 @@ const failures = [];
 const versions = new Set();
 const referenced = new Set();
 const programs = ["gwbasic", "bootlogo", "rogue", "vz", "kermit",
-  "command", "edlin", "debug", "find", "more", "sort", "fc"];
+  "command", "edlin", "debug", "find", "more", "sort", "fc", "vc405", "vcsetup405"];
 const programPattern = programs.join('|');
 const sideFiles = readdirSync(dir).filter(file => file.endsWith(".wasm") && file !== "vc.wasm").sort();
 const sideHashes = new Set();
@@ -53,6 +53,16 @@ const requestedSides = [...new Set([...main.matchAll(new RegExp(`(?:${programPat
   .map(([file]) => file))].sort();
 if (requestedSides.length !== programs.length || JSON.stringify(requestedSides) !== JSON.stringify(sideFiles))
   failures.push(`main requests [${requestedSides.join(", ")}], but published files are [${sideFiles.join(", ")}]`);
+const fileAssets = readdirSync(dir).filter(file => /^file\..*\.bin$/.test(file)).sort();
+const requestedFiles = [...new Set([...main.matchAll(/file\.[A-Za-z0-9_-]+\.bin(?=\0)/g)]
+  .map(([file]) => file))].sort();
+if (!requestedFiles.length || JSON.stringify(requestedFiles) !== JSON.stringify(fileAssets))
+  failures.push('main lazy-file names differ from the published file assets');
+for (const file of fileAssets) {
+  const match = file.match(/^file\.([0-9a-f]{12})\.bin$/);
+  const hash = createHash('sha256').update(readFileSync(join(dir, file))).digest('hex').slice(0, 12);
+  if (!match || match[1] !== hash) failures.push(`${file}: lazy-file hash differs from its actual bytes`);
+}
 for (const [file, text] of Object.entries(sources)) {
   if (text.includes("__V__")) failures.push(`${file}: placeholder __V__ was not replaced`);
   // Include vendor assets and future relative imports, not just a fixed
@@ -74,7 +84,7 @@ const resolver = sources["vc-web.js"].match(/locateFile:\s*(.+),\s*$/m)?.[1];
 if (!resolver) failures.push("vc-web.js: missing locateFile resolver");
 else {
   const locateFile = runInNewContext(`(${resolver})`);
-  for (const file of ["vc.wasm", ...requestedSides]) {
+  for (const file of ["vc.wasm", ...requestedSides, ...requestedFiles]) {
     const url = new URL(locateFile(file, "https://vc.invalid/subdir/"));
     if (url.pathname !== `/subdir/${file}` || !/^[0-9a-f]{12}$/.test(url.searchParams.get("v") || ""))
       failures.push(`locateFile: ${file} lacks its subdirectory or build hash`);
@@ -96,5 +106,5 @@ if (failures.length) {
   console.error("web assets: FAIL\n  " + failures.join("\n  ") + "\nFix: build with `make web`, which stamps the hash.");
   process.exitCode = 1; // Let redirected diagnostics drain before exiting.
 } else {
-  console.log(`web assets: every page asset carries ?v=${[...versions][0]}; ${programs.length} hashed side filenames match the main binary (${[...sideHashes][0]})`);
+  console.log(`web assets: every page asset carries ?v=${[...versions][0]}; ${programs.length} hashed side filenames match the main binary (${[...sideHashes][0]}); ${fileAssets.length} immutable lazy files match their bytes and main references`);
 }

@@ -6,6 +6,7 @@ actual initialized bytes and BSS symbols, not merely the generator's text.
 
 from pathlib import Path
 import ctypes
+import json
 import lzma
 import random
 import re
@@ -41,13 +42,15 @@ def mz(payload: bytes, tail: bytes = b"", magic: bytes = b"MZ") -> bytes:
     return bytes(header) + payload + tail
 
 
-def generate(tmp_path, pairs, *, check=True, web_only=()):
+def generate(tmp_path, pairs, *, check=True, web_only=(), web_lazy=()):
     output = tmp_path / "files.c"
     command = [sys.executable, str(ROOT / "tools/embed.py"), str(output)]
     for index, (name, data) in enumerate(pairs):
         source = tmp_path / f"input-{index}.bin"
         source.write_bytes(data)
-        command.append(("--web-only=" if name in web_only else "") + f"{name}={source}")
+        prefix = ("--web-only-lazy=" if name in web_lazy else "--web-only=") if name in web_only else (
+            "--web-lazy=" if name in web_lazy else "")
+        command.append(prefix + f"{name}={source}")
     result = subprocess.run(command, capture_output=True, text=True)
     if check:
         assert result.returncode == 0, result.stderr
@@ -77,7 +80,7 @@ int main(void) {{
     embedded_files_init();
     embedded_files_init();
     for (int i = 0; i < embedded_file_count; ++i)
-        if (fwrite(embedded_files[i].data, 1, embedded_files[i].size, stdout)
+        if (embedded_files[i].data && fwrite(embedded_files[i].data, 1, embedded_files[i].size, stdout)
                 != embedded_files[i].size) return 2;
     return 0;
 }}
@@ -144,6 +147,41 @@ def test_builtin_files_cannot_be_web_only(tmp_path):
     _, result = generate(tmp_path, [("VC.COM", b"\xc3")], web_only=("VC.COM",), check=False)
     assert result.returncode != 0
     assert "built-in files must exist in both builds" in result.stderr
+
+
+@pytest.mark.parametrize("web", [False, True], ids=["native-unchanged", "web-metadata-only"])
+def test_lazy_file_bytes_only_leave_the_browser_binary(tmp_path, web):
+    from hashlib import sha256
+
+    pairs = [("VC.COM", b"\xc3"), ("VC.OVL", mz(bytes(range(200)))),
+             ("KEPT.TXT", b"small eager file"), ("OTHER.EXE", b"MZoriginal executable bytes\0\xff"),
+             ("SRC/VC.ASM", b"first original line\r\n"), ("EMPTY.TXT", b"")]
+    lazy_names = ("OTHER.EXE", "SRC/VC.ASM", "EMPTY.TXT")
+    source, _ = generate(tmp_path, pairs, web_only=("SRC/VC.ASM",), web_lazy=lazy_names)
+    _, result = compile_fixture(tmp_path, source, pairs, web=web)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"".join(data for name, data in pairs
+                                    if (name not in lazy_names if web else name != "SRC/VC.ASM"))
+    manifest = json.loads(source.with_suffix(".web.json").read_text())
+    assert manifest["format"] == 1
+    assert [entry["name"] for entry in manifest["files"]] == list(lazy_names)
+    for entry in manifest["files"]:
+        original = dict(pairs)[entry["name"]]
+        digest = sha256(original).hexdigest()
+        assert entry["asset"] == f"file.{digest[:12]}.bin"
+        assert entry["sha256"] == digest
+        assert entry["size"] == len(original)
+        assert entry["checksum"] == zlib.adler32(original)
+        assert Path(entry["source"]).read_bytes() == original
+        assert entry["asset"] in source.read_text()
+        assert digest in source.read_text(), "the main retains the full expected file hash"
+
+
+@pytest.mark.parametrize("name", ["VC.COM", "VC.OVL", "VC.INI", "VC.EXT", "VCEDIT.EXT"])
+def test_vc_startup_files_cannot_be_lazy(tmp_path, name):
+    _, result = generate(tmp_path, [(name, b"startup")], web_lazy=(name,), check=False)
+    assert result.returncode != 0
+    assert "startup files must remain eager" in result.stderr
 
 
 @pytest.mark.parametrize("name,data,message", [
@@ -360,7 +398,8 @@ def test_generated_initializer_refuses_corrupt_packed_files(tmp_path, corruption
 
 
 @pytest.mark.parametrize("web", [False, True], ids=["native", "web"])
-def test_every_real_embedded_file_round_trips_byte_for_byte(tmp_path, web):
+@pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy-references"])
+def test_every_real_embedded_file_round_trips_byte_for_byte(tmp_path, web, lazy):
     browser_sources = ("SRC/VC.ASM", "SRC/VCOVL.ASM", *(f"GAMES/{name}" for name in game_files()))
     paths = [
         ("VC.COM", "build/VC.COM"), ("VC.OVL", "build/VC.OVL"),
@@ -384,14 +423,17 @@ def test_every_real_embedded_file_round_trips_byte_for_byte(tmp_path, web):
         *((f"GAMES/{name}", f"build/games/{name}") for name in game_files()),
     ]
     pairs = [(name, (ROOT / path).read_bytes()) for name, path in paths]
-    source, _ = generate(tmp_path, pairs, web_only=browser_sources)
+    lazy_names = tuple(name for name, _ in pairs
+                       if name not in ("VC.COM", "VC.OVL", "VC.INI", "VC.EXT", "VCEDIT.EXT")) if lazy else ()
+    source, _ = generate(tmp_path, pairs, web_only=browser_sources, web_lazy=lazy_names)
     if web:
         text = source.read_text()
         match = re.search(r"static const uint8_t embedded_packed\[\d+\] = \{([\s\S]*?)\n\};", text)
         assert match
         packed = bytes(map(int, re.findall(r"\d+", match[1])))
         assert lzma.decompress(packed, format=lzma.FORMAT_RAW, filters=[LZMA_FILTER]) == x86_16_filter(b"".join(
-            data for name, data in pairs if name not in ("VC.COM", "VC.OVL")))
+            data for name, data in pairs if name not in ("VC.COM", "VC.OVL") and name not in lazy_names))
     _, result = compile_fixture(tmp_path, source, pairs, web=web)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == b"".join(data for name, data in pairs if web or name not in browser_sources)
+    assert result.stdout == b"".join(data for name, data in pairs
+                                    if (name not in lazy_names if web else name not in browser_sources))

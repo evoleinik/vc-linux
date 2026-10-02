@@ -99,6 +99,8 @@ const programs = [
   ['more', [], [], minimal],
   ['sort', ['rt_fault'], [], minimal],
   ['fc', [], [], minimal],
+  ['vc405', ['port_in8', 'rt_yield'], []],
+  ['vcsetup405', ['port_in8', 'rt_yield'], []],
 ];
 const linkerSymbols = new Set(['__memory_base', '__table_base', '__stack_pointer',
   '__indirect_function_table', 'memory']);

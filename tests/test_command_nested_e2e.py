@@ -63,7 +63,7 @@ def survived(session, before):
 
 
 @pytest.mark.parametrize("quick", [False, True], ids=["comspec", "int2e"])
-def test_vc_exec_under_command_returns_or_reports_dos_error(quick):
+def test_vc_exec_under_command_loads_panels_and_returns(quick):
     with running_vc(quick=quick) as (session, _, _):
         before = start_command(session)
         launch = len(session.log.read_text())
@@ -74,23 +74,26 @@ def test_vc_exec_under_command_returns_or_reports_dos_error(quick):
             child = com_psp(log, "VC.COM")
             if child is None or "translation VC.COM (DOS-hosted loader)" not in log:
                 return False
-            if terminated(log, child, 2):
-                return command_prompt(session) and "Error reading overlay file." in session.text()
-            # A returned outer VC also has panels. Never send F10 unless the
-            # newly loaded nested VC has not already terminated.
-            return panels(session.text()) and not terminated(log, child)
+            return panels(session.text()) or terminated(log, child)
 
         until(session, vc_result, timeout=15)
         child = com_psp(session.log.read_text()[launch:], "VC.COM")
-        if panels(session.text()):
-            leave = len(session.log.read_text())
-            session.send("f10")
-            until(session, lambda: command_prompt(session) and
-                  terminated(session.log.read_text()[leave:], child), timeout=15)
-        else:
-            # DOS2's loader copies environment strings without DOS3's
-            # executable-name trailer; VC reports its own DOS file error.
-            assert terminated(session.log.read_text()[launch:], child, 2)
+        # The child now gets a DOS3 executable trailer even through DOS2's
+        # loader. An overlay-read error is not an acceptable launch result.
+        # A returned outer VC also has panels: prove this child is alive.
+        assert child is not None
+        assert not terminated(session.log.read_text()[launch:], child), session.log.read_text()[launch:]
+        assert panels(session.text())
+        leave = len(session.log.read_text())
+        session.send("f10")
+        until(session, lambda: "Do you want to quit the Volkov Commander?" in session.text()
+              or (command_prompt(session) and
+                  terminated(session.log.read_text()[leave:], child)), timeout=15)
+        if "Do you want to quit the Volkov Commander?" in session.text():
+            assert not terminated(session.log.read_text()[leave:], child)
+            session.send("enter")
+        until(session, lambda: command_prompt(session) and
+              terminated(session.log.read_text()[leave:], child), timeout=15)
         survived(session, before)
         line(session, "echo NESTED-VC-RETURNED", lambda text: "NESTED-VC-RETURNED" in text)
         back_to_vc(session)

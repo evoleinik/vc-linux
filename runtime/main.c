@@ -17,6 +17,7 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include "term.h"
+#include "web_files.h"
 
 EM_JS(void, browser_exit, (int status), {
     if (Module['vcExit']) Module['vcExit'](status);
@@ -192,6 +193,17 @@ static void retire_unchanged_program(const char *dir, const char *name, const Em
 /* Setup files are written once and then belong to the user. Program images
  * are updated to this binary's bytes, leaving matching installations alone. */
 static void install_files(const char *dir) {
+    char vc405_directory[4096];
+#ifdef __EMSCRIPTEN__
+    const char *vc405_base = "/home/vc";
+#else
+    const char *vc405_base = dir;
+#endif
+    int vc405_length = snprintf(vc405_directory, sizeof vc405_directory, "%s/VC405", vc405_base);
+    if (vc405_length < 0 || (size_t)vc405_length >= sizeof vc405_directory || mkdirs(vc405_directory)) {
+        fprintf(stderr, "vc: cannot prepare VC405 configuration: %s\n", strerror(errno));
+        exit(1);
+    }
 #ifndef __EMSCRIPTEN__
     char dos_directory[4096];
     int dos_length = snprintf(dos_directory, sizeof dos_directory, "%s/DOS2", dir);
@@ -207,6 +219,7 @@ static void install_files(const char *dir) {
     for (int i = 0; i < embedded_file_count; i++) {
         const EmbeddedFile *f = &embedded_files[i];
         char path[4096];
+        const char *installed_name = f->name;
 #ifdef __EMSCRIPTEN__
         /* H: is the program drive in the browser. Configuration remains out
          * of sight under /var/vc/config, as before. */
@@ -218,6 +231,7 @@ static void install_files(const char *dir) {
         /* VZ loads its English definitions next to its COM, not VC.INI. */
         const char *target = rogue_asset ? "/home/vc/GAMES" :
             dos_asset ? "/home/vc/DOS" :
+            !strcmp(f->name, "VC405.COM") ? vc405_directory :
             !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
             !strcmp(f->name, "VZ.COM") || !strcmp(f->name, "VZLIC.TXT") ||
             !strcmp(f->name, "KERMIT.EXE") || !strcmp(f->name, "KERMIT.TXT") ||
@@ -225,22 +239,39 @@ static void install_files(const char *dir) {
             !strcmp(f->name, "COMMAND.COM") ||
             !strcmp(f->name, "SRC/VC.ASM") || !strcmp(f->name, "SRC/VCOVL.ASM") ||
             !strncmp(f->name, "GAMES/", 6) ||
+            !strncmp(f->name, "VC405/", 6) ||
+            !strcmp(f->name, "README.TXT") || !strcmp(f->name, "ПРОЧТИ.TXT") ||
+            !strcmp(f->name, "HISTORY.TXT") || !strcmp(f->name, "BOOTLOGO.TXT") ||
+            !strcmp(f->name, "GWBASIC.TXT") || !strcmp(f->name, "LOGOLIC.TXT") ||
+            !strncmp(f->name, "DOS/", 4) ||
+            !strncmp(f->name, "SRC/", 4) ||
             (ext && !strcmp(ext, ".DEF"))
             ? "/home/vc" : dir;
+        if (!strcmp(f->name, "VC405.COM")) installed_name = "VC.COM";
 #else
         /* VC still uses /bin/sh. Keep colliding utility names off its DOS
          * PATH; only the explicit DOS2.COM shell alias belongs there. */
         const char *target = msdos_program(f->name) ? dos_directory : dir;
 #endif
-        int length = snprintf(path, sizeof path, "%s/%s", target, f->name);
+        int length = snprintf(path, sizeof path, "%s/%s", target, installed_name);
         if (length < 0 || (size_t)length >= sizeof path) {
             fputs("vc: configuration file path is too long\n", stderr);
             exit(1);
         }
+#ifdef __EMSCRIPTEN__
+        if (!f->data) {
+            if (web_files_install(path, f)) {
+                fprintf(stderr, "vc: cannot prepare lazy file %s: %s\n", path, strerror(errno));
+                exit(1);
+            }
+            continue;
+        }
+#endif
         int program = !strcmp(f->name, "VC.COM") || !strcmp(f->name, "VC.OVL") ||
                       !strcmp(f->name, "GWBASIC.EXE") || !strcmp(f->name, "BOOTLOGO.COM") ||
                       !strcmp(f->name, "ROGUE.EXE") || !strcmp(f->name, "VZ.COM") ||
-                      !strcmp(f->name, "KERMIT.EXE") || msdos_program(f->name);
+                      !strcmp(f->name, "KERMIT.EXE") || msdos_program(f->name) ||
+                      !strcmp(f->name, "VC405.COM") || !strcmp(f->name, "VC405/VCSETUP.COM");
         struct stat existing;
         if (!program && !lstat(path, &existing) &&
             (!S_ISREG(existing.st_mode) ||
@@ -285,13 +316,6 @@ int main(int argc, char **argv) {
         mkdirs(cache) || mkdirs(dos_directory) || mkdirs(source_directory) ||
         mkdirs(games_directory) || chdir("/home/vc")) {
         fprintf(stderr, "vc: cannot prepare browser home: %s\n", strerror(errno));
-        return 1;
-    }
-    /* Emscripten's packager requires ASCII symbol names. Only its staging
-     * name is Latin: H: exposes the actual Cyrillic name before the first
-     * directory scan, with the guide's original CP866 bytes unchanged. */
-    if (rename("READMERU.TXT", "ПРОЧТИ.TXT")) {
-        fprintf(stderr, "vc: cannot install Russian guide: %s\n", strerror(errno));
         return 1;
     }
 #else

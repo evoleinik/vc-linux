@@ -1,0 +1,312 @@
+--- a/src/H/globals.h
++++ b/src/H/globals.h
+@@ -618,6 +618,7 @@
+     bool        strict_masm_compat;      /* -Zne option  */
+     bool        masm_compat_gencode;     /* -Zg option  */
+     bool        masm8_proc_visibility;   /* -Zv8 option  */
++    bool        tasm_compat;             /* -Zt: TASM's MASM-compatible dialect */
+     bool        listif;                  /* -Sx, -Sa option  */
+     bool        list_generated_code;     /* -Sg, -Sa option  */
+     enum listmacro list_macro;           /* -Sa option  */
+--- a/src/H/label.h
++++ b/src/H/label.h
+@@ -30,6 +30,7 @@
+ 
+ #ifndef _LABEL_H_
+ #define _LABEL_H_
++extern ret_code LabelDirective( int, struct asm_tok[] );
+ 
+ struct qualified_type;
+ 
+--- a/src/H/proc.h
++++ b/src/H/proc.h
+@@ -60,5 +60,6 @@
+ extern void             ProcInit( void );
+ 
+ extern void             ProcCheckOpen( void );
++extern ret_code         TasmUses( struct asm_tok[] );
+ 
+ #endif
+--- a/src/branch.c
++++ b/src/branch.c
+@@ -301,10 +301,32 @@
+             //    CodeInfo->mem_type = MT_NEAR;
+             //}
+             DebugMsg(("process_branch: CI.memtype=%Xh addr=%Xh\n", CodeInfo->mem_type, addr ));
++            /* TASM's multipass relaxation budgets the existing long
++             * forward instruction before deciding whether it is short:
++             * one extra byte for JMP, three for the 8086 Jcc expansion.
++             * This conservatively retains near forms at the 7Fh edge. */
+             if( CodeInfo->mem_type != MT_NEAR && CodeInfo->token != T_CALL &&
+-                ( addr >= SCHAR_MIN && addr <= SCHAR_MAX ) ) {
++                ( addr >= SCHAR_MIN && addr <= SCHAR_MAX ) &&
++                !( Options.tasm_compat && opndx->instr != T_SHORT &&
++                   ( ( CodeInfo->token == T_JMP && addr == SCHAR_MAX ) ||
++                     ( IS_JCC( CodeInfo->token ) && addr > SCHAR_MAX - 3 ) ) ) ) {
+                 CodeInfo->opnd[OPND1].type = OP_I8;
+             } else {
++                /* TASM JUMPS extends 8086 LOOP/JCXZ without changing
++                 * flags: LOOP $+4; JMP SHORT $+5; JMP NEAR target. */
++                if ( Options.tasm_compat && ModuleInfo.ljmp &&
++                     CodeInfo->Ofssize == USE16 && IS_XCX_BRANCH( CodeInfo->token ) &&
++                     CodeInfo->mem_type == MT_EMPTY && opndx->instr != T_SHORT ) {
++                    OutputCodeByte( CodeInfo->pinstr->opcode );
++                    OutputCodeByte( 2 );
++                    OutputCodeByte( 0xeb );
++                    OutputCodeByte( 3 );
++                    CodeInfo->token = T_JMP;
++                    CodeInfo->pinstr = &InstrTable[ IndexFromToken( T_JMP ) ];
++                    CodeInfo->opnd[OPND1].type = OP_I16;
++                    CodeInfo->opnd[OPND1].data32l = addr - 5;
++                    return( NOT_ERROR );
++                }
+                 if ( opndx->instr == T_SHORT || ( IS_XCX_BRANCH( CodeInfo->token ) ) ) {
+                     /* v2.06: added */
+                     if( CodeInfo->token == T_CALL ) {
+--- a/src/cmdline.c
++++ b/src/cmdline.c
+@@ -129,6 +129,7 @@
+     /* strict_masm_compat    */     FALSE,
+     /* masm_compat_gencode   */     FALSE,
+     /* masm8_proc_visibility */     FALSE,
++    /* tasm_compat           */     FALSE,
+ 
+     /* listif                */     FALSE,
+     /* list_generated_code   */     FALSE,
+@@ -722,6 +723,7 @@
+     { "Zli",    optofs( local_imports ), Set_True },
+ #endif
+     { "Zm",     optofs( masm51_compat ),      Set_True },
++    { "Zt",     optofs( tasm_compat ),        Set_True },
+     { "Zne",    optofs( strict_masm_compat ), Set_True },
+     { "Zp=#",   0,        Set_Zp },
+     { "zcm",    0,        Set_zcm },
+@@ -1154,4 +1156,3 @@
+     DebugMsg(("CmdLineFini exit\n" ));
+     return;
+ }
+-
+--- a/src/data.c
++++ b/src/data.c
+@@ -240,6 +240,8 @@
+ 
+     /* scan the STRUCT/UNION/RECORD's members */
+     for( f = symtype->e.structinfo->head; f != NULL; f = f->next ) {
++        if ( Options.tasm_compat && f->sym.total_size == 0 &&
++             !f->sym.type && f->ivalue[0] == NULLC ) continue;
+ 
+         DebugMsg1(("InitStructuredVar(%s) field=%s ofs=%" I32_SPEC "u total_size=%" I32_SPEC "u total_len=%" I32_SPEC "u value=>%s< >%s<\n",
+                   symtype->sym.name,
+@@ -660,7 +662,8 @@
+         const struct asym *tmp = type_sym;
+         /* v2.10: check if target type is a struct/union/record; if yes, it's an error. */
+         while ( tmp->type ) tmp = tmp->type;
+-        if ( tmp->typekind != TYPE_TYPEDEF ) {
++        if ( tmp->typekind != TYPE_TYPEDEF &&
++             !( Options.tasm_compat && tokenarray[i].token == T_QUESTION_MARK ) ) {
+             DebugMsg1(("data_item: error, type=%s needs literal, >%s<\n", type_sym->name, tokenarray[i].tokpos ));
+             return( EmitErr( STRUCTURE_IMPROPERLY_INITIALIZED, type_sym->name ) );
+         }
+@@ -1446,4 +1449,3 @@
+                CurrStruct ? CurrStruct->sym.offset : CurrSeg->sym.offset ));
+     return( NOT_ERROR );
+ }
+-
+--- a/src/equate.c
++++ b/src/equate.c
+@@ -366,6 +366,10 @@
+     /* if a literal follows, the equate MUST be(come) a text macro */
+     if ( tokenarray[2].token == T_STRING && tokenarray[2].string_delim == '<' )
+         return ( SetTextMacro( tokenarray, sym, name, NULL ) );
++    /* TASM preserves a quoted EQU as text, including short strings such
++     * as the four characters in '4.05'. */
++    if ( Options.tasm_compat && tokenarray[2].token == T_STRING && Token_Count == 3 )
++        return ( SetTextMacro( tokenarray, sym, name, tokenarray[2].tokpos ) );
+ 
+     if( sym == NULL ||
+        sym->state == SYM_UNDEFINED ||
+--- a/src/label.c
++++ b/src/label.c
+@@ -90,7 +90,7 @@
+      * trailing colon only [in ParseLine()].
+      */
+     if ( ( mem_type & MT_SPECIAL_MASK) == MT_ADDRESS ) {
+-        if ( SegAssumeTable[ASSUME_CS].error ) { /* CS assumed to ERROR? */
++        if ( SegAssumeTable[ASSUME_CS].error && !Options.tasm_compat ) { /* CS assumed to ERROR? */
+             DebugMsg(("CreateLabel: code label and CS assumed error\n" ));
+             EmitError( USE_OF_REGISTER_ASSUMED_TO_ERROR );
+             return( NULL );
+@@ -261,6 +261,19 @@
+         return( EmitErr( SYNTAX_ERROR_EX, tokenarray[i].tokpos ) ); /* v2.10: display tokpos */
+     }
+ 
++    /* A TASM structure LABEL names an alias at the current field offset,
++     * consumes no bytes, and remains visible in the listing. */
++    if ( Options.tasm_compat && CurrStruct ) {
++        if ( Parse_Pass == PASS_1 ) {
++            if ( !CreateStructField( -1, NULL, tokenarray[0].string_ptr,
++                                    ti.mem_type, ti.symtype, 0 ) ) return( ERROR );
++        } else {
++            CurrStruct->e.structinfo->tail = CurrStruct->e.structinfo->tail->next;
++        }
++        LstWrite( LSTTYPE_STRUCT, CurrStruct->sym.offset, NULL );
++        return( NOT_ERROR );
++    }
++
+     if ( ModuleInfo.list )
+         LstWrite( LSTTYPE_LABEL, 0, NULL );
+ 
+--- a/src/parser.c
++++ b/src/parser.c
+@@ -560,6 +560,9 @@
+     bit3_idx = 0;
+     rex = 0;
+ #endif
++    if ( Options.tasm_compat && CodeInfo->Ofssize == USE16 &&
++         !CodeInfo->prefix.adrsiz && CodeInfo->opnd[CurrOpnd].InsFixup == NULL )
++        CodeInfo->opnd[CurrOpnd].data32l = (int_16)CodeInfo->opnd[CurrOpnd].data32l;
+     if( CodeInfo->opnd[CurrOpnd].InsFixup != NULL ) { /* symbolic displacement given? */
+         mod_field = MOD_10;
+     } else if( CodeInfo->opnd[CurrOpnd].data32l == 0 ) { /* no displacement (or 0) */
+@@ -3027,6 +3030,18 @@
+ 
+     i = 0;
+ 
++    /* TASM's JUMPS is a source directive, not an instruction. */
++    if ( Options.tasm_compat && Token_Count == 1 &&
++         tokenarray[0].token == T_ID &&
++         _stricmp( tokenarray[0].string_ptr, "JUMPS" ) == 0 ) {
++        ModuleInfo.ljmp = TRUE;
++        LstWriteSrcLine();
++        return( NOT_ERROR );
++    }
++    if ( Options.tasm_compat && tokenarray[0].token == T_ID &&
++         _stricmp( tokenarray[0].string_ptr, "USES" ) == 0 )
++        return( TasmUses( tokenarray ) );
++
+     /* Does line start with a code label? */
+     if ( tokenarray[0].token == T_ID && ( tokenarray[1].token == T_COLON || tokenarray[1].token == T_DBL_COLON ) ) {
+         i = 2;
+@@ -3086,6 +3101,8 @@
+             if ( tokenarray[i].dirtype == DRT_DATADIR ) {
+                 return( data_dir( i, tokenarray, NULL ) );
+             }
++            if ( Options.tasm_compat && CurrStruct && tokenarray[i].tokval == T_LABEL )
++                return( LabelDirective( i, tokenarray ) );
+             dirflags = GetValueSp( tokenarray[i].tokval );
+             if( CurrStruct && ( dirflags & DF_NOSTRUC ) ) {
+                 return( EmitError( STATEMENT_NOT_ALLOWED_INSIDE_STRUCTURE_DEFINITION ) );
+@@ -3304,6 +3321,28 @@
+         return( EmitErr( SYNTAX_ERROR_EX, tokenarray[i].tokpos ) );
+     }
+ 
++    /* TASM folds LEA reg,absolute into the shorter MOV reg,OFFSET form. */
++    if ( Options.tasm_compat && CodeInfo.token == T_LEA && j == 2 &&
++         CodeInfo.Ofssize == USE16 && opndx[1].kind == EXPR_ADDR &&
++         opndx[1].base_reg == NULL && opndx[1].idx_reg == NULL ) {
++        CodeInfo.token = T_MOV;
++        CodeInfo.pinstr = &InstrTable[ IndexFromToken( T_MOV ) ];
++        opndx[1].indirect = FALSE;
++        opndx[1].instr = T_OFFSET;
++        opndx[1].mem_type = MT_NEAR;
++    }
++    /* TASM prefers AX's accumulator immediate opcode to the equal-size
++     * sign-extended 83 /digit form. Other registers still use 83. */
++    if ( Options.tasm_compat && j == 2 && opndx[0].kind == EXPR_REG &&
++         !opndx[0].indirect && opndx[0].base_reg->tokval == T_AX &&
++         opndx[1].kind == EXPR_CONST && !opndx[1].explicit &&
++         ( CodeInfo.token == T_ADD || CodeInfo.token == T_ADC ||
++           CodeInfo.token == T_SUB || CodeInfo.token == T_SBB ||
++           CodeInfo.token == T_AND || CodeInfo.token == T_OR ||
++           CodeInfo.token == T_XOR || CodeInfo.token == T_CMP ) ) {
++        opndx[1].mem_type = MT_WORD;
++        opndx[1].explicit = TRUE;
++    }
+     for ( CurrOpnd = 0; CurrOpnd < j && CurrOpnd < MAX_OPND; CurrOpnd++ ) {
+ 
+         Frame_Type = FRAME_NONE;
+@@ -3566,4 +3605,3 @@
+     }
+     return;
+ }
+-
+--- a/src/proc.c
++++ b/src/proc.c
+@@ -431,6 +431,29 @@
+  * type:  qualified type [simple type, structured type, ptr to simple/structured type]
+  */
+ 
++/* TASM places USES on its own line with comma-separated registers. */
++ret_code TasmUses( struct asm_tok tokenarray[] )
++{
++    int i, count = 0;
++    uint_16 *registers;
++    if ( !CurrProc || !( ProcStatus & PRST_PROLOGUE_NOT_DONE ) )
++        return( EmitError( PROC_MACRO_MUST_PRECEDE_LOCAL ) );
++    if ( Parse_Pass != PASS_1 ) return( NOT_ERROR );
++    for ( i = 1; i < Token_Count; i += 2 ) {
++        if ( tokenarray[i].token != T_REG || SizeFromRegister( tokenarray[i].tokval ) != 2 ||
++             ( tokenarray[i+1].token != T_COMMA && tokenarray[i+1].token != T_FINAL ) )
++            return( EmitErr( SYNTAX_ERROR_EX, tokenarray[i].string_ptr ) );
++        count++;
++    }
++    if ( !count || CurrProc->e.procinfo->regslist ) return( ERROR );
++    registers = LclAlloc( ( count + 1 ) * sizeof( uint_16 ) );
++    CurrProc->e.procinfo->regslist = registers;
++    *registers++ = count;
++    for ( i = 1; i < Token_Count; i += 2 ) *registers++ = tokenarray[i].tokval;
++    LstWriteSrcLine();
++    return( NOT_ERROR );
++}
++
+ ret_code LocalDir( int i, struct asm_tok tokenarray[] )
+ /*****************************************************/
+ {
+@@ -568,6 +591,17 @@
+                        local->sym.mem_type,
+                        ti.symtype ? ti.symtype->name : "NULL",
+                        ti.size, local->sym.total_length ));
++        }
++        if ( Options.tasm_compat && tokenarray[i].token == T_COLON ) {
++            struct expr count;
++            int end;
++            i++;
++            for ( end = i; end < Token_Count && tokenarray[end].token != T_COMMA; end++ );
++            if ( EvalOperand( &i, tokenarray, end, &count, 0 ) == ERROR ) return( ERROR );
++            if ( count.kind != EXPR_CONST || count.value < 0 || count.hvalue )
++                return( EmitError( CONSTANT_EXPECTED ) );
++            local->sym.total_length = count.value;
++            local->sym.isarray = TRUE;
+         }
+         local->sym.is_ptr  = ti.is_ptr;
+         local->sym.isfar   = ti.is_far;
+@@ -1063,6 +1097,8 @@
+     }
+ #endif
+ 
++    /* TASM also accepts PROC C NEAR (language before distance). */
++    if ( Options.tasm_compat ) GetLangType( &i, tokenarray, &langtype );
+     /* 1. attribute is <distance> */
+     if ( tokenarray[i].token == T_STYPE &&
+         tokenarray[i].tokval >= T_NEAR && tokenarray[i].tokval <= T_FAR32 ) {
+@@ -2486,7 +2522,7 @@
+          * it will generate short instructions up to a size of 128.
+          * with SUB, short instructions work up to 127 only.
+          */
+-        if ( Options.masm_compat_gencode || info->localsize == 128 )
++        if ( ( Options.masm_compat_gencode && !Options.tasm_compat ) || info->localsize == 128 )
+             AddLineQueueX( "add %r, %d", rstackreg, NUMQUAL - info->localsize );
+         else
+             AddLineQueueX( "sub %r, %d", rstackreg, NUMQUAL info->localsize );
+@@ -2610,6 +2646,11 @@
+     for( curr = info->locallist; curr; curr = curr->nextlocal ) {
+         uint_32 itemsize = ( curr->sym.total_size == 0 ? 0 : curr->sym.total_size / curr->sym.total_length );
+         info->localsize += curr->sym.total_size;
++        if ( Options.tasm_compat && ModuleInfo.Ofssize == USE16 ) {
++            info->localsize = ROUND_UP( info->localsize, 2 );
++            curr->sym.offset = -info->localsize;
++            continue;
++        }
+         if ( itemsize > align )
+             info->localsize = ROUND_UP( info->localsize, align );
+         else if ( itemsize ) /* v2.04: skip if size == 0 */

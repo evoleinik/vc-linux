@@ -12,7 +12,8 @@ import tempfile
 
 
 PROGRAMS = ("gwbasic", "bootlogo", "rogue", "vz", "kermit",
-            "command", "edlin", "debug", "find", "more", "sort", "fc")
+            "command", "edlin", "debug", "find", "more", "sort", "fc",
+            "vc405", "vcsetup405")
 GENERATED_NAME = re.compile(r"(?:" + "|".join(PROGRAMS) + r")(?:\.[0-9a-f]{12})?\.wasm")
 
 

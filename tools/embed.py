@@ -2,11 +2,15 @@
 
 --web-only=NAME=PATH puts a startup file in the browser's packed table only.
 It neither installs nor adds the file's bytes to the native binary.
+--web-lazy=NAME=PATH retains the native bytes but makes a browser metadata-only
+file. --web-only-lazy does the same without a native installation. Their exact
+content-derived URLs go in C; the sibling .web.json manifest lets web_files.py
+publish the bytes separately, with no dependency on the page's version hash.
 
 Writes the `embedded_files` table declared in runtime/rt.h. Native arrays stay
 unchanged. The browser reconstructs VC from its already-linked, unrelocated
-image and exact MZ header/trailer, and unpacks the other files before any DOS
-installation/EXEC comparison. Nothing is removed, deferred, or network-fetched.
+image and exact MZ header/trailer, and unpacks the explicitly eager files before
+installation. Lazy references become available through the DOS open/EXEC path.
 
 Before raw LZMA1, a reversible byte filter turns each E8/E9-following 16-bit
 word into an absolute stream offset modulo 65536. This is compression, not
@@ -17,6 +21,8 @@ An Adler-32 over the original bytes catches accidental corruption; it is not
 an authenticity mechanism.
 """
 from pathlib import Path
+from hashlib import sha256
+import json
 import lzma
 import sys
 import zlib
@@ -26,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from translator.image import load_image
+from tools.web_modules import update
 
 
 WEB_LZMA_FILTER = {
@@ -84,21 +91,36 @@ def main() -> None:
     out, pairs = sys.argv[1], sys.argv[2:]
     entries = []
     payload = bytearray()
+    lazy_files = []
+    names = set()
     # Validate every input before replacing a previously generated source.
     for pair in pairs:
-        web_only = pair.startswith("--web-only=")
-        if web_only:
-            pair = pair.removeprefix("--web-only=")
+        web_only = pair.startswith(("--web-only=", "--web-only-lazy="))
+        lazy = pair.startswith(("--web-lazy=", "--web-only-lazy="))
+        if web_only or lazy:
+            pair = pair.split("=", 1)[1]
         name, path = pair.split("=", 1)
         if web_only and name in ("VC.COM", "VC.OVL"):
             raise ValueError("VC's built-in files must exist in both builds")
+        if lazy and name in ("VC.COM", "VC.OVL", "VC.INI", "VC.EXT", "VCEDIT.EXT"):
+            raise ValueError(f"{name}: VC's startup files must remain eager")
+        if name in names or not name or name.startswith("/") or any(
+                part in ("", ".", "..") for part in name.split("/")):
+            raise ValueError(f"Duplicate or unsafe embedded name: {name}")
+        names.add(name)
         data = Path(path).read_bytes()
         parts = vc_parts(name, path, data) if name in ("VC.COM", "VC.OVL") else None
-        entries.append((name, data, parts, len(payload), web_only))
-        if parts is None:
+        entries.append((name, data, parts, len(payload), web_only, lazy))
+        if lazy:
+            digest = sha256(data).hexdigest()
+            lazy_files.append({"name": name, "source": str(Path(path).resolve()),
+                               "asset": f"file.{digest[:12]}.bin", "sha256": digest,
+                               "size": len(data), "checksum": zlib.adler32(data)})
+        elif parts is None:
             payload.extend(data)
 
     lines = ['#include "rt.h"', '#ifdef __EMSCRIPTEN__', '#include "embed_lzma.h"',
+             '#include "web_files.h"',
              '#include <stdlib.h>', '#include <string.h>', '#endif', ""]
     table = []
     initialize = []
@@ -117,8 +139,13 @@ def main() -> None:
             "  if (embed_adler32(embedded_unpacked, sizeof embedded_unpacked) !=",
             f"          {zlib.adler32(payload)}u) abort();",
         ]
-    for i, (name, data, parts, offset, web_only) in enumerate(entries):
-        if parts is not None:
+    for i, (name, data, parts, offset, web_only, lazy) in enumerate(entries):
+        if lazy:
+            lines += ["#ifdef __EMSCRIPTEN__", f"#define f{i} NULL"]
+            if not web_only:
+                lines += ["#else", *array(f"f{i}", data)]
+            lines.append("#endif")
+        elif parts is not None:
             image, prefix, suffix, size = parts
             lines += ["#ifdef __EMSCRIPTEN__", f"static uint8_t f{i}[{len(data)}];"]
             if prefix:
@@ -151,15 +178,25 @@ def main() -> None:
                 lines.append("#endif")
         if web_only:
             table.append("#ifdef __EMSCRIPTEN__")
-        table.append(f'  {{"{name}", f{i}, {len(data)}}},')
+        table.append(f'  {{{json.dumps(name, ensure_ascii=False)}, f{i}, {len(data)}}},')
         if web_only:
             table.append("#endif")
     lines += ["", "const EmbeddedFile embedded_files[] = {", *table, "};"]
     lines.append("const int embedded_file_count = sizeof embedded_files / sizeof embedded_files[0];")
+    lines += ["", "#ifdef __EMSCRIPTEN__", "WebFileReference web_file_references[] = {"]
+    for entry in lazy_files:
+        lines.append(f'  {{{json.dumps(entry["name"], ensure_ascii=False)}, '
+                     f'"{entry["asset"]}", "{entry["sha256"]}", '
+                     f'{entry["size"]}u, {entry["checksum"]}u, NULL}},')
+    if not lazy_files:
+        lines.append("  {0},")
+    lines += ["};", f"const size_t web_file_reference_count = {len(lazy_files)}u;", "#endif"]
     lines += ["", "/* Called before installation and before any DOS EXEC byte match. */",
               "void embedded_files_init(void) {", "#ifdef __EMSCRIPTEN__",
               *initialize, "#endif", "}"]
-    Path(out).write_text("\n".join(lines) + "\n")
+    update(Path(out).with_suffix(".web.json"),
+           (json.dumps({"format": 1, "files": lazy_files}, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    update(Path(out), ("\n".join(lines) + "\n").encode("utf-8"))
 
 
 if __name__ == "__main__":

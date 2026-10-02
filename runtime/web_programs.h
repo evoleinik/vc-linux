@@ -9,6 +9,7 @@
 enum {
     WEB_VC_COM, WEB_VC_OVL, WEB_GWBASIC, WEB_BOOTLOGO, WEB_ROGUE, WEB_VZ, WEB_KERMIT,
     WEB_COMMAND, WEB_EDLIN, WEB_DEBUG, WEB_FIND, WEB_MORE, WEB_SORT, WEB_FC,
+    WEB_VC405, WEB_VCSETUP405,
     WEB_IMAGE_COUNT
 };
 const char *web_image_filename(size_t index);
@@ -16,5 +17,10 @@ const char *web_image_filename(size_t index);
  * May suspend the dispatcher's direct Asyncify chain; never Image.run. */
 int web_load_image(size_t index, const Image **out);
 int web_image_is_vz(const Image *image);
+
+/* Shared bounded transport for immutable modules and lazy DOS file contents.
+ * Only call on the dispatcher's direct Asyncify chain, never Image.run.
+ * File references require their full SHA-256; modules retain NULL. */
+int web_fetch_asset(const char *name, const char *path, const char *sha256);
 
 #endif

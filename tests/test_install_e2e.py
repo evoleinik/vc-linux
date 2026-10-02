@@ -17,7 +17,7 @@ from test_gwbasic_e2e import ROOT, VcSession, panels, running_vc, until
 
 MSDOS_PROGRAMS = ("COMMAND.COM", "EDLIN.COM", "DEBUG.COM", "FIND.EXE", "MORE.COM", "SORT.EXE", "FC.EXE")
 PROGRAMS = ("VC.COM", "VC.OVL", "GWBASIC.EXE", "BOOTLOGO.COM", "ROGUE.EXE", "VZ.COM", "KERMIT.EXE",
-            "DOS2.COM", *(f"DOS2/{name}" for name in MSDOS_PROGRAMS))
+            "VC405.COM", "VC405/VCSETUP.COM", "DOS2.COM", *(f"DOS2/{name}" for name in MSDOS_PROGRAMS))
 
 
 @contextmanager
@@ -37,6 +37,15 @@ def test_install_bootlogo_uses_its_own_name():
         assert (config / "BOOTLOGO.COM").is_file(), "bootLogo needs its own DOS PATH name"
         assert (config / "BOOTLOGO.COM").read_bytes() == (ROOT / "build/bootlogo/LOGO.COM").read_bytes()
         assert not (config / "LOGO.COM").exists(), "the bundled interpreter must not shadow host logo"
+
+
+def test_install_vc405_is_separate_from_current_vc():
+    with running_vc() as (_, work, config):
+        assert (config / "VC405.COM").read_bytes() == (ROOT / "build/vc405/VC.COM").read_bytes()
+        assert (config / "VC405/VCSETUP.COM").read_bytes() == (ROOT / "build/vc405/VCSETUP.COM").read_bytes()
+        assert (config / "VC.COM").read_bytes() == (ROOT / "build/VC.COM").read_bytes()
+        assert not (config / "VCSETUP.COM").exists(), "only vc405 may add a new Linux command name"
+        assert not (work / "VC.INI").exists()
 
 
 def test_install_msdos_programs_in_config_without_home_writes():
@@ -317,6 +326,16 @@ def test_web_demo_installs_source_built_dos_shell_and_utilities(tmp_path):
     guide = (tmp_path / "DOS/DOS.TXT").read_text()
     assert all(word in guide for word in (*MSDOS_PROGRAMS, "Microsoft", "MIT", "github.com/microsoft/MS-DOS"))
     assert "1." in guide and "2." in guide and "3." in guide
+
+
+def test_web_and_door_demo_install_vc405_in_its_own_directory(tmp_path):
+    result = web_demo(tmp_path)
+    assert result.returncode == 0, result.stderr
+    for name in ("VC.COM", "VCSETUP.COM"):
+        assert (tmp_path / "VC405" / name).read_bytes() == (ROOT / "build/vc405" / name).read_bytes()
+        assert not (tmp_path / name).exists(), "old VC images must not replace the modern shell's files"
+    assert (tmp_path / "VC405/LICENSE.TXT").read_bytes() == (ROOT / "asm405/LICENSE.TXT").read_bytes()
+    assert not (tmp_path / "VC405/VC.INI").exists(), "unmodified 4.05 creates its own default settings"
 
 
 def test_web_demo_installs_vz_and_all_definitions_alongside_rogue(tmp_path):

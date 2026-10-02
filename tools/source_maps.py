@@ -35,6 +35,7 @@ from translator.linked import build_linked_layout, parse_map
 from translator.listing import Listing, parse_listing
 from translator.nasm import build_nasm_layout, parse_nasm_listing
 from translator.supplement import build_gwbasic_graphics_layout
+from translator.vc405 import build_vc405_layout
 
 
 def physical_lines(data: bytes) -> list[bytes]:
@@ -120,6 +121,24 @@ class Sources:
             if len(lines) != len(physical_lines(data.rstrip(b"\x1a"))):
                 raise ValueError(f"{original}: VZ preprocessing changed physical line count")
             source = Source(original, lines, list(range(1, len(lines) + 1)))
+        elif self.dialect == "vc405":
+            # JWasm prints TASM backslash continuations as one logical row.
+            # Reproduce only that documented join, retaining the first actual
+            # physical line as provenance; the vendor bytes stay untouched.
+            physical = physical_lines(data)
+            lines, numbers = [], []
+            index = 0
+            while index < len(physical):
+                number, line = index + 1, physical[index]
+                while line.rstrip().endswith(b"\\") and b";" not in line:
+                    index += 1
+                    if index == len(physical):
+                        raise ValueError(f"{original}:{number}: unterminated source continuation")
+                    line = line.rstrip()[:-1] + b" " + physical[index].lstrip()
+                lines.append(line)
+                numbers.append(number)
+                index += 1
+            source = Source(original, lines, numbers)
         else:
             lines = physical_lines(data)
             source = Source(original, lines, list(range(1, len(lines) + 1)))
@@ -151,6 +170,10 @@ def jwasm_origins(path: Path, sources: Sources, listing: Listing | None = None) 
     prologue: Origin | None = None
     pending: Frame | None = None
     text_macros: dict[bytes, bytes] = {}
+    forced_options = set()
+    if sources.dialect == "vc405":
+        forced_options = {line.rstrip() for line in physical_lines(
+            (ROOT / "tools/vc405-options.inc").read_bytes())}
     if sources.dialect == "basic":
         text_macros[b"OEMVER"] = (sources.original / "UPSTREAM").read_bytes().split()[1]
 
@@ -200,6 +223,10 @@ def jwasm_origins(path: Path, sources: Sources, listing: Listing | None = None) 
                 origins[lineno] = origin
             continue
         included = raw[30:31] == b"C"
+        # -Fi supplies only assembler options before the original VC source.
+        # Match those exact tool-owned lines, never assign them a vendor line.
+        if included and not stack[0].cursor and source in forced_options:
+            continue
         if pending is not None:
             if included and source == pending.source.lines[0].rstrip():
                 stack.append(pending)
@@ -320,6 +347,15 @@ def single_vc(build: Path, destination: Path, name: str) -> dict:
     origins = jwasm_origins(path, Sources(ROOT / "asm"), listing)
     layout = build_layout(load_image(build / name), listing)
     return assembly_map(name, layout, lambda record: origins.get(record.line.lineno), destination)
+
+
+def single_vc405(build: Path, destination: Path, name: str) -> dict:
+    image_name = "VC405.COM" if name == "VC.COM" else "VCSETUP.COM"
+    path = build / "vc405" / (name + ".lst")
+    listing = parse_listing(path, physical_lines=True)
+    origins = jwasm_origins(path, Sources(ROOT / "asm405", dialect="vc405"), listing)
+    layout = build_vc405_layout(load_image(build / "vc405" / name), listing)
+    return assembly_map(image_name, layout, lambda record: origins.get(record.line.lineno), destination)
 
 
 def linked_assembly(build: Path, destination: Path, dialect: str) -> dict:
@@ -447,7 +483,9 @@ def publish(build: Path, destination: Path, work: Path) -> str:
                 ("GWBASIC.EXE", lambda: linked_assembly(build, destination, "basic")),
                 ("LOGO.COM", lambda: bootlogo(build, destination)),
                 ("ROGUE.EXE", lambda: rogue(build)),
-                ("VZ.COM", lambda: linked_assembly(build, destination, "vz")))
+                ("VZ.COM", lambda: linked_assembly(build, destination, "vz")),
+                ("VC405.COM", lambda: single_vc405(build, destination, "VC.COM")),
+                ("VCSETUP.COM", lambda: single_vc405(build, destination, "VCSETUP.COM")))
     for name, builder in builders:
         mapping = builder()
         stem = "source-map-" + name.lower().replace(".", "-")

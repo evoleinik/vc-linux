@@ -24,6 +24,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include "web_programs.h"
+#include "web_files.h"
 #endif
 
 #define DOS_SEG     0x0070u   /* DOS data */
@@ -39,6 +40,10 @@ static uint8_t alloc_strategy;
 static uint16_t last_retcode;
 static uint8_t break_flag;
 static int door_mode;
+/* Only these two installed paths are VC 4.99's internal reloads. A different
+ * directory may legitimately contain another byte-matched VC.COM. */
+static char builtin_dos[2][128], builtin_short[2][128], builtin_host[2][4096];
+static char vc405_directory[128];
 
 void dos_core_set_door(int enabled) { door_mode = !!enabled; }
 
@@ -51,6 +56,7 @@ typedef struct {
     Cpu parent;        /* parent registers at its EXEC call */
     uint16_t dta_seg, dta_off;
     char temp_dir[32]; /* Private, short VZ swap directory; not guest memory. */
+    char vc_startup[128]; /* DOS2 loader finishes PSP/env after AH55. */
 } Proc;
 static Proc procs[8];
 static int nprocs;
@@ -255,6 +261,9 @@ static uint16_t image_version(const Image *img) {
 /* Build an environment block: the strings, an empty string, the word 1, then
  * the program's DOS path. Returns its segment, or 0 when out of memory. */
 static uint16_t make_env(const char *strings, size_t slen, const char *prog, uint16_t owner) {
+    /* With no variables, the strings list still contributes one NUL before
+     * the separator. VC scans for two NULs before the executable trailer. */
+    if (!slen) { strings = ""; slen = 1; }
     size_t plen = strlen(prog) + 1;
     size_t total = slen + 1 + 2 + plen;
     uint16_t seg, largest;
@@ -455,7 +464,7 @@ static int load_image(const Image *img, const char *envbuf, size_t elen, const u
 static const Image *const images[] = {
     &image_vc_com, &image_vc_ovl, &image_gwbasic, &image_bootlogo, &image_rogue, &image_vz,
     &image_kermit, &image_command, &image_edlin, &image_debug, &image_find, &image_more,
-    &image_sort, &image_fc
+    &image_sort, &image_fc, &image_vc405, &image_vcsetup405
 };
 #define IMAGE_COUNT (sizeof images / sizeof images[0])
 #endif
@@ -468,7 +477,8 @@ static const EmbeddedFile *image_file(size_t index) {
     const char *name = web_image_filename(index);
 #else
     const Image *img = images[index];
-    const char *name = img == &image_bootlogo ? "BOOTLOGO.COM" : img->name;
+    const char *name = img == &image_bootlogo ? "BOOTLOGO.COM" :
+                       img == &image_vcsetup405 ? "VC405/VCSETUP.COM" : img->name;
 #endif
     for (int i = 0; i < embedded_file_count; i++)
         if (!strcmp(embedded_files[i].name, name)) return &embedded_files[i];
@@ -510,7 +520,13 @@ static int known_image(const char *host, const Image **out) {
     if (!ferror(file) && got == size && extra == EOF)
         for (size_t i = 0; i < IMAGE_COUNT; i++) {
             const EmbeddedFile *f = image_file(i);
-            if (f && size == f->size && !memcmp(bytes, f->data, size)) {
+            if (!f || size != f->size) continue;
+            const uint8_t *reference = f->data;
+#ifdef __EMSCRIPTEN__
+            int reference_error = web_files_reference(f, &reference);
+            if (reference_error) { err = reference_error; break; }
+#endif
+            if (!memcmp(bytes, reference, size)) {
                 matched = i;
                 err = 0;
                 break;
@@ -738,6 +754,25 @@ static int short_dos_path(const char *path, char out[128]) {
     return err;
 }
 
+static const Image *builtin_image(const char *path) {
+    const char *base = path;
+    for (const char *p = path; *p; ++p)
+        if (*p == ':' || *p == '\\' || *p == '/') base = p + 1;
+    int which = !strcasecmp(base, "VC.COM") ? 0 : !strcasecmp(base, "VC.OVL") ? 1 : -1;
+    if (which < 0) return NULL;
+    char normalized[260];
+    size_t length = strlen(path);
+    if (length >= sizeof normalized) return NULL;
+    for (size_t i = 0; i <= length; ++i) normalized[i] = path[i] == '/' ? '\\' : path[i];
+    int match = (builtin_dos[which][0] && !strcasecmp(normalized, builtin_dos[which])) ||
+                (builtin_short[which][0] && !strcasecmp(normalized, builtin_short[which]));
+    if (!match && builtin_host[which][0]) {
+        char host[4096];
+        match = !dos_path_host(path, host, sizeof host) && !strcmp(host, builtin_host[which]);
+    }
+    return match ? (which ? &image_vc_ovl : &image_vc_com) : NULL;
+}
+
 static void environment_value(const char *name, char *out, size_t cap) {
     out[0] = 0;
     uint16_t env = rd16(cur_psp, 0x2C);
@@ -766,9 +801,13 @@ static int program_candidate(const char *path, char *host, size_t cap) {
     const char *base = path;
     for (const char *p = path; *p; p++)
         if (*p == ':' || *p == '\\' || *p == '/') base = p + 1;
-    /* These names belong to the native VC itself, not command lookup.
-     * Its resident code still loads them through direct DOS EXEC. */
-    if (!strcasecmp(base, "VC.COM") || !strcasecmp(base, "VC.OVL")) return 0;
+    /* Native command lookup has always left these basenames to the host,
+     * even when cwd contains another installation's identical VC.COM.
+     * Browser/door still allow other copies through byte-matched lookup. */
+#ifndef __EMSCRIPTEN__
+    if (!door_mode && (!strcasecmp(base, "VC.COM") || !strcasecmp(base, "VC.OVL"))) return 0;
+#endif
+    if (builtin_image(path)) return 0;
     if (dos_path_host(path, host, cap)) {
         int err = file_error();
         return err == 2 || err == 3 ? 0 : -err;
@@ -958,6 +997,14 @@ static int dos_program_command(const uint8_t *cmd, size_t len) {
     if (err && err != 11) return command_error(err);
 #endif
     if (err) return association ? command_error(err) : -1;
+#ifndef __EMSCRIPTEN__
+    /* VC 4.05 adds exactly one native command. Newly recognized old/setup
+     * bytes under any other typed name must retain their host meaning.
+     * Direct DOS EXEC (including COMMAND's loader) still matches by bytes. */
+    if (!door_mode && (img == &image_vc405 || img == &image_vcsetup405) &&
+        strcasecmp(word, "vc405"))
+        return association ? command_error(11) : -1;
+#endif
     if (association) {
         /* A shipped association names its interpreter, not any translation.
          * A renamed VC image would parse the file tail as commands itself. */
@@ -1378,6 +1425,39 @@ static int command_environment(char *env, size_t *length, size_t cap, const char
     return 0;
 }
 
+static int is_vc405_image(const Image *img) {
+    return !strcmp(img->name, "VC405.COM") || !strcmp(img->name, "VCSETUP.COM");
+}
+
+/* Both versions interpret VC= as their settings home. Give 4.05 its private
+ * directory (VC.ASM:MainPth, VCSETUP.ASM:Init10), but never pass that setting
+ * into a 4.99 child: the two versions' VC.INI formats are incompatible.
+ * Work only on the child's copied strings, including duplicate/cased keys. */
+static int vc_environment(const Image *img, char *env, size_t *length, size_t cap) {
+    size_t read = 0, used = 0;
+    while (read < *length) {
+        const char *end = memchr(env + read, 0, *length - read);
+        if (!end) return 8;
+        size_t size = (size_t)(end - (env + read)) + 1;
+        if (strncasecmp(env + read, "VC=", 3)) {
+            memmove(env + used, env + read, size);
+            used += size;
+        }
+        read += size;
+    }
+    *length = used;
+    if (img == &image_vc_com) return 0;
+    char directory[128];
+    int err = short_dos_path(vc405_directory, directory);
+    if (err) return err;
+    /* MainPth has LenPath=68 and reserves two bytes for a separator/NUL. */
+    if (strlen(directory) > 65) return 3;
+    int size = snprintf(env + used, cap - used, "VC=%s", directory);
+    if (size < 0 || (size_t)size >= cap - used) return 8;
+    *length = used + (size_t)size + 1;
+    return 0;
+}
+
 static int start_child(const Image *img, const char *dos_prog, const uint8_t *tail, uint16_t envseg) {
     if (nprocs == (int)(sizeof procs / sizeof procs[0])) return 8;
     char short_program[128];
@@ -1397,9 +1477,15 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
         dos_prog = short_program;
         tail = short_tail;
     }
+    if (is_vc405_image(img)) {
+        int err = short_dos_path(dos_prog, short_program);
+        if (err || strlen(short_program) >= 68) return err ? err : 3;
+        dos_prog = short_program;
+    }
     rt_log("load %s: translation %s", dos_prog, img->name);
     Proc *p = &procs[nprocs];
     p->temp_dir[0] = 0;
+    p->vc_startup[0] = 0;
     const Image *parent_image = nprocs ? procs[nprocs - 1].image : &image_vc_com;
     p->machine = rt_save_process_state(parent_image);
     if (!p->machine) {
@@ -1418,6 +1504,8 @@ static int start_child(const Image *img, const char *dos_prog, const uint8_t *ta
     size_t elen = env_strings(envseg ? envseg : rd16(cur_psp, 0x2C), envbuf, sizeof envbuf);
     int err = !strcmp(img->name, "COMMAND.COM") ?
         command_environment(envbuf, &elen, sizeof envbuf, dos_prog) : 0;
+    if (!err && (is_vc405_image(img) || img == &image_vc_com))
+        err = vc_environment(img, envbuf, &elen, sizeof envbuf);
     if (!err && is_vz_image(img)) err = vz_environment(envbuf, &elen, sizeof envbuf, p);
     if (!err) err = load_image(img, envbuf, elen, tail, dos_prog, parent_psp, ret_cs, ret_ip);
     if (err) {
@@ -1492,6 +1580,14 @@ static int adopt_dos2_child(uint16_t child) {
         else loadseg = high;
     }
     if (nprocs == (int)(sizeof procs / sizeof procs[0])) err = 8;
+    char vc_program[128] = {0};
+    if (!err && (is_vc405_image(img) || img == &image_vc_com)) {
+        Cpu caller = dos2_saved_frame(cur_psp);
+        char program[260];
+        get_str(caller.ds, caller.d.x, program, sizeof program);
+        err = short_dos_path(program, vc_program);
+        if (!err && is_vc405_image(img) && strlen(vc_program) >= 68) err = 3;
+    }
     RtProcessState *machine = NULL;
     const Image *parent_image = nprocs ? procs[nprocs - 1].image : loader;
     if (!err && !(machine = rt_save_process_state(parent_image))) err = 8;
@@ -1515,6 +1611,7 @@ static int adopt_dos2_child(uint16_t child) {
     Proc *p = &procs[nprocs++];
     memset(p, 0, sizeof *p);
     p->child = child; p->image = img; p->machine = machine;
+    memcpy(p->vc_startup, vc_program, sizeof vc_program);
     p->parent = dos2_saved_frame(cur_psp);
     p->break_vector = lin(vec_seg(0x1B), vec_off(0x1B));
     get_dta(&p->dta_seg, &p->dta_off);
@@ -1575,11 +1672,7 @@ static void do_exec(void) {
     /* These two images are vc itself. In particular, VC.COM reloads VC.OVL
      * after every command, even if another vc replaced its installation or
      * the config directory no longer exists. Do not consult the disk. */
-    const char *base = command_path;
-    for (const char *p = command_path; *p; p++)
-        if (*p == '\\' || *p == ':') base = p + 1;
-    const Image *img = !strcasecmp(base, "VC.COM") ? &image_vc_com :
-                       !strcasecmp(base, "VC.OVL") ? &image_vc_ovl : NULL;
+    const Image *img = builtin_image(command_path);
     int err = 0;
     if (!img) {
         char host[4096];
@@ -1698,6 +1791,49 @@ static void abort_child(Proc *p, uint8_t code, uint8_t how) {
     rt_finish_process_state(machine, 1);
 }
 
+/* MS-DOS 2's own EXEC copies only environment strings, without the DOS 3+
+ * executable trailer VC needs, and writes PSP:2Ch after AH55. Wait until
+ * the first DOS call from the actual child, then replace only its copy.
+ * Normal native EXEC already prepared this environment in start_child. */
+static int finish_vc_environment(void) {
+    Proc *p = nprocs ? &procs[nprocs - 1] : NULL;
+    if (!p || !p->vc_startup[0] || cur_psp != p->child) return 0;
+    uint16_t ip = rd16(cpu.ss, cpu.sp), cs = rd16(cpu.ss, (uint16_t)(cpu.sp + 2));
+    if (rt_image_return("COMMAND.COM", cs, ip)) return 0;
+    static char envbuf[32768];
+    uint16_t old_env = rd16(cur_psp, 0x2C);
+    size_t length = env_strings(old_env, envbuf, sizeof envbuf);
+    int err = vc_environment(p->image, envbuf, &length, sizeof envbuf);
+    uint16_t env = 0;
+    if (!err) env = make_env(envbuf, length, p->vc_startup, cur_psp);
+    if (!err && !env) {
+        /* A COM owns all remaining DOS memory. Return enough of its high
+         * allocation for the new environment while retaining its full
+         * 64 KiB segment/stack, and keep the public PSP bound accurate. */
+        uint16_t size = mcb_size((uint16_t)(cur_psp - 1)), largest;
+        size_t paras = ((length ? length : 1) + 4 + strlen(p->vc_startup) + 15) / 16;
+        if (size > 0x1000u + paras + 1 &&
+            !mem_resize(cur_psp, (uint16_t)(size - paras - 1), &largest)) {
+            wr16(cur_psp, 2, (uint16_t)(cur_psp + mcb_size((uint16_t)(cur_psp - 1))));
+            env = make_env(envbuf, length, p->vc_startup, cur_psp);
+        }
+        if (!env) err = 8;
+    }
+    p->vc_startup[0] = 0;
+    if (err) {
+        char message[96];
+        int n = snprintf(message, sizeof message,
+                         "\r\nCannot prepare VC environment (DOS error %d).\r\n", err);
+        con_write((const uint8_t *)message, (size_t)n);
+        term_render();
+        abort_child(p, (uint8_t)err, 0);
+        return 1;
+    }
+    wr16(cur_psp, 0x2C, env);
+    if (old_env && mcb_owner((uint16_t)(old_env - 1)) == cur_psp) mem_free(old_env);
+    return 0;
+}
+
 int dos_abort_untranslated(void) {
     Proc *p = abortable_child();
     if (!p) return 0;
@@ -1759,6 +1895,10 @@ static void init_dos_data(void) {
 }
 
 void dos_core_init(void) {
+    memset(builtin_dos, 0, sizeof builtin_dos);
+    memset(builtin_short, 0, sizeof builtin_short);
+    memset(builtin_host, 0, sizeof builtin_host);
+    vc405_directory[0] = 0;
     while (psp_copies) {
         PspCopy *copy = psp_copies;
         psp_copies = copy->next;
@@ -1785,6 +1925,7 @@ int dos_run_psp(void) {
 /* ---- INT 21h -------------------------------------------------------------- */
 
 int dos_core_int21(void) {
+    if (finish_vc_environment()) return 1;
     uint16_t seg, largest, maxp;
     int err;
     switch (cpu.a.h) {
@@ -1986,6 +2127,22 @@ static int start_first(const Image *image, const char *dos_prog,
     char *slash = strrchr(program_dir, '\\');
     if (slash) slash[1] = 0;
     else strcpy(program_dir, "C:\\");
+    if (image == &image_vc_com) {
+        const char *names[] = {"VC.COM", "VC.OVL"};
+        for (int i = 0; i < 2; ++i) {
+            int length = snprintf(builtin_dos[i], sizeof builtin_dos[i], "%s%s", program_dir, names[i]);
+            if (length < 0 || (size_t)length >= sizeof builtin_dos[i]) return 3;
+            if (short_dos_path(builtin_dos[i], builtin_short[i])) builtin_short[i][0] = 0;
+            if (dos_path_host(builtin_dos[i], builtin_host[i], sizeof builtin_host[i])) builtin_host[i][0] = 0;
+        }
+    }
+#ifdef __EMSCRIPTEN__
+    strcpy(vc405_directory, "H:\\VC405");
+#else
+    int vc405_length = snprintf(vc405_directory, sizeof vc405_directory,
+                               door_mode ? "H:\\VC405" : "%sVC405", program_dir);
+    if (vc405_length < 0 || (size_t)vc405_length >= sizeof vc405_directory) return 3;
+#endif
 #ifdef __EMSCRIPTEN__
     n += (size_t)snprintf(env + n, sizeof env - n, "PATH=H:\\;H:\\DOS;H:\\GAMES;%s;C:\\", program_dir) + 1;
 #else
@@ -2000,6 +2157,10 @@ static int start_first(const Image *image, const char *dos_prog,
 #endif
     n += (size_t)snprintf(env + n, sizeof env - n, "TEMP=%s", tmpdos) + 1;
     n += (size_t)snprintf(env + n, sizeof env - n, "TMP=%s", tmpdos) + 1;
+    if (is_vc405_image(image)) {
+        int err = vc_environment(image, env, &n, sizeof env);
+        if (err) return err;
+    }
 
     uint8_t t[128] = {0};
     if (tail_len > 126) tail_len = 126;

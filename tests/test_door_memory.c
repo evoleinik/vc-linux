@@ -37,6 +37,8 @@ const Image image_find = {.name = "FIND.EXE"};
 const Image image_more = {.name = "MORE.COM"};
 const Image image_sort = {.name = "SORT.EXE"};
 const Image image_fc = {.name = "FC.EXE"};
+const Image image_vc405 = {.name = "VC405.COM"};
+const Image image_vcsetup405 = {.name = "VCSETUP.COM"};
 const EmbeddedFile embedded_files[] = {{"VC.COM", vc_bytes, sizeof vc_bytes}};
 const int embedded_file_count = 1;
 
@@ -71,7 +73,9 @@ static void loader_boundary(void) {
     wr8(0xf800, 0, 'Z');
     wr16(0xf800, 1, 0);
     wr16(0xf800, 3, 0x7000);
-    memcpy(mem + lin(0x2000, 0), "VC.OVL", sizeof "VC.OVL");
+    /* Only the installed modern overlay has the built-in reload shortcut;
+     * an arbitrary same-named file in the current directory does not. */
+    memcpy(mem + lin(0x2000, 0), "H:\\.VC\\VC.OVL", sizeof "H:\\.VC\\VC.OVL");
     memset(mem + lin(0x2000, 0x100), 0, 16);
     wr16(0x2000, 0x102, 0x200);
     wr16(0x2000, 0x104, 0x2000);
@@ -159,7 +163,7 @@ static void random_memory(void) {
  * or a 64 KiB segment, or point at the planted strings and blocks below. */
 enum { PLANT = 0xe000 }; /* above conventional RAM, below the BIOS stubs */
 static const char *const plants[] = {
-    "VC.OVL", "H:\\.VC\\VC.OVL", "VC.COM", "H:\\FUZZ.TXT", "H:\\FUZZDIR",
+    "h:/.vc/VC.OVL", "H:\\.VC\\VC.OVL", "H:\\.VC\\VC.COM", "H:\\FUZZ.TXT", "H:\\FUZZDIR",
     "H:\\FUZZDIR\\A.B", "H:\\*.*", "*.*", "H:\\", "H:\\GAMES\\..\\FUZZ2.TXT",
     "H:\\COMMAND.COM", "????????.???",
 };

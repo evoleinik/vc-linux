@@ -6,6 +6,11 @@
 #include "cpu.h"
 #include "image.h"
 
+/* Additional statically linked programs. Their Image layout is unchanged;
+ * browser builds obtain these exact symbols from the lazy side modules. */
+extern const Image image_vc405;
+extern const Image image_vcsetup405;
+
 /* Stub addresses in the BIOS ROM segment. F000:00nn is the default handler of
  * INT nn. The dispatcher calls C when CS:IP lands on one. */
 #define STUB_SEG      0xF000u

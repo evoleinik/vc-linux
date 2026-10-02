@@ -70,6 +70,8 @@ const Image image_find = {.name = "FIND.EXE"};
 const Image image_more = {.name = "MORE.COM"};
 const Image image_sort = {.name = "SORT.EXE"};
 const Image image_fc = {.name = "FC.EXE"};
+const Image image_vc405 = {.name = "VC405.COM"};
+const Image image_vcsetup405 = {.name = "VCSETUP.COM"};
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file},

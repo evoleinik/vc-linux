@@ -43,3 +43,33 @@ include (`tools/kermit-options.inc`). The exceptions are explicit:
 JWlink uses `nofarcalls` so it cannot replace a listed far CALL with PUSH CS
 and a near CALL. The assembler's own same-segment far-call expansion is
 instead normalized and individually checked by the linked-listing front end.
+
+## VC 4.05's separate TASM-compatible assembler
+
+`tools/build_vc405_jwasm.py` builds `build/vc405-toolchain/jwasm` from the
+same pinned archive and `vc405.patch`. Neither the stock tool above nor the
+Kermit/MS-DOS private tools change. The new `-Zt` switch implements the
+TASM-compatible syntax and encoding choices exercised by the June 2000
+source; it is not a general implementation of every TASM dialect feature.
+
+The exact options are `-bin -Zt -Zm -Zg -Sg -Sa`, with the forced include
+`tools/vc405-options.inc` selecting `.DOSSEG`. `-bin` resolves this tiny-model
+image directly, with initialized data before BSS, as the original `TLINK /t/x`
+does. All 19 files in `asm405/` retain their original bytes, including CRLF
+and DOS EOF markers. No staged source rewriting is used.
+
+The tool fixes accept `PROC C NEAR`, separate comma-separated `USES`,
+`LOCAL name:WORD:count`, structure `LABEL` aliases that allocate no bytes,
+and structure `?` reservations. They preserve quoted `EQU` strings, allow
+colon labels in data, generate TASM's word-rounded stack locals and `SUB SP`,
+prefer accumulator immediates, fold direct `LEA` into `MOV reg,OFFSET`, and
+shrink signed 16-bit address displacements. TASM's conservative forward
+jump relaxation and flag-preserving seven-byte `LOOP` extension are retained;
+the translator independently proves all three boundaries of that extension.
+
+Both results match Danila Sukharev's genuine TASM 4.1 / TLINK 7.1 build byte
+for byte: `VC.COM` is 64,990 bytes (SHA-256 `b408f14da5bcba174f5e86107437b22b2863ee6ec72f79bdadf1b812607405fb`),
+and `VCSETUP.COM` is 23,615 bytes (SHA-256 `64f629207d16c4025c1e824fe11445dec8d9ea584d55c55b374a977ff5bbf703`).
+`make test-vc405-build` independently checks the pinned reference bytes,
+source integrity, both fresh builds and their listings, and representative
+syntax/encoding fixtures against the unpatched assembler.

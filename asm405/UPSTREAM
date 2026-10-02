@@ -1,0 +1,17 @@
+Volkov Commander 4.05, by Vsevolod V. Volkov
+Repository: https://github.com/ddanila/vc
+Commit: dbbb60578dc3a7e4cbc719f2376a3ad685d99040
+Path: archives/vc405.zip (same source tree as versions/4.05/)
+Archive SHA-256: c4ede94b833ea81da24483231de157bd64b67cf1ec66a77be383490046889c3e
+Vendored offline: 2026-10-02
+
+All 19 archive members are unedited, including CRLF and DOS EOF bytes.
+VC.ASM dates the program 16 June 2000; VCSETUP.ASM dates setup 14 June 2000.
+The archive's packaging files are dated 22 June 2000. LICENSE.TXT is byte
+identical to asm/LICENSE.TXT (the BSD 2-Clause licence of VC 4.99.09).
+SOURCES.sha256 records every original archive member. No VC 0.05 binary or
+translation is included; that 1992 release has no supplied source.
+
+tools/build_vc405.py builds these exact files using a separately patched
+JWasm, never source preprocessing. Both output COM files match the genuine
+TASM 4.1/TLINK 7.1 references in tests/fixtures/vc405-tasm/ byte for byte.

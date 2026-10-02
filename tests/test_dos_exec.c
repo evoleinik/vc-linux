@@ -32,6 +32,8 @@ static const uint8_t find_file[] = {0xB8, 0x03, 0x30, 0xCD, 0x21, 0xCB};
 static const uint8_t more_file[] = {0xB8, 0x04, 0x30, 0xCD, 0x21, 0xCB};
 static const uint8_t sort_file[] = {0xB8, 0x05, 0x30, 0xCD, 0x21, 0xCB};
 static const uint8_t fc_file[] = {0xB8, 0x06, 0x30, 0xCD, 0x21, 0xCB};
+static const uint8_t vc405_file[] = {0xB8, 0x05, 0x04, 0xCD, 0x21, 0xCB};
+static const uint8_t vcsetup405_file[] = {0xB8, 0x06, 0x04, 0xCD, 0x21, 0xCB};
 static const uint8_t association[] = "bas: gwbasic !.!\r\ntak: kermit stay, take !.!\r\n";
 const Image image_vc_com = {.name = "VC.COM", .bytes = vc_file, .size = sizeof vc_file};
 const Image image_vc_ovl = {
@@ -60,6 +62,8 @@ DOS_IMAGE(image_find, "FIND.EXE", find_file);
 DOS_IMAGE(image_more, "MORE.COM", more_file);
 DOS_IMAGE(image_sort, "SORT.EXE", sort_file);
 DOS_IMAGE(image_fc, "FC.EXE", fc_file);
+DOS_IMAGE(image_vc405, "VC405.COM", vc405_file);
+DOS_IMAGE(image_vcsetup405, "VCSETUP.COM", vcsetup405_file);
 const EmbeddedFile embedded_files[] = {
     {"VC.COM", vc_file, sizeof vc_file}, {"VC.OVL", ovl_file, sizeof ovl_file},
     {"GWBASIC.EXE", basic_file, sizeof basic_file}, {"VC.EXT", association, sizeof association - 1},
@@ -75,6 +79,8 @@ const EmbeddedFile embedded_files[] = {
     {"MORE.COM", more_file, sizeof more_file},
     {"SORT.EXE", sort_file, sizeof sort_file},
     {"FC.EXE", fc_file, sizeof fc_file},
+    {"VC405.COM", vc405_file, sizeof vc405_file},
+    {"VC405/VCSETUP.COM", vcsetup405_file, sizeof vcsetup405_file},
 };
 const int embedded_file_count = sizeof embedded_files / sizeof embedded_files[0];
 int hle_redirect, rt_exited, rt_exit_code;
@@ -176,14 +182,14 @@ static void path_env(const char *value) {
     wr16(parent_psp, 0x2C, env);
 }
 
-static void exec_file(const char *name, const char *tail) {
+static void exec_file_env(const char *name, const char *tail, uint16_t env) {
     guest_string(0x1000, name);
     size_t n = strlen(tail);
     CHECK(n < 126);
     wr8(parent_psp, 0x1200, (uint8_t)n);
     for (size_t i = 0; i < n; i++) wr8(parent_psp, (uint16_t)(0x1201 + i), (uint8_t)tail[i]);
     wr8(parent_psp, (uint16_t)(0x1201 + n), '\r');
-    wr16(parent_psp, 0x1100, 0);
+    wr16(parent_psp, 0x1100, env);
     wr16(parent_psp, 0x1102, 0x1200);
     wr16(parent_psp, 0x1104, parent_psp);
     cpu.ds = cpu.es = parent_psp;
@@ -192,6 +198,10 @@ static void exec_file(const char *name, const char *tail) {
     cpu.a.x = 0x4B00;
     cpu_int(0x21, 0x2345);
     CHECK(dos_core_int21());
+}
+
+static void exec_file(const char *name, const char *tail) {
+    exec_file_env(name, tail, 0);
 }
 
 static void command(const char *text, int quick) {
@@ -650,6 +660,258 @@ static void test_exec_identity(void) {
     CHECK(registered == &image_vc_ovl);
     end_child();
 }
+
+static const char *child_environment(const char *name);
+
+static void test_vc405_identity(void) {
+    /* VC 4.05 has the same original filename as the built-in 4.99 loader.
+     * Only the actual loader's installed pathname may bypass disk identity. */
+    const char *names[] = {"VC405/VC.COM", "VC405.COM", "OLD.EXE"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        host_file(names[i], vc405_file, sizeof vc405_file);
+        for (unsigned route = 0; route < 3; ++route) {
+            fresh_machine();
+            dos_core_set_door(route == 2);
+            /* command()'s COMSPEC fixture is the native /bin/sh bridge;
+             * use the direct INT2E command entry for the door-mode control. */
+            if (route) command(names[i], route == 2 || (i & 1));
+            else exec_file(names[i], "");
+            if (route == 1) {
+                CHECK(!hle_redirect && !registered && host_runs == 1);
+            } else {
+                CHECK(hle_redirect && registered == &image_vc405 && !host_runs);
+                CHECK(strstr(child_environment("VC"), "\\VC405"));
+                end_child();
+            }
+            dos_core_set_door(0);
+        }
+        for (size_t at = 0; at < sizeof vc405_file; ++at) {
+            uint8_t changed[sizeof vc405_file];
+            memcpy(changed, vc405_file, sizeof changed);
+            changed[at] ^= 1;
+            host_file(names[i], changed, sizeof changed);
+            fresh_machine();
+            exec_file(names[i], "");
+            CHECK(!hle_redirect && !registered && cpu.cf && cpu.a.x == 11 && !host_runs);
+        }
+    }
+    host_file("VC405.COM", vc405_file, sizeof vc405_file);
+    for (unsigned quick = 0; quick < 2; ++quick) {
+        fresh_machine();
+        command("vc405", quick);
+        CHECK(hle_redirect && registered == &image_vc405 && !host_runs);
+        end_child();
+    }
+    host_file("VC405/VCSETUP.COM", vcsetup405_file, sizeof vcsetup405_file);
+    host_file("SETOLD.EXE", vcsetup405_file, sizeof vcsetup405_file);
+    const char *setup[] = {"VC405/VCSETUP.COM", "SETOLD.EXE"};
+    for (size_t i = 0; i < sizeof setup / sizeof setup[0]; ++i) {
+        fresh_machine();
+        exec_file(setup[i], "");
+        CHECK(hle_redirect && registered == &image_vcsetup405 && !host_runs);
+        CHECK(strstr(child_environment("VC"), "\\VC405"));
+        end_child();
+        uint8_t changed[sizeof vcsetup405_file];
+        memcpy(changed, vcsetup405_file, sizeof changed);
+        changed[sizeof changed - 1] ^= 1;
+        host_file(setup[i], changed, sizeof changed);
+        fresh_machine();
+        exec_file(setup[i], "");
+        CHECK(!hle_redirect && !registered && cpu.cf && cpu.a.x == 11 && !host_runs);
+    }
+}
+
+static void test_vc405_environment(void) {
+    const Image *images[] = {&image_vc405, &image_vcsetup405};
+    const char *names[] = {"VC405.COM", "VC405/VCSETUP.COM"};
+    host_file(names[0], vc405_file, sizeof vc405_file);
+    host_file(names[1], vcsetup405_file, sizeof vcsetup405_file);
+    for (size_t i = 0; i < sizeof images / sizeof images[0]; ++i) {
+        fresh_machine();
+        path_env("H:\\");
+        static const char env[] = "PATH=H:\\\0VC=H:\\\0CUSTOM=preserved\0\0";
+        uint16_t parent_environment = rd16(parent_psp, 0x2C);
+        CHECK(!guest_write(lin(parent_environment, 0), env, sizeof env));
+        exec_file(names[i], "");
+        CHECK(hle_redirect && registered == images[i]);
+        CHECK(!strcmp(child_environment("CUSTOM"), "preserved"));
+        CHECK(!strcmp(child_environment("PATH"), "H:\\"));
+        const char *directory = child_environment("VC");
+        CHECK(directory && strcmp(directory, "H:\\"));
+        char host[4096], expected[256];
+        CHECK(!guest_write(lin(cpu.ds, 0x2000), directory, strlen(directory) + 1));
+        CHECK(!dos_fs_to_host(cpu.ds, 0x2000, host, sizeof host));
+        snprintf(expected, sizeof expected, "%s/VC405", fixture);
+        CHECK(!strcmp(host, expected));
+        end_child();
+        CHECK(!memcmp(mem + lin(parent_environment, 0), env, sizeof env));
+    }
+}
+
+static void test_vc499_environment(void) {
+    const char *names[] = {"VC.COM", "NEWVC.COM"};
+    host_file(names[1], vc_file, sizeof vc_file);
+    static const char environments[][160] = {
+        "VC=H:\\VC405\0PATH=H:\\\0vC=H:\\OTHER\0CUSTOM=preserved\0"
+        "VCACHE=keep\0XVC=keep-too\0VALUE=VC=literal\0Vc=\0",
+        "PATH=H:\\\0CUSTOM=preserved\0",
+        "VC=H:\\VC405\0",
+    };
+    static const char kept[][160] = {
+        "PATH=H:\\\0CUSTOM=preserved\0VCACHE=keep\0XVC=keep-too\0VALUE=VC=literal\0",
+        "PATH=H:\\\0CUSTOM=preserved\0",
+        "\0",
+    };
+    for (unsigned name = 0; name < sizeof names / sizeof names[0]; ++name)
+    for (unsigned layout = 0; layout < sizeof environments / sizeof environments[0]; ++layout)
+    for (unsigned explicit_env = 0; explicit_env < 2; ++explicit_env) {
+        fresh_machine();
+        path_env("H:\\");
+        uint16_t parent_env = rd16(parent_psp, 0x2C), source = parent_env;
+        if (explicit_env) {
+            cpu.a.h = 0x48; cpu.b.x = 0x10;
+            CHECK(dos_core_int21() && !cpu.cf);
+            source = cpu.a.x;
+        }
+        uint8_t parent_before[sizeof environments[0]];
+        CHECK(!guest_write(lin(source, 0), environments[layout], sizeof environments[layout]));
+        memcpy(parent_before, mem + lin(parent_env, 0), sizeof parent_before);
+        exec_file_env(names[name], "", explicit_env ? source : 0);
+        CHECK(hle_redirect && registered == &image_vc_com && !host_runs);
+        uint16_t child_env = rd16(cpu.ds, 0x2C);
+        CHECK(child_env != source && child_env != parent_env);
+        size_t length = 0;
+        while (kept[layout][length]) length += strlen(kept[layout] + length) + 1;
+        length = length ? length + 1 : 2; /* Even an empty DOS environment has two NULs. */
+        CHECK(!memcmp(mem + lin(child_env, 0), kept[layout], length));
+        CHECK(rd16(child_env, (uint16_t)length) == 1);
+        CHECK(!strcmp((const char *)mem + lin(child_env, (uint16_t)(length + 2)), names[name]));
+        end_child();
+        CHECK(rd16(parent_psp, 0x2C) == parent_env);
+        CHECK(!memcmp(mem + lin(parent_env, 0), parent_before, sizeof parent_before));
+        CHECK(!memcmp(mem + lin(source, 0), environments[layout], sizeof environments[layout]));
+    }
+    /* The private setting still belongs to other children; only the 4.99
+     * resident image must forget it, not COMMAND or the overlay generally. */
+    const char *others[] = {"COMMAND.COM", "BASIC.EXE", "VC.OVL"};
+    host_file(others[0], command_file, sizeof command_file);
+    for (unsigned i = 0; i < sizeof others / sizeof others[0]; ++i) {
+        fresh_machine();
+        path_env("H:\\");
+        uint16_t parent_env = rd16(parent_psp, 0x2C);
+        CHECK(!guest_write(lin(parent_env, 0), environments[0], sizeof environments[0]));
+        exec_file(others[i], "");
+        CHECK(hle_redirect && registered && registered != &image_vc_com);
+        CHECK(!strcmp(child_environment("VC"), "H:\\VC405"));
+        CHECK(!strcmp(child_environment("vC"), "H:\\OTHER"));
+        end_child();
+        CHECK(!memcmp(mem + lin(parent_env, 0), environments[0], sizeof environments[0]));
+    }
+}
+
+static void vc_dos2_environment(int modern) {
+    for (unsigned tight = 0; tight < 2; ++tight)
+    for (unsigned shared = 0; shared < 2; ++shared)
+    for (unsigned layout = 0; layout < (modern ? 3u : 1u); ++layout) {
+        fresh_machine();
+        host_file("COMMAND.COM", command_file, sizeof command_file);
+        const Image *image = modern ? &image_vc_com : &image_vc405;
+        const uint8_t *bytes = modern ? vc_file : vc405_file;
+        size_t size = modern ? sizeof vc_file : sizeof vc405_file;
+        const char *name = modern ? "NEWVC.COM" : "VC405.COM";
+        host_file(name, bytes, size);
+        exec_file("COMMAND.COM", "");
+        CHECK(registered == &image_command);
+        uint16_t shell = cpu.ds, shell_env = rd16(cpu.ds, 0x2C);
+        cpu.a.h = 0x4A; cpu.es = shell; cpu.b.x = 0x1000;
+        CHECK(dos_core_int21() && !cpu.cf);
+        cpu.a.h = 0x48; cpu.b.x = 0x10;
+        CHECK(dos_core_int21() && !cpu.cf);
+        uint16_t old_env = cpu.a.x;
+        static const char environments[][128] = {
+            "PATH=H:\\\0VC=H:\\VC405\0vC=H:\\OTHER\0CUSTOM=preserved\0VCACHE=keep\0",
+            "VC=H:\\VC405\0",
+            "PATH=H:\\\0CUSTOM=preserved\0",
+        };
+        const char *env = environments[layout];
+        CHECK(!guest_write(lin(old_env, 0), env, sizeof environments[layout]));
+        uint16_t paragraphs = 0x1000;
+        if (tight) {
+            cpu.a.h = 0x48; cpu.b.x = 0xFFFF;
+            CHECK(dos_core_int21() && cpu.cf && cpu.a.x == 8);
+            paragraphs = cpu.b.x;
+        }
+        cpu.a.h = 0x48; cpu.b.x = paragraphs;
+        CHECK(dos_core_int21() && !cpu.cf);
+        uint16_t child = cpu.a.x;
+        wr16((uint16_t)(child - 1), 1, child);
+        if (shared) {
+            /* A caller may deliberately share an environment. Neither
+             * filtering nor child termination may edit or free the parent's. */
+            wr16(shell, 0x2C, old_env);
+            shell_env = old_env;
+        } else wr16((uint16_t)(old_env - 1), 1, child);
+        CHECK(!guest_write(lin(shell, 0x600), name, strlen(name) + 1));
+        cpu.a.x = 0x3D00; cpu.ds = shell; cpu.d.x = 0x600;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        uint16_t file = cpu.a.x;
+        cpu.a.h = 0x3F; cpu.b.x = file; cpu.ds = (uint16_t)(child + 0x10);
+        cpu.d.x = 0; cpu.c.x = (uint16_t)size;
+        CHECK(dos_fs_int21() && !cpu.cf && cpu.a.x == size);
+        cpu.a.h = 0x3E;
+        CHECK(dos_fs_int21() && !cpu.cf);
+        wr16(shell, 0x2E, 0x500); wr16(shell, 0x30, shell);
+        const uint16_t frame[] = {0x4B00, 0, 0, 0x600, 0, 0, 0, shell, shell, 0x6789, shell, 0x202};
+        for (unsigned i = 0; i < sizeof frame / sizeof frame[0]; ++i)
+            wr16(shell, (uint16_t)(0x500 + 2 * i), frame[i]);
+        cpu.cs = cpu.ss = shell; cpu.sp = 0x900;
+        cpu_int(0x21, 0x105);
+        cpu.a.h = 0x55; cpu.d.x = child; cpu.si = (uint16_t)(child + paragraphs);
+        hle_redirect = 0;
+        CHECK(dos_core_int21() && !hle_redirect && registered == image);
+        /* The old DOS loader writes these AFTER AH55; setting them inside
+         * adoption would lose the new environment before the child runs. */
+        wr16(child, 0x2C, old_env);
+        wr16(child, 0x02, (uint16_t)(child + paragraphs));
+        cpu.a.x = 0x3301; cpu.d.l = 0;
+        CHECK(dos_core_int21() && rd16(child, 0x2C) == old_env);
+        CHECK(!memcmp(mem + lin(old_env, 0), env, sizeof environments[layout]));
+        cpu.cs = cpu.ss = cpu.ds = child; cpu.sp = 0xFF00;
+        cpu_int(0x21, 0x120); /* VC's first own DOS call, not COMMAND. */
+        cpu.a.x = 0x3000;
+        CHECK(dos_core_int21() && !hle_redirect && cpu.a.x == 0x0A07);
+        if (layout != 1) {
+            CHECK(!strcmp(child_environment("CUSTOM"), "preserved"));
+            CHECK(!strcmp(child_environment("PATH"), "H:\\"));
+        }
+        if (!layout) CHECK(!strcmp(child_environment("VCACHE"), "keep"));
+        CHECK(!child_environment("vC"));
+        if (modern) CHECK(!child_environment("VC"));
+        else CHECK(strstr(child_environment("VC"), "\\VC405"));
+        uint16_t new_env = rd16(child, 0x2C);
+        CHECK(new_env != old_env && new_env != shell_env);
+        CHECK(rd16((uint16_t)(new_env - 1), 1) == child);
+        CHECK(rd16((uint16_t)(old_env - 1), 1) == (shared ? shell : 0));
+        if (shared) CHECK(!memcmp(mem + lin(old_env, 0), env, sizeof environments[layout]));
+        CHECK(rd16(child, 2) == child + rd16((uint16_t)(child - 1), 3));
+        CHECK(tight ? rd16((uint16_t)(child - 1), 3) < paragraphs :
+                      rd16((uint16_t)(child - 1), 3) == paragraphs);
+        const char *strings = (const char *)mem + lin(new_env, 0);
+        size_t at = 0;
+        while (strings[at]) at += strlen(strings + at) + 1;
+        if (!at) { CHECK(!strings[1]); ++at; }
+        CHECK(rd16(new_env, (uint16_t)(at + 1)) == 1);
+        CHECK(strstr(strings + at + 3, name));
+        CHECK(rd16(shell, 0x2C) == shell_env);
+        wr16(child, 0x0A, 0x6789); wr16(child, 0x0C, shell);
+        cpu.a.x = 0x4C00;
+        CHECK(dos_core_int21() && hle_redirect && cpu.cs == shell && cpu.ip == 0x6789);
+        end_child();
+    }
+}
+
+static void test_vc405_dos2_environment(void) { vc_dos2_environment(0); }
+static void test_vc499_dos2_environment(void) { vc_dos2_environment(1); }
 
 static void test_logo_identity(void) {
     /* A COM program obeys exactly the same complete-file identity rule as
@@ -1551,13 +1813,18 @@ int main(int argc, char **argv) {
     CHECK(mkdtemp(fixture));
     CHECK(setenv("HOME", fixture, 1) == 0);
     CHECK(chdir(fixture) == 0);
-    CHECK(mkdir("BIN1", 0700) == 0 && mkdir("BIN2", 0700) == 0);
+    CHECK(mkdir("BIN1", 0700) == 0 && mkdir("BIN2", 0700) == 0 && mkdir("VC405", 0700) == 0);
     host_file("VC.COM", vc_file, sizeof vc_file);
     host_file("VC.OVL", ovl_file, sizeof ovl_file);
     host_file("VZ.COM", vz_file, sizeof vz_file);
     host_file("BASIC.EXE", basic_file, sizeof basic_file);
     const struct { const char *name; void (*run)(void); } suites[] = {
         {"identity", test_exec_identity},
+        {"vc405-identity", test_vc405_identity},
+        {"vc405-environment", test_vc405_environment},
+        {"vc405-dos2-environment", test_vc405_dos2_environment},
+        {"vc499-environment", test_vc499_environment},
+        {"vc499-dos2-environment", test_vc499_dos2_environment},
         {"setver", test_setver},
         {"jft", test_job_file_table},
         {"default-fcbs", test_default_fcbs},

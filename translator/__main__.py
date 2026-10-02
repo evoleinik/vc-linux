@@ -13,6 +13,7 @@ from .linked import build_linked_layout
 from .msdos import build_msdos_layout
 from .nasm import build_nasm_layout, parse_nasm_listing
 from .supplement import build_gwbasic_graphics_layout, emit_supplement
+from .vc405 import build_vc405_layout
 
 
 def main() -> int:
@@ -20,7 +21,7 @@ def main() -> int:
     parser.add_argument("image", type=Path)
     parser.add_argument("listing", type=Path, nargs="*")
     parser.add_argument("--map", type=Path, help="linker map for a multi-module EXE or flat COM")
-    parser.add_argument("--format", choices=("jwasm", "nasm", "watcom", "msdos"), default="jwasm",
+    parser.add_argument("--format", choices=("jwasm", "nasm", "watcom", "msdos", "vc405"), default="jwasm",
                         help="listing dialect (NASM requires -LefFt and a flat COM)")
     parser.add_argument("--watcom", type=Path, help="OpenWatcom root (otherwise WATCOM)")
     parser.add_argument("--supplement", choices=("gwbasic-graphics",),
@@ -38,6 +39,11 @@ def main() -> int:
             if args.map or len(args.listing) != 1:
                 parser.error("NASM requires one flat-COM listing, without --map")
             layout = build_nasm_layout(load_image(args.image), parse_nasm_listing(args.listing[0]))
+        elif args.format == "vc405":
+            if args.map or len(args.listing) != 1 or args.supplement:
+                parser.error("VC 4.05 requires one flat-COM listing, without --map")
+            layout = build_vc405_layout(load_image(args.image),
+                                         parse_listing(args.listing[0], physical_lines=True))
         elif args.format == "msdos":
             if not args.map or not args.listing or args.supplement:
                 parser.error("MS-DOS requires JWasm listings and --map")

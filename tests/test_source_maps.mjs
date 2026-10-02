@@ -42,7 +42,7 @@ function originalText(bytes, path = '') {
 const index = JSON.parse(await generated(indexName));
 assert.equal(index.version, 1);
 assert.deepEqual(Object.keys(index.images).sort(),
-  ['VC.COM', 'VC.OVL', 'GWBASIC.EXE', 'LOGO.COM', 'ROGUE.EXE', 'VZ.COM'].sort());
+  ['VC.COM', 'VC.OVL', 'GWBASIC.EXE', 'LOGO.COM', 'ROGUE.EXE', 'VZ.COM', 'VC405.COM', 'VCSETUP.COM'].sort());
 const maps = new Map();
 const originals = new Map();
 let fetchedBytes = 0;
@@ -106,8 +106,10 @@ function instructionSource(text) {
 async function listedInstructions(image) {
   // Latin-1 is intentional here: fixed listing columns count bytes, not Unicode
   // characters. Source-text comparisons below use the independent file decoder.
-  const text = (await readFile(join(build, 'gen', `${image}.lst`))).toString('latin1');
-  const imageBytes = await readFile(join(build, image));
+  const vc405 = image === 'VC405.COM' || image === 'VCSETUP.COM';
+  const filename = image === 'VC405.COM' ? 'VC.COM' : image;
+  const text = (await readFile(join(build, vc405 ? 'vc405' : 'gen', `${filename}.lst`))).toString('latin1');
+  const imageBytes = await readFile(join(build, vc405 ? 'vc405' : '', filename));
   const executable = imageBytes[0] === 0x4d && imageBytes[1] === 0x5a;
   const header = executable ? imageBytes.readUInt16LE(8) * 16 : 0;
   const segments = new Map();
@@ -136,9 +138,12 @@ async function listedInstructions(image) {
     }
     const code = source.trim().match(/^\.CODE(?:\s+(\S+))?/i);
     if (code) segment = code[1] || [...segments.keys()].find(name => name.endsWith('_TEXT'));
-    if (/^\.(?:DATA\??|CONST|FARDATA\??)\b/i.test(source.trim())) segment = undefined;
+    const data = source.trim().match(/^\.(DATA\??|CONST|FARDATA\??)\b/i);
+    if (data) segment = vc405 ? { DATA: '_DATA', 'DATA?': '_BSS', CONST: 'CONST' }[data[1].toUpperCase()] : undefined;
     const address = raw.match(/^([0-9A-F]{4,8}) /);
-    if (!address || !segments.get(segment)?.code) continue;
+    // 4.05 intentionally puts its Alloc0 startup instructions in CONST.
+    // Listing mnemonics establish their boundaries just as in _TEXT.
+    if (!address || !segments.has(segment) || (!vc405 && !segments.get(segment).code)) continue;
     const field = raw.slice(address[0].length, 28).trim();
     if (!field || field.startsWith('=')) continue;
     const mnemonic = instructionSource(source);
@@ -153,7 +158,8 @@ async function listedInstructions(image) {
     result.push({ offset, mnemonic, length, source, generated, listingLine: rowIndex + 1,
       bytes: imageBytes.subarray(header + offset, header + offset + length) });
   }
-  assert.ok(result.length > (image === 'VC.COM' ? 2500 : 35000), `${image}: independent listing parser lost instructions`);
+  const minimum = { 'VC.COM': 2500, 'VC.OVL': 35000, 'VC405.COM': 22000, 'VCSETUP.COM': 4700 };
+  assert.ok(result.length > minimum[image], `${image}: independent listing parser lost instructions`);
   return result;
 }
 
@@ -171,10 +177,20 @@ const generatedSamples = {
     [23478, 23486, 'asm/VCVIEW.INC', 2026, /^ViewPutLine\s+PROC\b/],
     [29858, 29866, 'asm/VCKEYB.INC', 597, /^\s*@@Exit:\s*RET\s*$/],
   ],
+  'VC405.COM': [
+    [24399, 24407, 'asm405/VCSUB2.INC', 1680, /^Input0\s+PROC\s+C\s+NEAR\b/],
+  ],
+  'VCSETUP.COM': [
+    [5783, 5791, 'asm405/VCSTSUB.INC', 2240, /^Input0\s+PROC\s+C\s+NEAR\b/],
+  ],
 };
 
-for (const image of ['VC.COM', 'VC.OVL']) {
+for (const image of ['VC.COM', 'VC.OVL', 'VC405.COM', 'VCSETUP.COM']) {
   const map = maps.get(image), listed = await listedInstructions(image);
+  if (image === 'VC405.COM' || image === 'VCSETUP.COM') {
+    assert.ok(map.files.every(file => file.path.startsWith('asm405/')),
+      `${image}: every Source location belongs to the unedited 4.05 source tree`);
+  }
   const addresses = new Map(map.lines.map(record => [record[0], record]));
   for (const row of listed) {
     assert.ok(addresses.has(row.offset), `${image}+0x${row.offset.toString(16)}: listed instruction has no source mapping`);
@@ -192,7 +208,7 @@ for (const image of ['VC.COM', 'VC.OVL']) {
   }
   const listingRows = new Map(listed.map(row => [row.listingLine, row]));
   let generatedCount = 0;
-  for (const [first, last, path, expectedLine, expectedText] of generatedSamples[image]) {
+  for (const [first, last, path, expectedLine, expectedText] of generatedSamples[image] || []) {
     assert.match(originals.get(path)[expectedLine - 1], expectedText, `${path}:${expectedLine}: generated-row fixture changed`);
     for (let listingLine = first; listingLine <= last; listingLine++) {
       const row = listingRows.get(listingLine);
@@ -259,4 +275,4 @@ try {
   await rm(fixture, { recursive: true, force: true });
 }
 
-console.log(`source maps: exact original text/CP866, include breadcrumbs, immutable URLs, all six images; ${fetchedBytes.toLocaleString('en')} source-text bytes (${sourceURLs.size} lazy files)`);
+console.log(`source maps: exact original text/CP866, include breadcrumbs, immutable URLs, all eight images; ${fetchedBytes.toLocaleString('en')} source-text bytes (${sourceURLs.size} lazy files)`);

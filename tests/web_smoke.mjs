@@ -2,6 +2,7 @@
 // the page. Actions wait for screen state; timers only put a bound on failure.
 // Add --fetch-failure, --fetch-timeout or --memory-limit for recovery gates.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -44,6 +45,9 @@ const fetchTimeout = process.argv.includes('--fetch-timeout');
 const memoryLimit = process.argv.includes('--memory-limit');
 const kermitOnly = process.argv.includes('--kermit-only');
 const msdosOnly = process.argv.includes('--msdos-only');
+const vc405Only = process.argv.includes('--vc405-only');
+const lazyFilesOnly = process.argv.includes('--lazy-files-only');
+const fileFailure = process.argv.includes('--file-fetch-failure');
 const programDeadlines = [];
 const realSetTimeout = globalThis.setTimeout;
 if (fetchTimeout) {
@@ -95,14 +99,21 @@ const originalSources = new Map();
 const legacyModules = ['gwbasic.wasm', 'bootlogo.wasm', 'rogue.wasm', 'vz.wasm', 'kermit.wasm'];
 const msdosFiles = ['COMMAND.COM', 'EDLIN.COM', 'DEBUG.COM', 'FIND.EXE', 'MORE.COM', 'SORT.EXE', 'FC.EXE'];
 const msdosModules = msdosFiles.map(name => `${name.split('.')[0].toLowerCase()}.wasm`);
-const programModules = [...legacyModules, ...msdosModules];
+const vc405Modules = ['vc405.wasm', 'vcsetup405.wasm'];
+const programModules = [...legacyModules, ...msdosModules, ...vc405Modules];
 const programFiles = new Map(readdirSync(dirname(modulePath)).flatMap((name) => {
-  const match = name.match(/^([a-z]+)\.([0-9a-f]{12})\.wasm$/);
+  const match = name.match(/^([a-z0-9]+)\.([0-9a-f]{12})\.wasm$/);
   return match && programModules.includes(`${match[1]}.wasm`) ? [[`${match[1]}.wasm`, name]] : [];
 }));
 assert.equal(programFiles.size, programModules.length, 'all side modules have immutable build-hash filenames');
 const moduleFetches = [];
 const expectedFetches = [];
+const fileFetches = [];
+const demoDirectory = `${dirname(modulePath)}-work/demo`;
+const demoBytes = name => readFileSync(join(demoDirectory, name));
+const lazyAssetName = bytes => `file.${createHash('sha256').update(bytes).digest('hex').slice(0, 12)}.bin`;
+let heldFile = null;
+let holdFileName = null;
 let heldDownload = null;
 const speakerEvents = [];
 const faultMessage = 'No translated code at 0000:0000. GWBASIC.EXE stopped.';
@@ -279,7 +290,7 @@ async function installSourcePanel() {
 }
 
 function originalSource(path) {
-  assert.match(path, /^(?:asm|third_party)\//, 'source provenance names a vendored original');
+  assert.match(path, /^(?:asm|asm405|third_party)\//, 'source provenance names a vendored original');
   if (!originalSources.has(path)) {
     const bytes = readFileSync(new URL(`../${path}`, import.meta.url));
     let decoded;
@@ -462,7 +473,35 @@ async function programRequest(url) {
 
 const programBytes = async (resource) => new Uint8Array(await readFile(resource));
 
+async function fileRequest(url) {
+  const resource = new URL(url);
+  const name = basename(resource.pathname);
+  const request = { name, url, bodyReads: 0 };
+  fileFetches.push(request);
+  assert.equal(resource.protocol, 'file:', 'lazy DOS files never use the network in Node');
+  assert.equal(resource.search, `?v=${buildHash}`, 'lazy DOS files use the same stamped resolver');
+  assert.match(name, /^file\.[0-9a-f]{12}\.bin$/, 'DOS contents have immutable filenames');
+  if (holdFileName === name) {
+    await new Promise(release => {
+      heldFile = { name, release, screen, inputReads, outputCalls };
+      observe();
+    });
+    heldFile = null;
+  }
+  await new Promise(done => setImmediate(done));
+  return { request, resource };
+}
+
+async function fetchFileBytes(url) {
+  const { request, resource } = await fileRequest(url);
+  const bytes = await programBytes(resource);
+  request.bodyReads++;
+  assert.equal(lazyAssetName(bytes), request.name, 'the actual requested bytes match their immutable filename');
+  return bytes;
+}
+
 async function fetchProgramBytes(url) {
+  if (new URL(url).pathname.endsWith('.bin')) return fetchFileBytes(url);
   const { resource } = await programRequest(url);
   return programBytes(resource);
 }
@@ -521,14 +560,324 @@ async function quitRogue() {
 
 async function selectFile(name) {
   // The status row, not the listing (where every name is always visible),
-  // identifies the active selection. Advance only after the last key landed.
+  // identifies the active selection. Home makes this independent of which
+  // file a preceding viewer or nested program left selected; Down does not
+  // wrap in either original VC. Wait for the key to land before advancing.
+  if (selected(screen).toUpperCase().includes(name.toUpperCase())) return;
+  const reads = inputReads;
+  send('\x1b[H');
+  await until('Home reaches the active panel', () => pending.length === 0 && inputReads > reads + 1);
   for (let step = 0; step < 40; step++) {
     const previous = selected(screen);
-    if (previous.includes(name)) return;
+    if (previous.toUpperCase().includes(name.toUpperCase())) return;
     send('\x1b[B');
     await until('the selection to move', (text) => selected(text) !== previous);
   }
   assert.fail(`${name} was not reachable in the active panel`);
+}
+
+async function checkLazyFiles() {
+  stage = 'lazy H: metadata, first DOS open, retry and cache';
+  const original = demoBytes('SRC/VC.ASM');
+  const firstLine = original.toString('ascii').split(/\r?\n/)[0];
+  const name = lazyAssetName(original);
+  const path = '/home/vc/SRC/VC.ASM';
+  const before = vc.FS.stat(path);
+  assert.equal(fileFetches.filter(item => item.name === name).length, 0,
+    'merely listing H: and its complete SRC directory never fetches VC.ASM');
+  await selectFile('SRC');
+  send('\r');
+  await until('SRC panel before lazy F3', text => hasPanels(text) && commandLine(text).includes('SRC>'));
+  await selectFile('VC.ASM');
+  const logStart = dosLog().length;
+  holdFileName = name;
+  send('\x1bOR');
+  await until('F3 reaches the lazy DOS-open fetch', () => heldFile?.name === name);
+  const held = heldFile;
+  await new Promise(done => setImmediate(done));
+  observe();
+  assert.equal(screen, held.screen, 'a held file download cannot change the DOS screen');
+  assert.equal(inputReads, held.inputReads, 'DOS is suspended while the file downloads');
+  assert.equal(outputCalls, held.outputCalls, 'the wait emits no guest output');
+  assert.equal(exitCalls, 0, 'the file wait keeps VC alive');
+  held.release();
+  holdFileName = null;
+  if (fileFailure) {
+    // VC's viewer uses the same generic dialog for every failed open.
+    // AH=716Ch names its file through DS:SI, while the existing trace
+    // prints DS:DX; the immediately following AH=59h supplies the name.
+    await until('failed file fetch reaches the original viewer error dialog', text =>
+      text.includes("Can't find the file") && text.includes('VC.ASM'));
+    assert.match(dosLog().slice(logStart),
+      /int21 716C[^\n]*CF=1 AX=0005\nint21 5905[^\n]*"VC\.ASM"[^\n]*CF=0 AX=0005/,
+      'the real DOS open, not merely the UI, reports error 5');
+    assert.equal(fileFetches.find(item => item.name === name).bodyReads, 0,
+      'HTTP-error file bodies must not be read or installed');
+    assert.equal(vc.FS.stat(path).size, original.length, 'a failed fetch preserves listing metadata');
+    assert.throws(() => vc.FS.readFile(path), 'failed placeholders cannot expose fabricated zero content');
+    send('\x1b');
+    await until('VC remains usable after failed file fetch', hasPanels);
+    send('\x1bOR');
+  }
+  await until('F3 shows the first original H: SRC VC.ASM line', text => text.includes(firstLine));
+  assert.deepEqual(Buffer.from(vc.FS.readFile(path)), original, 'DOS open materializes every original byte');
+  const after = vc.FS.stat(path);
+  assert.equal(after.ino, before.ino, 'materialization preserves the listed inode');
+  assert.equal(after.size, before.size, 'materialization preserves the listed size');
+  assert.equal(after.mtime.getTime(), before.mtime.getTime(), 'materialization preserves the listed date');
+  send('\x1b');
+  await until('SRC panel after first viewer', hasPanels);
+  send('\x1bOR');
+  await until('second F3 reads cached source contents', text => text.includes(firstLine));
+  assert.equal(fileFetches.filter(item => item.name === name).length, fileFailure ? 2 : 1,
+    'exactly one successful fetch, with only the intentional failed attempt retried');
+  assert.equal(exitCalls, 0, 'both F3 opens leave VC running');
+  send('\x1b');
+  await until('SRC panel after cached viewer', hasPanels);
+  send('\x1b[H');
+  await until('parent selected after cached viewer', text => selected(text).includes('..'));
+  send('\r');
+  await until('root panels after lazy-file test', isPanel);
+  console.log(`PASS lazy H: complete metadata, suspended DOS open, F3 ${JSON.stringify(firstLine)}, one successful fetch${fileFailure ? ', HTTP503 DOS error5 and working retry' : ''}`);
+}
+
+async function checkVC405() {
+  stage = 'VC 4.05 Enter, Source, F3, private setup and F10';
+  const modernPath = '/var/vc/config/vc-linux/VC.INI';
+  const modern = vc.FS.readFile(modernPath).slice();
+  const privateIni = '/home/vc/VC405/VC.INI';
+  const oldPanels = text => (text.split('\n')[0] || '').includes('╔')
+    && (text.split('\n')[24] || '').includes('10Quit');
+  await selectFile('VC405');
+  send('\r');
+  await until('the VC405 directory in the newer VC', text => hasPanels(text) && commandLine(text).includes('VC405>'));
+  await selectFile('VC.COM');
+  const firstLoad = dosLoads('VC405.COM');
+  expectedFetches.push('vc405.wasm');
+  send('\r');
+  await releaseProgramFetch('vc405.wasm');
+  await until('Enter starts actual VC 4.05 with its source-default right panel', text =>
+    dosLoads('VC405.COM') > firstLoad && oldPanels(text) && text.includes('Version 4.05'));
+  assert.ok(!hasPanels(screen), 'unedited 4.05 defaults initially hide the inactive left panel');
+  assert.match(screen.toLowerCase(), /license/, 'the older panel lists actual H: files');
+  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/VC405/VC.COM')),
+    demoBytes('VC405/VC.COM'), '4.05 runs the complete TASM-identical file');
+  let view = await openSource('VC405.COM');
+  assertSourceLine(view.current);
+  assert.match(view.current.path, /^asm405\//, 'running 4.05 maps to its own unedited source');
+  for (const caller of view.callers) {
+    assertSourceLine(caller);
+    assert.match(caller.path, /^asm405\//, '4.05 callers never borrow newer VC source lines');
+  }
+  await closeSourceWithShortcut();
+  await selectFile('LICENSE.TXT');
+  const firstLine = demoBytes('VC405/LICENSE.TXT').toString('ascii').split(/\r?\n/)[0];
+  send('\x1bOR');
+  await until('4.05 F3 displays its licence first line', text => text.includes(firstLine));
+  send('\x1b');
+  await until('4.05 panels after F3', oldPanels);
+  send('\x1b[20;2~');
+  await until('4.05 asks to save its own setup', text => text.includes('Do you wish to save'));
+  // The page sends physical key-up reports; the raw-byte harness must too.
+  send('\x1b[57441;1:3u\r');
+  await until('4.05 writes its private VC.INI', text => oldPanels(text) && vc.FS.analyzePath(privateIni).exists);
+  const saved = Buffer.from(vc.FS.readFile(privateIni));
+  assert.equal(saved.subarray(0, 3).toString('ascii'), 'VVV', '4.05 wrote an actual settings file');
+  assert.notDeepEqual(saved, Buffer.from(modern), '4.05 has its own incompatible settings format');
+  assert.deepEqual(vc.FS.readFile(modernPath), modern, '4.05 saving cannot overwrite 4.99 settings');
+
+  const returned = dosLoads('VC.OVL');
+  send('\x1b[21~');
+  await until('4.05 F10 quit confirmation', text => text.includes('Do you want to quit'));
+  send('\r');
+  await until('4.05 F10 returns to the newer panels', text =>
+    (dosLoads('VC.OVL') > returned && hasPanels(text)) || text.includes('Press ENTER'));
+  if (screen.includes('Press ENTER')) send('\r');
+  await until('the newer VC restores both panels', text => dosLoads('VC.OVL') > returned && hasPanels(text));
+  assert.equal(exitCalls, 0, '4.05 F10 exits only the nested program');
+  assert.deepEqual(vc.FS.readFile(modernPath), modern, '4.05 automatic save also remains isolated');
+
+  await selectFile('VCSETUP.COM');
+  const setupLoad = dosLoads('VCSETUP.COM');
+  expectedFetches.push('vcsetup405.wasm');
+  send('\r');
+  await releaseProgramFetch('vcsetup405.wasm');
+  await until('the original 4.05 setup menu', text =>
+    dosLoads('VCSETUP.COM') > setupLoad && text.includes('F2   Configuration'));
+  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/VC405/VCSETUP.COM')),
+    demoBytes('VC405/VCSETUP.COM'), 'setup also executes complete TASM-identical bytes');
+  view = await openSource('VCSETUP.COM');
+  assertSourceLine(view.current);
+  assert.match(view.current.path, /^asm405\//, 'setup maps to asm405 too');
+  await closeSourceWithShortcut();
+  send('\x1bOQ');
+  await until('4.05 setup opens Configuration', text => text.includes('Auto menus'));
+  const option = screen.split('\n').find(row => row.includes('Auto menus'));
+  send(' ');
+  await until('setup changes an actual configuration option', text =>
+    text.split('\n').find(row => row.includes('Auto menus')) !== option);
+  const quickExecute = screen.split('\n').find(row => row.includes('Quick execute commands'));
+  send('\x1b[C\x1b[B ');
+  await until('setup enables the real 4.05 INT 2e command path', text =>
+    text.split('\n').find(row => row.includes('Quick execute commands')) !== quickExecute);
+  send('\r');
+  await until('the setup main menu after editing', text => text.includes('F2   Configuration'));
+  const setupReturn = dosLoads('VC.OVL');
+  send('\x1b[21~');
+  await until('4.05 setup asks to save the changed settings', text => text.includes('Do you wish to save'));
+  send('\r');
+  await until('setup returns to newer VC', text =>
+    (dosLoads('VC.OVL') > setupReturn && hasPanels(text)) || text.includes('Press ENTER'));
+  if (screen.includes('Press ENTER')) send('\r');
+  await until('newer panels after setup', text => dosLoads('VC.OVL') > setupReturn && hasPanels(text));
+  const updated = Buffer.from(vc.FS.readFile(privateIni));
+  assert.notDeepEqual(updated, saved, 'the real setup modifies the private 4.05 file');
+  assert.equal(updated.subarray(0, -2).reduce((sum, byte) => sum + byte, 0) & 0xffff,
+    updated.readUInt16LE(updated.length - 2), '4.05 setup writes its original settings checksum');
+  assert.deepEqual(vc.FS.readFile(modernPath), modern, 'setup leaves the newer VC.INI unchanged');
+  assert.equal(exitCalls, 0);
+  await checkNestedVC405(oldPanels, privateIni, updated, modernPath);
+  send('\x1b[H');
+  await until('parent selected after setup', text => selected(text).includes('..'));
+  send('\r');
+  await until('H: root after both 4.05 programs', isPanel);
+  assertFetches();
+  console.log('PASS VC405: Enter, original 4.05 panels, F3, asm405 Source for both images, private VC.INI, F10 returns; both modules fetched once');
+}
+
+async function checkNestedVC405(oldPanels, privateIni, expectedIni, modernPath) {
+  stage = 'VC 4.05 -> COMMAND -> H:\\.VC\\VC.COM: nested save and clean 4.05 restart';
+  // Web keeps its installed 4.99 files off H:. Reproduce the door's .VC
+  // directory with complete installed bytes so the exact reported path
+  // traverses COMMAND's real DOS loader, not a harness launch shortcut.
+  const nestedDirectory = '/home/vc/.VC';
+  const nestedIni = `${nestedDirectory}/VC.INI`;
+  vc.FS.mkdirTree(nestedDirectory);
+  for (const name of ['VC.COM', 'VC.OVL', 'VC.INI', 'VC.EXT', 'VCEDIT.EXT'])
+    vc.FS.writeFile(`${nestedDirectory}/${name}`, vc.FS.readFile(`${dirname(modernPath)}/${name}`));
+  const modernBefore = Buffer.from(vc.FS.readFile(modernPath));
+  const oldReady = text => oldPanels(text) && !hasPanels(text);
+  const badIni = text => text.includes('VC.INI is not correct');
+  const autoMenu = text => text.includes('Could not find the menu file') && text.includes('H:\\VC405\\vc.mnu');
+  async function startOld() {
+    await selectFile('VC.COM');
+    const before = dosLoads('VC405.COM');
+    send('\r');
+    // VCSETUP above enabled Auto menus. No VC.MNU is installed, so its
+    // automatic menu dialog proves the restarted guest read that setting.
+    await until('4.05 restarts with its saved Auto menus option', text =>
+      dosLoads('VC405.COM') > before && (autoMenu(text) || badIni(text)));
+    assert.ok(!badIni(screen), '4.05 must accept its own VC.INI without a corruption warning');
+    send('\r');
+    await until('4.05 panels after its automatic user-menu dialog', text => oldReady(text) && !autoMenu(text));
+  }
+  async function quitOld() {
+    const before = dosLoads('VC.OVL');
+    send('\x1b[21~');
+    await until('4.05 nested-save test quit confirmation', text => text.includes('Do you want to quit'));
+    send('\r');
+    await until('4.05 exits back to the outer 4.99', text =>
+      (dosLoads('VC.OVL') > before && hasPanels(text)) || text.includes('Press ENTER'));
+    if (screen.includes('Press ENTER')) send('\r');
+    await until('outer 4.99 panels after the nested-save test', text =>
+      dosLoads('VC.OVL') > before && hasPanels(text));
+  }
+  await startOld();
+  stage = 'VC 4.05 -> H:\\.VC\\VC.COM: ordinary EXEC nested save';
+  const directLoads = dosLoads('VC.COM');
+  const directLog = dosLog().length;
+  const directModified = vc.FS.stat(nestedIni).mtime.getTime();
+  send('H:\\.VC\\VC.COM\r');
+  await until('4.05 quick execute starts the actual nested 4.99 panels', text =>
+    dosLoads('VC.COM') > directLoads && oldPanels(text));
+  assert.match(dosLog().slice(directLog), /load H:\\\.VC\\VC\.COM: translation VC\.COM\n/,
+    'the real 4.05 quick-execute setting reaches ordinary DOS EXEC');
+  send('\x1b[20;2~');
+  await until('ordinary EXEC nested 4.99 Shift-F9 save dialog', text => text.includes('Save the current setup as'));
+  const directSaveDialog = screen;
+  const directReads = inputReads;
+  send('\x1b[57441;1:3u\r');
+  await until('ordinary EXEC nested 4.99 completes its settings save', text =>
+    oldPanels(text) && !text.includes('Save the current setup as') && pending.length === 0 && inputReads > directReads + 1);
+  assert.deepEqual(Buffer.from(vc.FS.readFile(privateIni)), expectedIni,
+    'ordinary EXEC nested 4.99 Shift-F9 must not overwrite the private 4.05 VC.INI');
+  assert.ok(directSaveDialog.includes('H:\\.VC\\VC.INI'), 'ordinary EXEC 4.99 saves in its own directory');
+  assert.ok(vc.FS.stat(nestedIni).mtime.getTime() > directModified, 'ordinary EXEC 4.99 really writes its own INI');
+  assert.deepEqual(Buffer.from(vc.FS.readFile(modernPath)), modernBefore,
+    'ordinary EXEC nested 4.99 leaves the outer 4.99 settings unchanged');
+  send('\x1b[21~');
+  await until('ordinary EXEC nested 4.99 quit confirmation', text => text.includes('Do you want to quit'));
+  send('\r');
+  await until('ordinary EXEC nested 4.99 returns to 4.05', oldReady);
+  console.log('PASS nested VC ordinary EXEC: 4.05 quick execute -> H:\\.VC\\VC.COM, real 4.99 Shift-F9 preserves the private 4.05 INI');
+
+  stage = 'VC 4.05 -> COMMAND -> H:\\.VC\\VC.COM: nested save and clean 4.05 restart';
+  const shellLoads = dosLoads('COMMAND.COM');
+  const firstShell = !expectedFetches.includes('command.wasm');
+  if (firstShell) expectedFetches.push('command.wasm');
+  send('command\r');
+  if (firstShell) await releaseProgramFetch('command.wasm');
+  const lastLine = text => text.split('\n').filter(line => line.trim()).at(-1)?.trimEnd() || '';
+  const shellPrompt = text => !oldPanels(text) && /^H:\\[^>\n]*>$/.test(lastLine(text));
+  await until('4.05 opens the actual COMMAND prompt', text =>
+    dosLoads('COMMAND.COM') > shellLoads && shellPrompt(text));
+  send('set\r');
+  await until('COMMAND inherits the private 4.05 VC variable', text =>
+    /^VC=H:\\VC405\s*$/m.test(text) && shellPrompt(text));
+  // DOS 2 parses the executable token as an FCB, so an absolute token
+  // beginning H:\ is only a drive switch. CD then VC executes that same
+  // exact H:\.VC\VC.COM file through its original supported command path.
+  send('cd H:\\.VC\r');
+  await until('COMMAND changes to the exact nested 4.99 directory', text =>
+    shellPrompt(text) && lastLine(text) !== 'H:\\VC405>');
+  const nestedDosDirectory = lastLine(screen).slice(0, -1);
+  const nestedLoads = dosLoads('VC.COM');
+  const modernModified = vc.FS.stat(nestedIni).mtime.getTime();
+  send('vc\r');
+  await until('COMMAND starts the nested 4.99 panels', text =>
+    dosLoads('VC.COM') > nestedLoads && (oldPanels(text) ||
+      (shellPrompt(text) && text.includes('Error reading overlay file.'))));
+  assert.match(dosLog(), /load [^\n]*\/\.VC\/VC\.COM: translation VC\.COM \(DOS-hosted loader\)/,
+    'the exact H:\\.VC\\VC.COM chain uses Microsoft COMMAND\'s own EXEC');
+  assert.ok(oldPanels(screen), 'nested 4.99 must reach its panels, not fail on its DOS2 environment trailer');
+  send('\x1b[20;2~');
+  await until('nested 4.99 Shift-F9 save dialog', text => text.includes('Save the current setup as'));
+  const saveDialog = screen;
+  const reads = inputReads;
+  send('\x1b[57441;1:3u\r');
+  await until('nested 4.99 completes its real settings save', text =>
+    oldPanels(text) && !text.includes('Save the current setup as') && pending.length === 0 && inputReads > reads + 1);
+  assert.deepEqual(Buffer.from(vc.FS.readFile(privateIni)), expectedIni,
+    'nested 4.99 Shift-F9 must not overwrite the private 4.05 VC.INI');
+  assert.ok(saveDialog.includes(`${nestedDosDirectory}\\VC.INI`), '4.99 saves beside its own executable, not under VC405');
+  assert.ok(vc.FS.stat(nestedIni).mtime.getTime() > modernModified, '4.99 really writes its own settings file');
+  const modernSaved = Buffer.from(vc.FS.readFile(nestedIni));
+  assert.equal(modernSaved.length, modernBefore.length, 'the nested save retains the 4.99 settings format');
+  assert.equal(modernSaved.subarray(0, -2).reduce((sum, byte) => sum + byte, 0) & 0xffff,
+    modernSaved.readUInt16LE(modernSaved.length - 2), 'the actual 4.99 save has its original checksum');
+  assert.deepEqual(Buffer.from(vc.FS.readFile(modernPath)), modernBefore,
+    'the nested 4.99 save also leaves the outer 4.99 settings alone');
+  send('\x1b[21~');
+  await until('nested 4.99 quit confirmation', text => text.includes('Do you want to quit'));
+  send('\r');
+  await until('nested 4.99 returns to COMMAND', shellPrompt);
+  send('cd H:\\VC405\r');
+  await until('COMMAND restores the original 4.05 directory', text =>
+    shellPrompt(text) && lastLine(text) === 'H:\\VC405>');
+  send('exit\r');
+  await until('COMMAND returns to 4.05', oldReady);
+  await quitOld();
+  // 4.05's own Auto save can legitimately update its panel state on exit.
+  // Restart must accept that private-format file and retain Auto menus.
+  const beforeRestart = Buffer.from(vc.FS.readFile(privateIni));
+  assert.equal(beforeRestart.length, expectedIni.length, '4.05 keeps its own settings format on exit');
+  await startOld();
+  assert.deepEqual(Buffer.from(vc.FS.readFile(privateIni)), beforeRestart,
+    '4.05 cleanly reads its own persisted settings after both nested 4.99 saves');
+  await quitOld();
+  assert.equal(exitCalls, 0, 'the entire nested chain leaves the outer VC running');
+  assertFetches();
+  console.log('PASS nested VC: 4.05 -> COMMAND -> H:\\.VC\\VC.COM, 4.99 Shift-F9 writes its own INI, private 4.05 settings unchanged, clean 4.05 restart retains Auto menus');
 }
 
 async function quitVC() {
@@ -573,15 +922,15 @@ async function checkCommand() {
   stage = 'DOS installation';
   for (const name of msdosFiles) {
     const path = name === 'COMMAND.COM' ? `/home/vc/${name}` : `/home/vc/DOS/${name}`;
-    assert.deepEqual(Buffer.from(vc.FS.readFile(path)),
-      readFileSync(new URL(`../build/msdos2/${name}`, import.meta.url)),
-      `${path} contains the complete source-built DOS executable`);
+    assert.equal(vc.FS.stat(path).size,
+      readFileSync(new URL(`../build/msdos2/${name}`, import.meta.url)).length,
+      `${path} lists the complete source-built DOS executable size before open`);
     if (name !== 'COMMAND.COM') assert.ok(!vc.FS.analyzePath(`/home/vc/${name}`).exists,
       'the six utilities belong in H:\\DOS, not H:\\');
   }
-  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/DOS/DOS.TXT')),
+  assert.deepEqual(demoBytes('DOS/DOS.TXT'),
     readFileSync(new URL('../data/DOS.TXT', import.meta.url)), 'H:\\DOS has the DOS guide');
-  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/DOS/DOSLIC.TXT')),
+  assert.deepEqual(demoBytes('DOS/DOSLIC.TXT'),
     readFileSync(new URL('../third_party/msdos2/LICENSE', import.meta.url)), 'the MIT licence travels with DOS');
 
   stage = 'DOS DIR from VC command line';
@@ -703,10 +1052,10 @@ async function checkDosUtilities() {
 async function checkKermit() {
   stage = 'Kermit BBS.TAK association and lazy module';
   assert.equal(bbs.calls.length, 0, 'no WebSocket opens before a Hayes dial');
-  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/KERMIT.EXE')),
+  assert.deepEqual(demoBytes('KERMIT.EXE'),
     readFileSync(new URL('../build/kermit/KERMIT.EXE', import.meta.url)),
-    'H: contains the complete source-built DOS executable, not a placeholder');
-  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/BBS.TAK')),
+    'H: publishes the complete source-built DOS executable');
+  assert.deepEqual(demoBytes('BBS.TAK'),
     readFileSync(new URL('../data/BBS.TAK', import.meta.url)), 'the shipped TAKE file is installed');
   send('\x1b[H');
   await until('home selection before BBS.TAK', text => /\.\.|B30\.BAT|BBS|GAMES/.test(selected(text)));
@@ -787,7 +1136,7 @@ async function checkFetchFailures() {
 
   stage = 'fetch failure: VC remains usable';
   await selectFile('README.TXT');
-  const firstLine = vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' }).split(/\r?\n/)[0];
+  const firstLine = demoBytes('README.TXT').toString('utf8').split(/\r?\n/)[0];
   send('\x1bOR');
   await until('working F3 after all failed EXECs', (text) => text.includes(firstLine));
   send('\x1b');
@@ -832,7 +1181,7 @@ async function checkUsableAfterFailedLoad(message) {
   send('\x0f');
   await until('VC panels after the DOS diagnostic', isPanel);
   await selectFile('README.TXT');
-  const firstLine = vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' }).split(/\r?\n/)[0];
+  const firstLine = demoBytes('README.TXT').toString('utf8').split(/\r?\n/)[0];
   send('\x1bOR');
   await until('F3 still works after the failed load', (text) => text.includes(firstLine));
   send('\x1b');
@@ -988,10 +1337,20 @@ process.on('uncaughtException', fail);
 process.on('unhandledRejection', fail);
 
 try {
-  if (fetchFailure || fetchTimeout) {
+  if (fetchFailure || fetchTimeout || fileFailure) {
     // Exercise the browser's real fetch/status/arrayBuffer branch entirely
     // in memory. No listener, HTTP server, or network request is involved.
     globalThis.fetch = async (url, options) => {
+      if (new URL(url).pathname.endsWith('.bin')) {
+        const { request, resource } = await fileRequest(url);
+        const failed = fileFailure && request.name === lazyAssetName(demoBytes('SRC/VC.ASM'))
+          && fileFetches.filter(item => item.name === request.name).length === 1;
+        return { ok: !failed, status: failed ? 503 : 200, async arrayBuffer() {
+          request.bodyReads++;
+          const bytes = await programBytes(resource);
+          return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        } };
+      }
       const { request, resource, attempt } = await programRequest(url);
       if (fetchTimeout) {
         request.signal = options?.signal;
@@ -1025,11 +1384,12 @@ try {
   }
   if (!fetchFailure && !fetchTimeout && !memoryLimit && !msdosOnly) await installSourcePanel();
   const wasmBinary = await readFile(new URL('./vc.wasm', moduleURL));
+  const installedAfter = Date.now();
   await createVC({
     wasmBinary,
     // Match main's declared minimum, but prohibit all growth. The pressure
     // and fragmentation scenarios then consume real allocations in this cap.
-    ...(memoryLimit ? { wasmMemory: new WebAssembly.Memory({ initial: 1024, maximum: 1024 }) } : {}),
+    ...(memoryLimit ? { wasmMemory: new WebAssembly.Memory({ initial: 1280, maximum: 1280 }) } : {}),
     instantiateWasm(imports, receiveInstance) {
       const compiled = new WebAssembly.Module(wasmBinary);
       const instance = new WebAssembly.Instance(compiled, imports);
@@ -1037,13 +1397,14 @@ try {
       return receiveInstance(instance, compiled);
     },
     locateFile: (name) => new URL(`${name}?v=${buildHash}`, moduleURL).href,
-    vcFetchProgram: fetchFailure || fetchTimeout ? undefined : fetchProgramBytes,
+    vcFetchProgram: fetchFailure || fetchTimeout || fileFailure ? undefined : fetchProgramBytes,
     vcModem: modem,
     ...(fetchTimeout ? { vcProgramFetchTimeoutMs: 100 } : {}),
     preRun: [(module) => {
       vc = module;
       module.ENV.VC_SCREEN_DUMP = screenPath;
       module.ENV.VC_FRAME_DUMP = framePath;
+      if (fileFailure) module.ENV.VC_TRACE = '1';
     }],
     vcReadInput(capacity) {
       inputReads++;
@@ -1081,6 +1442,7 @@ try {
     isPanel(text) && text.includes('H:\\'));
   assertFetches();
   assert.equal(moduleFetches.length, 0, 'VC reaches its first screen before any program module is fetched');
+  assert.equal(fileFetches.length, 0, 'VC reaches its first screen before any lazy file contents are fetched');
   assert.equal(sourceFetches.length, 0, 'no source index, maps or source text load before the first VC screen');
   startupHeapBytes = vc.HEAPU8.byteLength;
   startupHeapTop = wasmExports.sbrk(0);
@@ -1089,16 +1451,34 @@ try {
     'VC keeps its settings and log off the H: demo drive');
   assert.ok(vc.FS.stat('/home/vc/GWBASIC.EXE').size > 50000,
     'GW-BASIC is an actual MZ file on H:');
-  for (const name of ['VC.ASM', 'VCOVL.ASM'])
-    assert.deepEqual(Buffer.from(vc.FS.readFile(`/home/vc/SRC/${name}`)),
-      readFileSync(new URL(`../asm/${name}`, import.meta.url)),
-      `startup LZMA preserves the exact H:\\SRC\\${name} bytes`);
-  for (const name of readdirSync(new URL('../build/games/', import.meta.url)))
-    assert.deepEqual(Buffer.from(vc.FS.readFile(`/home/vc/GAMES/${name}`)),
-      readFileSync(new URL(`../build/games/${name}`, import.meta.url)),
-      `startup LZMA preserves the exact H:\\GAMES\\${name} bytes`);
+  const installedBefore = Date.now();
+  for (const name of readdirSync(demoDirectory, { recursive: true })) {
+    const expected = statSync(join(demoDirectory, name));
+    const installed = vc.FS.stat(`/home/vc/${name}`);
+    if (expected.isFile()) {
+      assert.equal(installed.size, expected.size, `${name}: listing has its real size without content`);
+      const modified = installed.mtime.getTime();
+      assert.ok(modified >= installedAfter && modified <= installedBefore,
+        `${name}: listing retains the eager installer's real startup date`);
+    } else assert.ok(vc.FS.isDir(installed.mode), `${name}: complete directory tree at first screen`);
+  }
   assert.ok(!vc.FS.analyzePath('/home/vc/GAMES/NOTHING.TXT').exists);
   console.log('PASS 1: startup shows 10Quit and README on H:');
+
+  if (fileFailure || lazyFilesOnly) {
+    await checkLazyFiles();
+    await quitVC();
+    console.log('web lazy-file smoke passed');
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
+  if (vc405Only) {
+    await checkVC405();
+    await quitVC();
+    console.log('web VC405 smoke passed');
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
 
   if (msdosOnly) {
     await checkCommand();
@@ -1124,6 +1504,8 @@ try {
     exitAfterOutput(0);
     await new Promise(() => {});
   }
+
+  await checkLazyFiles();
 
   stage = 'Source VC, F9 and unchanged screen';
   const beforeSource = screen;
@@ -1166,7 +1548,7 @@ try {
 
   stage = '2 F3 viewer';
   await selectFile('README.TXT');
-  const firstLine = vc.FS.readFile('/home/vc/README.TXT', { encoding: 'utf8' })
+  const firstLine = demoBytes('README.TXT').toString('utf8')
     .split(/\r?\n/)[0];
   assert.ok(firstLine.length, 'the demo README must not be empty');
   send('\x1bOR');
@@ -1176,7 +1558,7 @@ try {
   await until('the panels after closing F3', isPanel);
 
   stage = '2b Russian F3 viewer';
-  const russianBytes = vc.FS.readFile('/home/vc/ПРОЧТИ.TXT');
+  const russianBytes = demoBytes('ПРОЧТИ.TXT');
   const russian = new TextDecoder('ibm866').decode(russianBytes);
   assert.equal(russian,
     readFileSync(new URL('../web/README-RU.TXT', import.meta.url), 'utf8').replaceAll('\n', '\r\n'),
@@ -1187,6 +1569,8 @@ try {
   send('\x1bOR');
   await until('the Russian first line and Cyrillic text in F3', (text) =>
     text.includes(russianFirstLine) && text.includes('Это не эмулятор.'));
+  assert.deepEqual(Buffer.from(vc.FS.readFile('/home/vc/ПРОЧТИ.TXT')), russianBytes,
+    'the real DOS open materializes the exact CP866 bytes');
   console.log('PASS Russian: F3 displays H:\\ПРОЧТИ.TXT correctly from its CP866 bytes');
   send('\x1b');
   await until('the panels after the Russian viewer', isPanel);
@@ -1285,7 +1669,7 @@ try {
   assert.equal(vc.FS.stat('/home/vc/BOOTLOGO.COM').size, 503, 'BOOTLOGO.COM is the original NASM COM file on H:');
   assert.ok(!vc.FS.analyzePath('/home/vc/LOGO.COM').exists, 'the old LOGO.COM alias is not installed');
   assert.ok(!vc.FS.analyzePath('/home/vc/LOGO.TXT').exists, 'the guide is installed under its own name');
-  assert.match(vc.FS.readFile('/home/vc/BOOTLOGO.TXT', { encoding: 'utf8' }), /TO FLOWER REPEAT 4 \[PETAL LT 50\] END/);
+  assert.match(demoBytes('BOOTLOGO.TXT').toString('utf8'), /TO FLOWER REPEAT 4 \[PETAL LT 50\] END/);
   expectedFetches.push('bootlogo.wasm');
   send('bootlogo\r');
   await releaseProgramFetch('bootlogo.wasm');
@@ -1350,7 +1734,7 @@ try {
   console.log('PASS 15: BASIC SCREEN 1/LINE/CIRCLE/PSET/DRAW pixels and SCREEN 0 text restoration');
 
   stage = '16 shipped SPIRAL.BAS';
-  const spiral = vc.FS.readFile('/home/vc/GAMES/SPIRAL.BAS', { encoding: 'utf8' });
+  const spiral = demoBytes('GAMES/SPIRAL.BAS').toString('utf8');
   assert.ok(spiral.includes('SCREEN 1') && spiral.includes('DRAW '));
   assert.ok(!spiral.replaceAll('\r\n', '').includes('\n'), 'SPIRAL.BAS is DOS CRLF text');
   // This FCB-based BASIC takes an 8.3 name, not a subdirectory path. Use
@@ -1421,15 +1805,15 @@ try {
   console.log('PASS 18: GW-BASIC still handles Ctrl-Break with Break in 10 and SYSTEM');
 
   stage = '19 Rogue installation and typed launch';
-  const rogueImage = vc.FS.readFile('/home/vc/GAMES/ROGUE.EXE');
+  const rogueImage = demoBytes('GAMES/ROGUE.EXE');
   assert.equal(String.fromCharCode(...rogueImage.slice(0, 2)), 'MZ',
     'ROGUE.EXE is a real compiled DOS image in H:\\GAMES');
   assert.ok(rogueImage.length > 50000, 'the game must contain the linked Rogue/PDCurses program');
   assert.ok(!vc.FS.analyzePath('/home/vc/ROGUE.EXE').exists,
     'DOS PATH finds H:\\GAMES without a second root copy');
-  assert.match(vc.FS.readFile('/home/vc/GAMES/ROGUELIC.TXT', { encoding: 'utf8' }),
+  assert.match(demoBytes('GAMES/ROGUELIC.TXT').toString('utf8'),
     /Michael Toy, Ken Arnold and Glenn Wichman/);
-  assert.match(vc.FS.readFile('/home/vc/GAMES/PDCLIC.TXT', { encoding: 'utf8' }), /public domain/);
+  assert.match(demoBytes('GAMES/PDCLIC.TXT').toString('utf8'), /public domain/);
   expectedFetches.push('rogue.wasm');
   send('rogue\r');
   await releaseProgramFetch('rogue.wasm');
@@ -1530,8 +1914,8 @@ try {
   stage = '24 F4 VZ edit, save, and quit';
   assert.ok(vc.FS.analyzePath('/home/vc/VZ.COM').exists,
     'the translated VZ.COM must be installed on H: before F4 can edit');
-  assert.deepEqual(vc.FS.readFile('/home/vc/VZ.COM'),
-    new Uint8Array(readFileSync(new URL('../third_party/vzeditor/VZ-IBM/US/VZUS.COM', import.meta.url))),
+  assert.deepEqual(demoBytes('VZ.COM'),
+    readFileSync(new URL('../third_party/vzeditor/VZ-IBM/US/VZUS.COM', import.meta.url)),
     'VZ.COM is the real byte-identical US DOS file on H:');
   for (const [installed, source] of [['VZ.DEF', 'VZIBM.DEF'], ['VZFLE.DEF', 'VZFLE.DEF'],
     ['HELPE.DEF', 'HELPE.DEF']]) {
@@ -1542,8 +1926,7 @@ try {
       assert.ok(option >= 0, 'the vendored default is unchanged');
       definition[option + 4] = '+'.charCodeAt(0);
     }
-    assert.deepEqual(vc.FS.readFile(`/home/vc/${installed}`),
-      new Uint8Array(definition),
+    assert.deepEqual(demoBytes(installed), definition,
       `${installed} contains the English VZ definitions with backups enabled by default`);
   }
   await selectFile('README.TXT');
@@ -1631,8 +2014,14 @@ try {
 
   await checkKermit();
   await checkDosUtilities();
+  await checkVC405();
   assert.deepEqual([...expectedFetches].sort(), [...programModules].sort(),
-    'all twelve programs fetched exactly once');
+    'all fourteen programs fetched exactly once');
+  for (const name of ['GWBASIC.EXE', 'BOOTLOGO.COM', 'GAMES/ROGUE.EXE', 'VZ.COM', 'KERMIT.EXE',
+    'COMMAND.COM', ...msdosFiles.slice(1).map(name => `DOS/${name}`), 'VC405/VC.COM', 'VC405/VCSETUP.COM']) {
+    assert.deepEqual(Buffer.from(vc.FS.readFile(`/home/vc/${name}`)), demoBytes(name),
+      `${name}: a real DOS open preserved every published executable byte`);
+  }
 
   stage = '25b cached BASIC after loading every side module';
   send('gwbasic\r');
@@ -1648,16 +2037,22 @@ try {
   const peak = wasmExports.sbrk(0);
   console.log(`PASS memory: peak ${peak} bytes; INITIAL_MEMORY ${startupHeapBytes} bytes; headroom ${startupHeapBytes - peak} bytes; heap ${startupHeapBytes} -> ${vc.HEAPU8.byteLength}`);
   assert.equal(vc.HEAPU8.byteLength, startupHeapBytes,
-    'INITIAL_MEMORY must cover loading all twelve programs without heap growth');
+    'INITIAL_MEMORY must cover loading all fourteen programs without heap growth');
   // The measured peak depends on load order: emmalloc asks sbrk for a whole
   // new block when no free block fits. Bound every order: each load's guard
   // may take a fresh 2N + 64 KiB above the startup heap top.
   const sideBytes = [...programFiles.values()].reduce((sum, name) =>
     sum + statSync(join(dirname(modulePath), name)).size, 0);
-  const worst = startupHeapTop + 2 * sideBytes + programFiles.size * 64 * 1024;
+  const fileAssets = readdirSync(dirname(modulePath)).filter(name => /^file\.[0-9a-f]{12}\.bin$/.test(name));
+  const fileBytes = fileAssets.reduce((sum, name) => sum + statSync(join(dirname(modulePath), name)).size, 0);
+  // References now allocate after startup. Bound an original plus a DOS
+  // candidate copy per asset, with stream/allocator bookkeeping, even if
+  // no freed block is reused. This includes unopened guides and sources.
+  const fileAllowance = 2 * fileBytes + fileAssets.length * 4096;
+  const worst = startupHeapTop + 2 * sideBytes + programFiles.size * 64 * 1024 + fileAllowance;
   assert.ok(startupHeapBytes - worst >= Math.max(4 * 1024 * 1024, worst * 0.2),
     `INITIAL_MEMORY leaves at least 4 MiB and 20% headroom above the any-order bound ${worst}`);
-  console.log(`PASS memory: any-order bound ${worst} bytes; headroom ${startupHeapBytes - worst} bytes`);
+  console.log(`PASS memory: any-order bound ${worst} bytes including ${fileAllowance} lazy-file allowance; headroom ${startupHeapBytes - worst} bytes`);
 
   assert.equal(new Set(sourceFetches.map(({ url }) => url)).size, sourceFetches.length,
     'reopening Source reuses every previously fetched map and original source file');
@@ -1668,7 +2063,7 @@ try {
   await quitVC();
   console.log('PASS 26: F10, Enter quits and fires the exit hook');
   assertFetches();
-  console.log('web smoke: legacy checks, DOS shell/utilities, Russian F3, Source, and all twelve first-use/cached module fetches passed');
+  console.log('web smoke: legacy checks, DOS shell/utilities, Russian F3, lazy H: files, VC405, Source, and all fourteen first-use/cached module fetches passed');
   exitAfterOutput(0);
 } catch (error) {
   fail(error);
