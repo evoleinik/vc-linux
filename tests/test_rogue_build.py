@@ -446,3 +446,17 @@ def test_rogue_port_refuses_changed_upstream_source(tmp_path):
     (source / "main.c").write_text("/* a changed upstream entry point */")
     with pytest.raises(ValueError, match="expected 1 instances"):
         port.prepare(source, tmp_path / "output")
+
+
+def test_pdcurses_date_stamp_is_pinned():
+    """PDCurses stamps __DATE__ and OpenWatcom ignores SOURCE_DATE_EPOCH, so an
+    unpinned build changes every day. CI went red at midnight UTC on 2026-10-02."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    spec = importlib.util.spec_from_file_location("build_rogue", ROOT / "tools/build_rogue.py")
+    build_rogue = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(build_rogue)
+    image = b"MZ..PDCurses 3.9 - Oct  2 2026\x00tail"
+    assert build_rogue.pin_build_date(image) == b"MZ..PDCurses 3.9 - Oct  1 2026\x00tail"
+    for bad in (b"no stamp here", image + image, b"PDCurses 3.9 - tomorrow!!!\x00"):
+        with pytest.raises(SystemExit):
+            build_rogue.pin_build_date(bad)

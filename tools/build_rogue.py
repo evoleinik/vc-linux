@@ -8,6 +8,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import re
 import subprocess
 
 from rogue_port import prepare
@@ -78,6 +79,8 @@ def build(root: Path, watcom: Path, out: Path, jobs: int) -> None:
     lines += [f"library {library}"]
     linkfile.write_text("\n".join(lines) + "\n")
     run([watcom / "binl64/wlink", "@" + str(linkfile)])
+    exe = out / "ROGUE.EXE"
+    exe.write_bytes(pin_build_date(exe.read_bytes()))
     # The license and source notice accompany both redistributed executables.
     notice = (watcom / "license.txt").read_bytes()
     notice += (b"\r\nOpenWatcom runtime source:\r\n"
@@ -85,6 +88,25 @@ def build(root: Path, watcom: Path, out: Path, jobs: int) -> None:
                b"Rogue is compiled from the BSD-3-Clause sources in third_party/rogue.\r\n")
     (out / "OWLIC.TXT").write_bytes(notice)
     print(f"Rogue DOS: {(out / 'ROGUE.EXE').stat().st_size} bytes")
+
+
+# PDCurses stamps __DATE__ into its notice (initscr.c), and OpenWatcom ignores
+# SOURCE_DATE_EPOCH and refuses to redefine __DATE__. Unpinned, ROGUE.EXE
+# changed every day; CI went red at midnight UTC on 2026-10-02. Pin the stamp
+# to the day this build was verified, so the pinned hashes hold.
+PDC_NOTICE = b"PDCurses 3.9 - "
+PDC_DATE = b"Oct  1 2026"
+
+
+def pin_build_date(image: bytes) -> bytes:
+    at = image.find(PDC_NOTICE)
+    if at < 0 or image.find(PDC_NOTICE, at + 1) >= 0:
+        raise SystemExit("ROGUE.EXE: expected exactly one PDCurses date stamp")
+    start = at + len(PDC_NOTICE)
+    stamp = image[start:start + len(PDC_DATE)]
+    if not re.fullmatch(rb"[A-Z][a-z]{2} [ 123][0-9] [0-9]{4}", stamp):
+        raise SystemExit(f"ROGUE.EXE: unexpected PDCurses date stamp {stamp!r}")
+    return image[:start] + PDC_DATE + image[start + len(PDC_DATE):]
 
 
 def main() -> None:
