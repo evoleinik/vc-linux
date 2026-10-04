@@ -305,6 +305,8 @@ a key pad appears under the screen with F1 to F10, arrows, Esc, Tab, Ins, Enter,
 and Shift, and a button that opens the phone's keyboard. The page text follows the browser's
 language in English, Russian or Ukrainian, and `H:\ПРОЧТИ.TXT` is the README in Russian.
 
+The page counts visits with [GoatCounter](https://www.goatcounter.com/): no cookies and no personal data, and its `count.js` (ISC) is served from this site, so the only outside request is the count itself. Local builds on `localhost` are never counted.
+
 To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
 
     make web          # build/web/: index.html, vc.mjs, vc.wasm and one wasm per program

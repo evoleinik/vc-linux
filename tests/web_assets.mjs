@@ -103,6 +103,18 @@ else {
 // without a click. Button-event tracking (1002) reports motion only while held.
 if (!sources["vc-web.js"].includes("\\x1b[?1003h"))
   failures.push("vc-web.js: does not enable any-motion mouse tracking (?1003h)");
+// Visits are counted with GoatCounter (Eugene, 2026-10-04). Its count.js is
+// self-hosted, so the page loads no third-party script; only the count
+// request goes to GoatCounter.
+{
+  const page = sources["index.html"];
+  const tag = page.match(/<script[^>]*data-goatcounter=[^>]*>/)?.[0] || "";
+  if (!/data-goatcounter="https:\/\/notanemulator\.goatcounter\.com\/count"/.test(tag))
+    failures.push("index.html: missing the GoatCounter script for notanemulator.goatcounter.com");
+  if (!/src="\.\/vendor\/goatcounter-count\.js\?v=[0-9a-f]+"/.test(tag))
+    failures.push("index.html: GoatCounter's count.js must be self-hosted under ./vendor with ?v=");
+  if (/gc\.zgo\.at/.test(page)) failures.push("index.html: loads a script from gc.zgo.at; self-host it");
+}
 if (versions.size !== 1) failures.push(`expected one build hash, found: ${[...versions].join(", ") || "none"}`);
 
 if (failures.length) {
