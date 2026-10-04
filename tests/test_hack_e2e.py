@@ -8,6 +8,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 import os
 import re
+import time
 import shutil
 import signal
 import tempfile
@@ -116,7 +117,14 @@ def move_player(session):
 
 def quit_hack(session):
     before = len(session.log.read_text())
-    session.send(b"Q")
+    # The dungeon is random: a monster beside the start can leave a --More--
+    # up, which eats the Q. Dismiss it first (web smoke, 2026-10-02).
+    for _ in range(8):
+        if "Really quit?" in session.text():
+            break
+        previous = session.text()
+        session.send(b" " if "--More--" in previous else b"Q")
+        until(session, lambda: session.text() != previous or "Really quit?" in session.text())
     until(session, lambda: "Really quit?" in session.text())
     assert not panels(session.text())
     session.send(b"y")
@@ -335,7 +343,15 @@ def test_hack_command_starts_first_level_with_player_and_status(quick, command):
     with running_vc(quick=quick) as (session, work, config):
         assert (config / "HACK/HACK.EXE").read_bytes() == (ROOT / "build/hack/HACK.EXE").read_bytes()
         assert not (work / "HACK.EXE").exists(), "the native alias must find the installed playground"
-        start_hack(session, command)
+        # Hack lights a level-1 room only 76 times in 77 (mkroom.c), and a dark
+        # start shows no walls at all (CI, 2026-10-04). Play a fresh,
+        # clock-seeded dungeon until one starts lit, at most three times.
+        for attempt in range(3):
+            start_hack(session, command)
+            if any(char in session.text() for char in "│─┌┐└┘"):
+                break
+            quit_hack(session)
+            time.sleep(1.1)
         assert any(char in session.text() for char in "│─┌┐└┘"), "walls use IBM PC line drawing"
         quit_hack(session)
 
