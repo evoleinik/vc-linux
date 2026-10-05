@@ -934,16 +934,29 @@ async function selectFile(name) {
   // The status row, not the listing (where every name is always visible),
   // identifies the active selection. Home makes this independent of which
   // file a preceding viewer or nested program left selected; Down does not
-  // wrap in either original VC. Wait for the key to land before advancing.
-  if (selected(screen).toUpperCase().includes(name.toUpperCase())) return;
-  const reads = inputReads;
-  send('\x1b[H');
-  await until('Home reaches the active panel', () => pending.length === 0 && inputReads > reads + 1);
-  for (let step = 0; step < 40; step++) {
-    const previous = selected(screen);
-    if (previous.toUpperCase().includes(name.toUpperCase())) return;
+  // wrap in either original VC. The row is read only once VC idles and the
+  // screen is quiet: a half-drawn row once looked like a completed move, so
+  // the next Down landed one file late (CI, 2026-10-05). VC 4.05 also drops
+  // keys typed while it redraws, so an unchanged selection resends the key.
+  const settledSelection = async () => {
+    const idle = inputReads;
+    await until('VC idles at its keyboard', () => pending.length === 0 && inputReads > idle + 1);
+    return selected(await settledScreen(150, 5000));
+  };
+  const wanted = (row) => row.toUpperCase().includes(name.toUpperCase());
+  let current = await settledSelection();
+  if (wanted(current)) return;
+  // Home until two presses agree, so a dropped Home cannot pass for the top.
+  for (let tries = 0; tries < 5; tries++) {
+    send('\x1b[H');
+    const top = await settledSelection();
+    if (tries > 0 && top === current) break;
+    current = top;
+  }
+  for (let step = 0; step < 60; step++) {
+    if (wanted(current)) return;
     send('\x1b[B');
-    await until('the selection to move', (text) => selected(text) !== previous);
+    current = await settledSelection();
   }
   assert.fail(`${name} was not reachable in the active panel`);
 }

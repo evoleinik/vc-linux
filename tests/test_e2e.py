@@ -438,12 +438,22 @@ def test_delete_symlink_to_ancestor(work, tmp_path):
 
 
 def test_mouse_click_moves_the_cursor(vc):
+    import time
     vc.pump(1.0)  # VC resets the mouse late in start-up; an earlier click is lost, as in DOS
     lines = vc.text().splitlines()
     y = next(i for i, line in enumerate(lines) if "subdir" in line[40:])
     x = lines[y].index("subdir", 40)
-    vc.send(f"\x1b[<0;{x + 2};{y + 1}M\x1b[<0;{x + 2};{y + 1}m".encode())  # SGR press, release
-    until(vc, lambda: "subdir" in status(vc)[40:])
+    click = f"\x1b[<0;{x + 2};{y + 1}M\x1b[<0;{x + 2};{y + 1}m".encode()  # SGR press, release
+    # On a slow runner the mouse reset can come after the first click, which
+    # VC then drops (CI, 2026-10-05). Clicking the same file again is harmless,
+    # so click again if the cursor has not moved 1.5 s later.
+    end, sent = time.time() + 12, 0.0
+    while time.time() < end and "subdir" not in status(vc)[40:]:
+        if time.time() - sent > 1.5:
+            vc.send(click)
+            sent = time.time()
+        vc.pump(0.1)
+    assert "subdir" in status(vc)[40:], vc.text()
 
 
 # VC's own keys. In a plain terminal Ctrl-[ sends the same byte as Esc, Ctrl-I
