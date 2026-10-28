@@ -42,6 +42,8 @@ while (pending.length) {
 assert.ok(sizes.has('vc.wasm'), 'the main wasm must be included in the first-load budget');
 assert.ok(![...sizes.keys()].some(file => /^(?:hack[.]|file[.]|(?:hack|source)-files[.])/.test(file)),
   'Hack translations and lazy DOS files must be absent from first-load dependencies');
+assert.ok(!sizes.has('vc-programs.js') && !sizes.has('vc-play.js'),
+  'Play commands and their launcher must be absent from normal first-load dependencies');
 const total = [...sizes.values()].reduce((sum, size) => sum + size, 0);
 for (const [file, size] of [...sizes].sort()) console.log(`  ${file}: ${size.toLocaleString('en-US')} gzip bytes`);
 console.log(`web first load: ${total.toLocaleString('en-US')} gzip bytes (${(total / 1_000_000).toFixed(3)} MB; limit 1,300,000)`);

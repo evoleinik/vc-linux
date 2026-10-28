@@ -2,6 +2,7 @@
 // the page. Actions wait for screen state; timers only put a bound on failure.
 // Add --fetch-failure, --fetch-timeout or --memory-limit for recovery gates.
 // Add --keypad-only for the portrait pad's real VC selection/input checks.
+// Add --programs to boot once per published Play slug, or --run=<slug> for one.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -9,6 +10,7 @@ import { readFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isMainThread, parentPort, Worker } from 'node:worker_threads';
+import { runInNewContext } from 'node:vm';
 import { fakeBBS, fixtureReplies } from './fake_bbs.mjs';
 
 function exitAfterOutput(code) {
@@ -18,29 +20,165 @@ function exitAfterOutput(code) {
 }
 
 const timeout = Number(process.env.WEB_SMOKE_TIMEOUT || 10000);
-if (isMainThread) {
-  // A missing Asyncify yield freezes the guest's JS event loop, including
-  // its normal timeout. Keep the failure watchdog outside that thread.
-  const worker = new Worker(new URL(import.meta.url), { argv: process.argv.slice(2) });
-  let deadline;
-  const arm = (description) => {
-    clearTimeout(deadline);
-    deadline = setTimeout(() => {
-      console.error(`FAIL: guest event loop stalled while waiting for ${description}`);
-      worker.terminate().then(() => exitAfterOutput(1));
-    }, timeout + 1000);
-  };
-  arm('startup');
-  worker.on('message', arm);
-  worker.on('error', (error) => { console.error(error); exitAfterOutput(1); });
-  worker.on('exit', (code) => { clearTimeout(deadline); exitAfterOutput(code); });
-  await new Promise(() => {});
-}
-
 const moduleArgument = process.argv.slice(2).find((argument) => !argument.startsWith('--'));
 const modulePath = moduleArgument
   ? resolve(moduleArgument)
   : fileURLToPath(new URL('../build/web/vc.mjs', import.meta.url));
+const programsOnly = process.argv.includes('--programs');
+const runArgument = process.argv.find(argument => argument.startsWith('--run='));
+const runSlug = runArgument === undefined ? null : runArgument.slice('--run='.length);
+const importPublished = name => import(`data:text/javascript,${encodeURIComponent(
+  readFileSync(resolve(dirname(modulePath), name), 'utf8'))}`);
+
+async function checkPlayInput() {
+  const { createProgramLauncher } = await importPublished('vc-play.js');
+  const loader = readFileSync(resolve(dirname(modulePath), 'vc-web.js'), 'utf8');
+  const sample = Object.freeze({ safe: Object.freeze(['first', 'second']) });
+  const renderStart = loader.indexOf('  const initialRender = terminal.onRender(');
+  const renderEnd = loader.indexOf('  await createVC(', renderStart);
+  assert.ok(renderStart >= 0 && renderEnd > renderStart, 'the page exposes its first-screen observer');
+  let render, visibleText = '', disposed = 0;
+  const firstScreen = { playReady: false,
+    screenText: () => visibleText,
+    terminal: { onRender(callback) { render = callback; return { dispose() { disposed++; } }; } },
+    requestAnimationFrame() {},
+  };
+  runInNewContext(loader.slice(renderStart, renderEnd), firstScreen);
+  render();
+  assert.equal(firstScreen.playReady, false, 'a blank startup frame cannot arm Play');
+  visibleText = '10Quit';
+  render();
+  assert.equal(firstScreen.playReady, false, 'an incomplete first screen cannot arm Play');
+  visibleText = 'README 10Quit';
+  render();
+  assert.equal(firstScreen.playReady, true, 'the real first-screen observer arms Play before input polls');
+  assert.equal(disposed, 1, 'the first-screen observer is retired once VC is ready');
+  const queueStart = loader.indexOf('function enqueue(');
+  const queueEnd = loader.indexOf('\nfunction dispatchInput(', queueStart);
+  assert.ok(queueStart >= 0 && queueEnd > queueStart, 'the page exposes its production byte queue');
+  const queueSource = loader.slice(queueStart, queueEnd);
+  const queue = (programs, slug, playReady = true) => {
+    const context = { TextEncoder, Uint8Array, playReady,
+      programLauncher: createProgramLauncher(programs, slug) };
+    runInNewContext(`
+      const encoder = new TextEncoder(), input = [];
+      let inputHead = 0, inputOffset = 0, inputBytes = 0;
+      const exited = false;
+      ${queueSource}
+      this.read = capacity => {
+        const bytes = readInput(capacity);
+        return bytes ? Array.from(bytes) : null;
+      };
+      this.queue = data => enqueue(data, true);
+    `, context);
+    return { read: capacity => {
+      const bytes = context.read(capacity);
+      return bytes === null ? null : Buffer.from(bytes).toString('utf8');
+    }, queue: context.queue, ready: () => { context.playReady = true; } };
+  };
+  const booting = queue(sample, 'safe', false);
+  for (let poll = 0; poll < 4; poll++)
+    assert.equal(booting.read(64), null, 'startup input probes cannot type before VC has its panels');
+  booting.ready();
+  assert.equal(booting.read(64), null, 'startup polls do not count toward VC keyboard readiness');
+  assert.equal(booting.read(64), 'first\r');
+  const input = queue(sample, 'safe');
+  assert.equal(input.read(64), null, 'Play waits for two input polls at startup');
+  assert.equal(input.read(2), 'fi', 'the second idle poll starts only the first whitelisted line');
+  assert.equal(input.read(64), 'rst\r', 'a partial read preserves the rest of the line and Enter');
+  assert.equal(input.read(64), null, 'the next line waits after the last byte is taken');
+  assert.equal(input.read(64), 'second\r', 'the second fresh idle poll starts the next line');
+  assert.equal(input.read(64), null);
+  assert.equal(input.read(64), null, 'completed Play commands never repeat');
+  const busy = queue(sample, 'safe');
+  busy.queue('manual\r');
+  assert.equal(busy.read(2), 'ma');
+  assert.equal(busy.read(64), 'nual\r', 'Play never inserts text into pending user input');
+  assert.equal(busy.read(64), null);
+  assert.equal(busy.read(64), 'first\r', 'user input also resets the idle-read requirement');
+  for (const slug of ['', 'missing', '__proto__', 'constructor', 'toString', 'safe\rdel *.*']) {
+    const unknown = queue(sample, slug);
+    for (let poll = 0; poll < 4; poll++)
+      assert.equal(unknown.read(64), null, `${JSON.stringify(slug)} never becomes guest input`);
+  }
+  const inherited = queue(Object.create({ safe: ['not allowed'] }), 'safe');
+  assert.equal(inherited.read(64), null);
+  assert.equal(inherited.read(64), null, 'inherited properties are not whitelisted commands');
+
+  const loadStart = loader.indexOf('// Ordinary visits fetch neither');
+  const loadEnd = loader.indexOf('\nfunction layoutSource()', loadStart);
+  assert.ok(loadStart >= 0 && loadEnd > loadStart, 'the page exposes its conditional Play imports');
+  const loadSource = loader.slice(loadStart, loadEnd).replaceAll(/\bimport\(/g, 'loadModule(');
+  for (const search of [undefined, '', '?other=safe', '?run=', '?run=missing', '?run=safe',
+    '?run=safe%0Ddel%20*.*']) {
+    const fetched = [];
+    const context = { window: { location: search === undefined ? undefined : { search } },
+      URLSearchParams, console,
+      async loadModule(name) {
+        fetched.push(name.split('?')[0]);
+        return name.includes('vc-programs.js') ? { programs: sample } : { createProgramLauncher };
+      },
+    };
+    runInNewContext(`let programLauncher; ${loadSource}\nthis.launcher = () => programLauncher;`, context);
+    await new Promise(done => setImmediate(done));
+    const hasRun = search && new URLSearchParams(search).has('run');
+    assert.deepEqual(fetched, hasRun ? ['./vc-programs.js', './vc-play.js'] : [],
+      `${String(search)} fetches Play code only for an explicit run parameter`);
+    const launcher = context.launcher();
+    if (launcher) {
+      assert.equal(launcher.poll(0), null);
+      assert.equal(launcher.poll(0), search === '?run=safe' ? 'first\r' : null,
+        'only the map command, never URL text, reaches the guest');
+    }
+  }
+  console.log('PASS Play input: conditional imports, own-key whitelist, empty queue and two fresh input polls');
+}
+
+if (isMainThread) {
+  // A missing Asyncify yield freezes the guest's JS event loop, including
+  // its normal timeout. Keep the failure watchdog outside that thread.
+  const runWorker = argv => new Promise((done, reject) => {
+    const worker = new Worker(new URL(import.meta.url), { argv });
+    let deadline;
+    const arm = description => {
+      clearTimeout(deadline);
+      deadline = setTimeout(() => {
+        console.error(`FAIL: guest event loop stalled while waiting for ${description}`);
+        worker.terminate().then(() => done(1));
+      }, timeout + 1000);
+    };
+    arm('startup');
+    worker.on('message', arm);
+    worker.on('error', error => { clearTimeout(deadline); reject(error); });
+    worker.on('exit', code => { clearTimeout(deadline); done(code); });
+  });
+  try {
+    let runs = [process.argv.slice(2)];
+    if (programsOnly) {
+      await checkPlayInput();
+      const { programs } = await importPublished('vc-programs.js');
+      assert.ok(Object.isFrozen(programs), 'published Play map is frozen');
+      for (const [slug, lines] of Object.entries(programs))
+        assert.ok(Object.isFrozen(lines), `${slug}: published run lines are frozen`);
+      assert.ok(Object.keys(programs).length, 'published Play map is not empty');
+      runs = Object.keys(programs).map(slug => [
+        ...process.argv.slice(2).filter(argument => argument !== '--programs' && !argument.startsWith('--run=')),
+        `--run=${slug}`,
+      ]);
+    }
+    for (const argv of runs) {
+      const code = await runWorker(argv);
+      if (code) { exitAfterOutput(code); await new Promise(() => {}); }
+    }
+    if (programsOnly) console.log(`web Play smoke: ${runs.length} slugs reached their own program screens in fresh VC boots`);
+    exitAfterOutput(0);
+  } catch (error) {
+    console.error(error);
+    exitAfterOutput(1);
+  }
+  await new Promise(() => {});
+}
+
 const fetchFailure = process.argv.includes('--fetch-failure');
 const fetchTimeout = process.argv.includes('--fetch-timeout');
 const memoryLimit = process.argv.includes('--memory-limit');
@@ -88,13 +226,18 @@ let vc;
 let screen = '';
 let pending = new Uint8Array();
 let inputReads = 0;
+let lastByteRead = 0;
+let playLauncher;
+let playReady = false;
+let playLines = [];
+const playCommands = [];
 let outputCalls = 0;
 let startupHeapBytes = 0;
 let startupHeapTop = 0;
 let wasmExports;
 let exitCode;
 let exitCalls = 0;
-let stage = '1 startup';
+let stage = runSlug === null ? '1 startup' : `Play ${runSlug}: startup`;
 let sourcePanel;
 let sourceButton;
 let sourceElement;
@@ -111,6 +254,12 @@ const msdosFiles = ['COMMAND.COM', 'EDLIN.COM', 'DEBUG.COM', 'FIND.EXE', 'MORE.C
 const msdosModules = msdosFiles.map(name => `${name.split('.')[0].toLowerCase()}.wasm`);
 const vc405Modules = ['vc405.wasm', 'vcsetup405.wasm'];
 const programModules = [...legacyModules, ...msdosModules, ...vc405Modules, 'hack.wasm'];
+const playModules = new Map([
+  ['volkov-commander', null], ['volkov-commander-405', 'vc405.wasm'],
+  ['gw-basic', 'gwbasic.wasm'], ['rogue', 'rogue.wasm'], ['hack', 'hack.wasm'],
+  ['ms-dos-2', 'command.wasm'], ['vz-editor', 'vz.wasm'],
+  ['kermit', 'kermit.wasm'], ['bootlogo', 'bootlogo.wasm'],
+]);
 const programFiles = new Map(readdirSync(dirname(modulePath)).flatMap((name) => {
   const match = name.match(/^([a-z0-9]+)\.([0-9a-f]{12})\.wasm$/);
   return match && programModules.includes(`${match[1]}.wasm`) ? [[`${match[1]}.wasm`, name]] : [];
@@ -731,6 +880,57 @@ async function startHack() {
   assert.ok(isHack(screen), 'Hack renders its original level and status');
   assert.equal(hackStatus.exec(screen)[1], '1', 'a fresh Hack starts on level one');
   assert.equal(graphics, null, 'Hack uses the BIOS text display');
+}
+
+async function checkProgramPlay() {
+  stage = `Play ${runSlug}.run`;
+  const module = playModules.get(runSlug);
+  if (module) await releaseProgramFetch(module);
+  switch (runSlug) {
+    case 'gw-basic':
+      await until('GW-BASIC banner and its own Ok prompt', text =>
+        !hasPanels(text) && text.includes('GW-BASIC') && /^Ok\s*$/m.test(text));
+      break;
+    case 'rogue':
+      await until('Rogue dungeon, player and Level/Gold/Hp status', isRogue);
+      break;
+    case 'hack':
+      await startHack();
+      break;
+    case 'ms-dos-2':
+      await until('MS-DOS COMMAND owns the H: prompt', text =>
+        !hasPanels(text) && /^H:\\>\s*$/m.test(text));
+      break;
+    case 'vz-editor': {
+      const firstLine = demoBytes('README.TXT').toString('utf8').split(/\r?\n/)[0];
+      await until('VZ Editor displays README.TXT and its File menu', text =>
+        !hasPanels(text) && text.includes(firstLine) && text.includes('File'));
+      break;
+    }
+    case 'kermit':
+      await until('Kermit CONNECT and the captured fake BBS banner', () =>
+        bbs.calls.length === 1 && (sawModemConnect || sawBBSBanner));
+      await until('Kermit renders the actual fake BBS session', () => sawBBSBanner);
+      modem.close();
+      break;
+    case 'bootlogo':
+      await until('bootLogo CGA canvas and its graphics prompt', () =>
+        graphics?.mode === 4 && graphicsText(graphics).split('\n')[21].trimEnd() === '>');
+      break;
+    case 'volkov-commander-405':
+      await until('Volkov Commander 4.05 panels and version banner', text =>
+        text.split('\n')[0].includes('╔') && text.split('\n')[24].includes('10Quit')
+        && text.includes('Version 4.05'));
+      break;
+    default:
+      await until('Volkov Commander 4.99 panels on H:', text =>
+        isPanel(text) && commandLine(text).trimEnd() === 'H:\\>');
+  }
+  assertFetches();
+  assert.deepEqual(playCommands, playLines.map(line => `${line}\r`),
+    `${runSlug}: exactly the published run lines were typed, each followed by Enter`);
+  assert.equal(exitCalls, 0, `${runSlug}: launching a program does not exit VC`);
+  console.log(`PASS Play ${runSlug}: fresh VC boot, published run lines, real program screen`);
 }
 
 async function quitHack() {
@@ -1767,7 +1967,18 @@ try {
       };
     };
   }
-  if (!fetchFailure && !fetchTimeout && !memoryLimit && !msdosOnly && !hackOnly && !sourceOnly && !keypadOnly && !lazyParentMove && !lazyRmdir) await installSourcePanel();
+  if (runSlug !== null) {
+    const [{ programs }, { createProgramLauncher }] = await Promise.all([
+      importPublished('vc-programs.js'), importPublished('vc-play.js'),
+    ]);
+    const known = Object.hasOwn(programs, runSlug);
+    assert.ok(!known || playModules.has(runSlug), `${runSlug}: add the program's own screen check`);
+    playLines = known ? programs[runSlug] : [];
+    playLauncher = createProgramLauncher(programs, runSlug);
+    const module = known && playModules.get(runSlug);
+    if (module) expectedFetches.push(module);
+  }
+  if (runSlug === null && !fetchFailure && !fetchTimeout && !memoryLimit && !msdosOnly && !hackOnly && !sourceOnly && !keypadOnly && !lazyParentMove && !lazyRmdir) await installSourcePanel();
   const wasmBinary = await readFile(new URL('./vc.wasm', moduleURL));
   const installedAfter = Date.now();
   await createVC({
@@ -1794,8 +2005,20 @@ try {
     vcReadInput(capacity) {
       inputReads++;
       observe();
+      if (isPanel(screen)) playReady = true;
+      const command = playReady ? playLauncher?.poll(pending.length) : null;
+      if (command) {
+        assert.equal(pending.length, 0, `${runSlug}: Play waits for the input queue to empty`);
+        assert.ok(inputReads - lastByteRead >= 2, `${runSlug}: two reads since the last byte was taken`);
+        if (!playCommands.length)
+          assert.ok(isPanel(screen), `${runSlug}: VC has its initial panels before the first command`);
+        playCommands.push(command);
+        send(command);
+      }
       const bytes = pending.slice(0, capacity);
       pending = pending.subarray(bytes.length);
+      playLauncher?.consumed(bytes.length);
+      if (bytes.length) lastByteRead = inputReads;
       return bytes;
     },
     vcOutput() {
@@ -1822,6 +2045,12 @@ try {
     print: (text) => console.log(`[VC stdout] ${text}`),
     printErr: (text) => console.error(`[VC stderr] ${text}`),
   });
+
+  if (runSlug !== null) {
+    await checkProgramPlay();
+    exitAfterOutput(0);
+    await new Promise(() => {});
+  }
 
   await until('10Quit and README in the H: listing', (text) =>
     isPanel(text) && text.includes('H:\\'));

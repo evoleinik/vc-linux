@@ -315,6 +315,17 @@ To build it, put Emscripten on your PATH (`source emsdk_env.sh`), then:
 Serve `build/web/` over HTTPS, or HTTP on localhost, to open it. Lazy-file SHA-256 verification
 uses WebCrypto when available and a portable fallback otherwise. The design is in `docs/plans/2026-10-01-browser-build.md`.
 
+### Program pages
+
+The site's English and Russian program pages come from `site/pages.toml`;
+`tools/site_pages.py` renders them, the sitemap and `llms.txt` into `build/web/`
+as part of `make web`. To add a page, add a `[[program]]` with its metadata,
+`en` and `ru` text, keyboard-idle `run` commands, and every lazy side-module
+basename it owns in `modules`. Each module must belong to exactly one page.
+Run `make web test-web` to check the pages and boot every Play target.
+Russian text comes from Gemini, never from Claude or Codex; keep supplied
+page prose unchanged and obtain an approved translation when it needs updating.
+
 ## Why shouldn't I use it?
 
 - **It is VC 4.99.09, an alpha from 2000.** Its own editor is switched off in the source. Some

@@ -396,7 +396,7 @@ WEB_PACKED_FILES := $(filter-out $(addprefix $(WEB_DEMO)/,$(WEB_INSTALLED)),$(WE
 WEB_LAZY_EXTRA := $(foreach f,$(WEB_PACKED_FILES),--web-only-lazy=$(patsubst $(WEB_DEMO)/%,%,$(f))=$(f))
 # Also applies to native packaging: generating references never invokes emcc.
 $(B)/gen/files.c $(B)/gen/files.web.json: $(WEB_DEMO_FILES)
-WEB_ASSETS := web/index.html web/vc-web.js web/vc-layout.js web/vc-source.js web/vc-keypad.js web/vc-language.js web/speaker.js web/graphics.js web/modem.js $(wildcard web/vendor/*)
+WEB_ASSETS := web/index.html web/vc-web.js web/vc-layout.js web/vc-source.js web/vc-keypad.js web/vc-language.js web/vc-play.js web/speaker.js web/graphics.js web/modem.js $(wildcard web/vendor/*)
 WEB_COPIES := $(patsubst web/%,$(WEB_OUT)/%,$(WEB_ASSETS))
 WEB_SOURCE_INDEX := $(WEB_WORK)/source-index-name.txt
 WEB_SOURCE_INPUTS := $(B)/VC.COM $(B)/VC.OVL $(B)/gen/VC.COM.lst $(B)/gen/VC.OVL.lst \
@@ -466,9 +466,9 @@ $(WEB_OUT)/%: web/%
 # Startup assets keep today's ?v= stamp. Lazy modules instead carry their
 # side-generation hash in the filename, which Pages cannot ignore on deploy.
 WEB_VERSIONED := $(WEB_OUT)/index.html $(WEB_OUT)/vc-web.js
-$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_BINARIES) $(WEB_ASSETS) $(WEB_SOURCE_INDEX)
+$(WEB_VERSIONED): $(WEB_OUT)/%: web/% $(WEB_BINARIES) $(WEB_ASSETS) $(WEB_SOURCE_INDEX) site/pages.toml tools/site_pages.py
 	@mkdir -p $(dir $@)
-	v=$$(cat $(WEB_BINARIES) $(WEB_ASSETS) $(WEB_SOURCE_INDEX) | sha256sum | cut -c1-12); \
+	v=$$({ cat $(WEB_BINARIES) $(WEB_ASSETS) $(WEB_SOURCE_INDEX); $(PY) tools/site_pages.py --print-programs; } | sha256sum | cut -c1-12); \
 	  source_index=$$(cat $(WEB_SOURCE_INDEX)); \
 	  sed "s/__V__/$$v/g; s/__SOURCE_INDEX__/$$source_index/g" $< > $@
 
@@ -476,6 +476,7 @@ web: $(WEB_BINARIES) $(WEB_COPIES)
 	@$(PY) tools/web_modules.py $(WEB_WORK) $(WEB_OUT)
 	@$(PY) tools/web_files.py $(B)/gen/files.web.json $(WEB_OUT) $(WEB_WORK)
 	@$(PY) tools/source_maps.py --restore --out $(WEB_OUT) --work $(WEB_WORK)
+	@$(PY) tools/site_pages.py --output $(WEB_OUT)
 
 $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/source-runtime.wasm &: tests/source_runtime.c runtime/rt.c $(wildcard runtime/*.h)
 	@mkdir -p $(WEB_WORK)
@@ -498,6 +499,7 @@ test-web-sha256: $(B)/test_web_sha256
 test: test-web-sha256
 
 test-web: web $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/files-test.mjs test-web-sha256
+	$(PY) -m pytest -q tests/test_site_pages.py
 	$(NODE) tests/web_assets.mjs $(WEB_OUT)
 	$(NODE) tests/web_size.mjs $(WEB_OUT)
 	$(NODE) tests/test_source_maps.mjs $(WEB_OUT)
@@ -513,6 +515,7 @@ test-web: web $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/files-test.mjs test-web
 	$(NODE) tests/test_web_speaker.mjs
 	$(NODE) tests/test_web_graphics.mjs
 	$(NODE) tests/test_web_modem.mjs
+	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --programs
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --hack-only --no-webcrypto
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --source-only --no-webcrypto
@@ -523,5 +526,7 @@ test-web: web $(WEB_WORK)/source-runtime.mjs $(WEB_WORK)/files-test.mjs test-web
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --memory-limit
 	$(NODE) tests/web_smoke.mjs $(WEB_OUT)/vc.mjs --file-fetch-failure
 	$(NODE) tests/web_command_fixes.mjs $(WEB_OUT)/vc.mjs
+	$(NODE) tests/test_site_mutations.mjs $(WEB_OUT)
+	$(NODE) tests/test_site.mjs $(WEB_OUT)
 
 .PHONY: web test-web test-web-sha256

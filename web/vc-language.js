@@ -6,6 +6,8 @@ const texts = {
     footer: "Volkov Commander 4.99, machine-translated from 8086 assembly to WebAssembly. "
       + "Not an emulator. Files live in memory and vanish on reload. ",
     linux: "Linux version on GitHub.",
+    programs: "Programs",
+    programsPath: "/programs/",
     fontCredit: "IBM VGA font: ",
     quit: "VC has quit. Press any key to start it again.",
     keyboard: "Keyboard",
@@ -15,6 +17,8 @@ const texts = {
     footer: "Volkov Commander 4.99, автоматически переведен с ассемблера 8086 в "
       + "WebAssembly. Это не эмулятор. Файлы живут в памяти и исчезают при обновлении страницы. ",
     linux: "Версия для Linux доступна на GitHub.",
+    programs: "Программы",
+    programsPath: "/ru/",
     fontCredit: "Шрифт IBM VGA: ",
     quit: "VC завершил работу. Нажмите любую клавишу, чтобы запустить его снова.",
     keyboard: "Клавиатура",
@@ -24,6 +28,8 @@ const texts = {
     footer: "Volkov Commander 4.99, автоматично перекладений з асемблера 8086 на "
       + "WebAssembly. Це не емулятор. Файли живуть у пам'яті та зникають при оновленні сторінки. ",
     linux: "Версія для Linux доступна на GitHub.",
+    programs: "Програми",
+    programsPath: "/programs/",
     fontCredit: "Шрифт IBM VGA: ",
     quit: "VC завершив роботу. Натисніть будь-яку клавішу, щоб запустити його знову.",
     keyboard: "Клавіатура",

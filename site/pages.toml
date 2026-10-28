@@ -1,0 +1,343 @@
+# The text of notanemulator.com's static pages, one entry per program plus the hub.
+# tools/site_pages.py renders this into build/web. English is written here; the Russian
+# ([*.ru]) is translated by Gemini (gemini-3.1-pro-preview), never by hand or by Claude/Codex.
+#
+# Body text is paragraphs separated by blank lines. The only markup is [text](url).
+# `run` is typed on VC's command line, one line at a time, when someone presses Play.
+# An empty `run` means Play opens VC itself.
+
+site = "https://notanemulator.com"
+repo = "https://github.com/evoleinik/vc-linux"
+doi = "https://doi.org/10.5281/zenodo.23085585"
+
+# Interface labels on every page.
+[labels.en]
+play = "Play"
+source = "Source and licence"
+
+[labels.ru]
+play = "Запустить"
+source = "Исходный код и лицензия"
+
+[hub.en]
+path = "/programs/"
+title = "DOS programs that run without an emulator | notanemulator"
+description = "Volkov Commander, GW-BASIC, Rogue, Hack, MS-DOS 2.0 and more, translated from 8086 code to C and WebAssembly. Play them in your browser."
+h1 = "DOS programs, translated instead of emulated"
+body = """
+notanemulator.com runs original DOS programs in your browser, but not inside an emulator. Each program's 8086 machine code was translated to C once, instruction by instruction. That C was then compiled to WebAssembly for the browser, and to a native program for Linux. When you press a key, compiled code runs, the same as in any other program.
+
+Every program here is kept as three things side by side. The first is its original source, unedited. The second is a reproducible build of that source, made the way it was originally built. The third is the machine translation to C. Every distinct instruction in each program is checked against the unicorn CPU emulator from random starting states, and the translated C is never edited by hand. Only DOS and the PC hardware around the CPU are rewritten by hand.
+
+Volkov Commander 4.99 starts first. The other programs live on its H: drive. Files you create live in memory and vanish when you reload the page.
+
+The source, the build and the translator are on [GitHub](https://github.com/evoleinik/vc-linux). Each release is archived on [Zenodo](https://doi.org/10.5281/zenodo.23085585).
+"""
+
+[hub.ru]
+path = "/ru/"
+title = "Программы DOS, работающие без эмулятора | notanemulator"
+description = "Volkov Commander, GW-BASIC, Rogue, Hack, MS-DOS 2.0 и другие программы, транслированные из 8086-кода в C и WebAssembly. Играйте в браузере."
+h1 = "DOS-программы: трансляция вместо эмуляции"
+body = """
+notanemulator.com запускает оригинальные программы для DOS в браузере, но не в эмуляторе. Машинный код 8086 каждой программы был однократно транслирован в C, инструкция за инструкцией. Этот C-код затем скомпилировали в WebAssembly для браузера и в нативное приложение для Linux. Когда вы нажимаете клавишу, выполняется скомпилированный код, как в любой другой программе.
+
+Каждая программа хранится здесь в виде трех составляющих. Первая — ее оригинальный исходный код без изменений. Вторая — воспроизводимая сборка этого кода, сделанная так же, как в оригинале. Третья — машинный перевод в C. Каждая уникальная инструкция в каждой программе проверяется на эмуляторе процессора unicorn из случайных начальных состояний, а транслированный C-код никогда не правится вручную. Только DOS и аппаратная часть ПК вокруг процессора переписаны вручную.
+
+Первым запускается Volkov Commander 4.99. Остальные программы находятся на его диске H:. Созданные вами файлы живут в памяти и исчезают при перезагрузке страницы.
+
+Исходный код, сборка и транслятор находятся на [GitHub](https://github.com/evoleinik/vc-linux). Каждый релиз архивируется на [Zenodo](https://doi.org/10.5281/zenodo.23085585).
+"""
+
+[[program]]
+slug = "volkov-commander"
+schema_type = "SoftwareApplication"
+category = "UtilitiesApplication"
+name = "Volkov Commander"
+authors = ["Vsevolod Volkov"]
+years = "1991-2000"
+license = "BSD-2-Clause"
+license_path = "asm/LICENSE.TXT"
+source_url = "https://github.com/evoleinik/vc-linux/tree/main/asm"
+linux = "vc"
+run = []
+modules = ["vc405", "vcsetup405"]
+also_run = { slug = "volkov-commander-405", label = "Volkov Commander 4.05", run = ["H:\\VC405\\VC.COM"] }
+
+[program.en]
+title = "Volkov Commander 4.99 and 4.05: the DOS file manager"
+description = "Run Volkov Commander 4.99 and 4.05 in your browser, translated from the original 8086 assembly to WebAssembly. No emulator, no download."
+h1 = "Volkov Commander"
+body = """
+Volkov Commander is a two-panel DOS file manager in the style of Norton Commander. Vsevolod Volkov wrote it in 8086 assembly between 1991 and 2000, and it was one of the most widely used DOS file managers in Russia and the other former Soviet countries. In 2026 he released its source under the BSD 2-Clause licence. Danila Sukharev had already preserved that source and made it build with the open JWasm assembler.
+
+This page runs Volkov Commander 4.99.09, the last version, translated from its own assembly into C and compiled to WebAssembly. F3 views a file, F4 edits it in VZ Editor, F5 copies, F6 moves, F7 makes a directory and F8 deletes. Alt-F10 shows the directory tree. On a phone, an on-screen keyboard gives you the F-keys.
+
+Volkov Commander 4.05 is here too, on the H: drive. JWasm builds it byte for byte identical to the original build made with Borland's TASM.
+
+On Linux, the same translated code is a native program that manages your real files, including long and Cyrillic names. It is one static binary, on the [releases page](https://github.com/evoleinik/vc-linux/releases/latest).
+"""
+
+[program.ru]
+title = "Волков Коммандер (Volkov Commander) онлайн в браузере"
+description = "Запускайте Volkov Commander 4.99 и 4.05 в браузере. Оригинальный код на ассемблере 8086 транслирован в WebAssembly. Без эмуляторов и загрузок."
+h1 = "Volkov Commander"
+body = """
+Volkov Commander — двухпанельный файловый менеджер для DOS в стиле Norton Commander. Всеволод Волков писал его на ассемблере 8086 с 1991 по 2000 год, и это был один из самых популярных файловых менеджеров DOS в России и других странах бывшего СССР. В 2026 году он открыл исходный код под лицензией BSD 2-Clause. Данила Сухарев до этого сохранил эти исходники и заставил их собираться открытым ассемблером JWasm.
+
+На этой странице работает Volkov Commander 4.99.09, последняя версия, транслированная из своего ассемблерного кода в C и скомпилированная в WebAssembly. F3 показывает файл, F4 открывает его в VZ Editor, F5 копирует, F6 перемещает, F7 создает каталог, а F8 удаляет. Alt-F10 показывает дерево каталогов. На телефоне F-клавиши доступны на экранной клавиатуре.
+
+Volkov Commander 4.05 тоже здесь, на диске H:. JWasm собирает его байт в байт идентично оригинальной сборке, сделанной с помощью TASM от Borland.
+
+В Linux этот же транслированный код работает как нативная программа для управления вашими реальными файлами, включая длинные имена и кириллицу. Это один статический бинарник на [странице релизов](https://github.com/evoleinik/vc-linux/releases/latest).
+"""
+
+[[program]]
+slug = "gw-basic"
+schema_type = "SoftwareApplication"
+category = "DeveloperApplication"
+name = "GW-BASIC"
+authors = ["Microsoft"]
+years = "1983"
+license = "MIT"
+license_path = "third_party/gwbasic/LICENSE"
+source_url = "https://github.com/evoleinik/vc-linux/tree/main/third_party/gwbasic"
+linux = "gwbasic"
+run = ["gwbasic"]
+modules = ["gwbasic"]
+
+[program.en]
+title = "GW-BASIC online: Microsoft's 1983 BASIC in your browser"
+description = "Run Microsoft GW-BASIC from 1983 in your browser, with twelve classic BASIC Computer Games and CGA graphics. Translated from 8086 code, not emulated."
+h1 = "GW-BASIC"
+body = """
+GW-BASIC is the BASIC interpreter Microsoft shipped with MS-DOS from 1983. Microsoft released its 8086 assembly source under the MIT licence in 2020. TK Chia's fork adds the OEM modules that release left out. This page runs that fork, assembled with JWasm and then translated to C and WebAssembly.
+
+Twelve games from David H. Ahl's 1978 book BASIC Computer Games are on the H: drive, in the GAMES directory: Acey Ducey, Amazing, Animal, Bagels, Blackjack, Hamurabi, Hangman, Hurkle, Life, Lunar LEM, Super Star Trek and Tic-Tac-Toe. In Volkov Commander, select a .BAS file and press Enter to run it. Type SYSTEM to return to Volkov Commander.
+
+CGA graphics work. SCREEN 1, PSET, LINE, CIRCLE and DRAW draw on a real 320x200 four-colour screen, and the browser shows the exact pixels. The original interpreter has only 31 bytes of typeahead, so type long lines rather than pasting them.
+"""
+
+[program.ru]
+title = "GW-BASIC онлайн: BASIC 1983 года от Microsoft в браузере"
+description = "Работайте в Microsoft GW-BASIC 1983 года прямо в браузере. Графика CGA и 12 игр из BASIC Computer Games. Транслировано из кода 8086, не эмуляция."
+h1 = "GW-BASIC"
+body = """
+GW-BASIC — интерпретатор языка BASIC, который Microsoft поставляла вместе с MS-DOS начиная с 1983 года. В 2020 году Microsoft открыла его исходный код на ассемблере 8086 под лицензией MIT. Форк TK Chia добавляет модули OEM, не вошедшие в этот релиз. На этой странице работает именно этот форк, собранный с помощью JWasm, а затем транслированный в C и WebAssembly.
+
+Двенадцать игр из книги BASIC Computer Games, изданной David H. Ahl в 1978 году, находятся на диске H:, в каталоге GAMES: Acey Ducey, Amazing, Animal, Bagels, Blackjack, Hamurabi, Hangman, Hurkle, Life, Lunar LEM, Super Star Trek и Tic-Tac-Toe. В Volkov Commander выберите файл .BAS и нажмите Enter, чтобы его запустить. Введите SYSTEM для возврата в Volkov Commander.
+
+Графика CGA работает. Команды SCREEN 1, PSET, LINE, CIRCLE и DRAW рисуют на настоящем четырехцветном экране 320x200, а браузер показывает в точности те же пиксели. В оригинальном интерпретаторе буфер опережающего ввода составляет всего 31 байт, поэтому длинные строки лучше печатать, а не вставлять целиком.
+"""
+
+[[program]]
+slug = "rogue"
+schema_type = "VideoGame"
+category = "GameApplication"
+name = "Rogue"
+authors = ["Michael Toy", "Ken Arnold", "Glenn Wichman"]
+years = "1980-1985"
+license = "BSD-3-Clause"
+license_path = "third_party/rogue/LICENSE.TXT"
+source_url = "https://github.com/evoleinik/vc-linux/tree/main/third_party/rogue"
+linux = "rogue"
+run = ["rogue"]
+modules = ["rogue"]
+
+[program.en]
+title = "Play Rogue online: the original 1980 roguelike"
+description = "Play Rogue 5.4.4, the game that named the roguelike genre, in your browser. Built from its original C source for DOS, then translated to WebAssembly."
+h1 = "Rogue"
+body = """
+Rogue is the dungeon game that gave the roguelike genre its name. Michael Toy and Glenn Wichman wrote it in 1980, and Ken Arnold joined them to develop it further. You go down through randomly generated dungeon levels to find the Amulet of Yendor and bring it back up.
+
+This is Rogue 5.4.4, the last version of the original code, under the BSD 3-Clause licence. Its unedited C source is compiled for DOS with OpenWatcom and PDCurses, and the resulting DOS program is translated to C and WebAssembly. Small DOS shims stand in for Unix calls, and the vendored sources are never edited.
+
+Move with h, j, k and l or the arrow keys, and press ? for help. S, then y, saves your game, and running rogue again restores it. Q, then y, quits.
+"""
+
+[program.ru]
+title = "Играть в Rogue онлайн: оригинальный рогалик 1980 года"
+description = "Играйте в браузере в Rogue 5.4.4, давшую название жанру рогалик. Собрана из оригинальных исходников на C для DOS, транслирована в WebAssembly."
+h1 = "Rogue"
+body = """
+Rogue — это игра про подземелья, давшая название жанру рогалик. Michael Toy и Glenn Wichman написали ее в 1980 году, а позже к ним присоединился Ken Arnold для дальнейшей разработки. Вы спускаетесь по случайно сгенерированным уровням подземелья, чтобы найти Амулет Йендора и вынести его на поверхность.
+
+Здесь представлена Rogue 5.4.4 — последняя версия оригинального кода под лицензией BSD 3-Clause. Ее неизмененный исходный код на C скомпилирован для DOS с помощью OpenWatcom и PDCurses, а полученная DOS-программа транслирована в C и WebAssembly. Небольшие прослойки DOS заменяют вызовы Unix, а сторонние исходные тексты никогда не редактируются.
+
+Двигайтесь с помощью h, j, k и l или клавиш со стрелками, а для справки нажмите ?. Нажатие S, а затем y сохраняет игру, а повторный запуск rogue ее восстанавливает. Нажатие Q, а затем y — выход.
+"""
+
+[[program]]
+slug = "hack"
+schema_type = "VideoGame"
+category = "GameApplication"
+name = "Hack"
+authors = ["Jay Fenlason", "Andries Brouwer"]
+years = "1982-1985"
+license = "BSD-3-Clause"
+license_path = "third_party/hack/COPYRIGHT"
+source_url = "https://github.com/evoleinik/vc-linux/tree/main/third_party/hack"
+linux = "hack103"
+run = ["hack"]
+modules = ["hack"]
+
+[program.en]
+title = "Play Hack 1.0.3 online: the roguelike before NetHack"
+description = "Play Hack 1.0.3 in your browser, the roguelike between Rogue and NetHack. Its NetBSD source, built for DOS and translated to WebAssembly."
+h1 = "Hack 1.0.3"
+body = """
+Hack sits between Rogue and NetHack. Jay Fenlason started it in 1982, and Andries Brouwer greatly extended it until 1985. NetHack grew out of Hack, and NetBSD still maintains Hack 1.0.3 today.
+
+This page runs Hack 1.0.3 from NetBSD's source, under the BSD 3-Clause licence. It is compiled for DOS with OpenWatcom, and the DOS program is translated to C and WebAssembly. Walls are drawn with the IBM PC's line characters.
+
+Move with h, j, k and l, and press ? for help. S saves, and Q then y quits.
+"""
+
+[program.ru]
+title = "Играть в Hack 1.0.3 онлайн: рогалик до NetHack в браузере"
+description = "Играйте в Hack 1.0.3 в браузере — рогалик между Rogue и NetHack. Исходный код игры из NetBSD собран для DOS и транслирован в WebAssembly."
+h1 = "Hack 1.0.3"
+body = """
+Hack занимает место между Rogue и NetHack. Jay Fenlason начал работу над ней в 1982 году, а Andries Brouwer значительно расширил ее до 1985 года. Из Hack вырос NetHack, и проект NetBSD поддерживает Hack 1.0.3 по сей день.
+
+На этой странице работает Hack 1.0.3 из исходного кода NetBSD под лицензией BSD 3-Clause. Она скомпилирована для DOS с помощью OpenWatcom, а DOS-программа транслирована в C и WebAssembly. Стены отрисовываются с помощью псевдографики IBM PC.
+
+Двигайтесь клавишами h, j, k и l, а для справки нажмите ?. S сохраняет, а Q, затем y — выходит.
+"""
+
+[[program]]
+slug = "ms-dos-2"
+schema_type = "SoftwareApplication"
+category = "UtilitiesApplication"
+name = "MS-DOS 2.0 COMMAND.COM"
+authors = ["Microsoft"]
+years = "1983"
+license = "MIT"
+license_path = "third_party/msdos2/LICENSE"
+source_url = "https://github.com/evoleinik/vc-linux/tree/main/third_party/msdos2"
+linux = "dos2"
+run = ["command"]
+modules = ["command", "edlin", "debug", "find", "more", "sort", "fc"]
+
+[program.en]
+title = "MS-DOS 2.0 online: COMMAND.COM, EDLIN and DEBUG"
+description = "Run Microsoft's MS-DOS 2.0 shell and utilities in your browser: COMMAND.COM, EDLIN, DEBUG, FIND, MORE, SORT and FC, from their released source."
+h1 = "MS-DOS 2.0 COMMAND.COM"
+body = """
+MS-DOS 2.0 came out in 1983 and brought directories, file handles and the shell most people remember. Microsoft released its source under the MIT licence. This page runs MS-DOS 2.0's own COMMAND.COM and its utilities EDLIN, DEBUG, FIND, MORE, SORT and FC, assembled from that source and translated to C and WebAssembly.
+
+Type command on Volkov Commander's command line to get the MS-DOS 2.0 prompt. DIR, TYPE, COPY, ECHO and .BAT files work. EXIT brings back Volkov Commander's panels. In the browser, Volkov Commander also runs the commands you type through this COMMAND.COM.
+"""
+
+[program.ru]
+title = "MS-DOS 2.0 онлайн: COMMAND.COM, EDLIN и DEBUG в браузере"
+description = "Оболочка и утилиты MS-DOS 2.0 от Microsoft онлайн: COMMAND.COM, EDLIN, DEBUG, FIND, MORE, SORT и FC из открытых исходников работают в браузере."
+h1 = "MS-DOS 2.0 COMMAND.COM"
+body = """
+MS-DOS 2.0 вышла в 1983 году и принесла каталоги, файловые дескрипторы и оболочку, которую помнит большинство. Microsoft открыла ее код под лицензией MIT. На этой странице работает собственный COMMAND.COM из MS-DOS 2.0 и ее утилиты EDLIN, DEBUG, FIND, MORE, SORT и FC, ассемблированные из этого кода и транслированные в C и WebAssembly.
+
+Введите command в командной строке Volkov Commander, чтобы получить приглашение MS-DOS 2.0. Команды DIR, TYPE, COPY, ECHO и файлы .BAT работают. EXIT возвращает панели Volkov Commander. В браузере Volkov Commander также выполняет вводимые вами команды через этот COMMAND.COM.
+"""
+
+[[program]]
+slug = "vz-editor"
+schema_type = "SoftwareApplication"
+category = "DeveloperApplication"
+name = "VZ Editor"
+authors = ["c.mos"]
+years = "1990s"
+license = "BSD-3-Clause"
+license_path = "third_party/vzeditor/LICENSE"
+source_url = "https://github.com/evoleinik/vc-linux/tree/main/third_party/vzeditor"
+linux = "vz"
+run = ["vz README.TXT"]
+modules = ["vz"]
+
+[program.en]
+title = "VZ Editor online: the DOS text editor in your browser"
+description = "Run VZ Editor 1.6, the fast DOS text editor written in assembly by c.mos, in your browser. Its released source, translated to WebAssembly."
+h1 = "VZ Editor"
+body = """
+VZ Editor is a small, fast text editor for DOS, written in assembly by c.mos and sold by Village Center in the 1990s. It was very popular in Japan. Its source was later released under the BSD 3-Clause licence. This page runs the English US build of VZ Editor 1.6, assembled from that source and translated to C and WebAssembly.
+
+In the browser, F4 in Volkov Commander opens the selected file in VZ Editor. Backups are on by default, so saving keeps the previous version beside the file.
+"""
+
+[program.ru]
+title = "VZ Editor онлайн: текстовый редактор DOS в браузере"
+description = "Запускайте VZ Editor 1.6 в браузере — быстрый текстовый редактор DOS на ассемблере от c.mos. Его открытый исходный код транслирован в WebAssembly."
+h1 = "VZ Editor"
+body = """
+VZ Editor — это небольшой и быстрый текстовый редактор для DOS, написанный на ассемблере автором c.mos и продаваемый Village Center в 1990-х. Он был очень популярен в Японии. Позже его исходный код был опубликован под лицензией BSD 3-Clause. На этой странице работает английская сборка (США) редактора VZ Editor 1.6, ассемблированная из этих исходников и транслированная в C и WebAssembly.
+
+В браузере клавиша F4 в Volkov Commander открывает выбранный файл в VZ Editor. Резервные копии включены по умолчанию, поэтому при сохранении предыдущая версия остается рядом с файлом.
+"""
+
+[[program]]
+slug = "kermit"
+schema_type = "SoftwareApplication"
+category = "CommunicationApplication"
+name = "MS-DOS Kermit"
+authors = ["Columbia University"]
+years = "1982-1997"
+license = "BSD-3-Clause"
+license_path = "third_party/mskermit/LICENSE"
+source_url = "https://github.com/evoleinik/vc-linux/tree/main/third_party/mskermit"
+linux = "kermit"
+run = ["kermit stay, take BBS.TAK"]
+modules = ["kermit"]
+
+[program.en]
+title = "MS-DOS Kermit online: dial a real BBS from your browser"
+description = "MS-DOS Kermit 3.15 dials a real BBS through a virtual Hayes modem at 14400 bps, in your browser. Columbia University's source, translated to WebAssembly."
+h1 = "MS-DOS Kermit"
+body = """
+MS-DOS Kermit is Columbia University's terminal and file-transfer program, developed from 1982 to 1997. Its source was released under the BSD 3-Clause licence in 2011. This page runs version 3.15, translated from 8086 code to C and WebAssembly.
+
+Press Play and Kermit dials the notanemulator BBS. A virtual Hayes modem answers ATDT555-1992 with CONNECT 14400 and carries the session at about 14400 bits per second. Kermit's own script sets its ANSI terminal with PC colours and the original character set. Ctrl-] then C returns to Kermit's prompt. HANGUP, then EXIT, returns to Volkov Commander.
+"""
+
+[program.ru]
+title = "MS-DOS Kermit онлайн: звоните на BBS прямо из браузера"
+description = "Звоните на реальную BBS в MS-DOS Kermit 3.15 через виртуальный модем Hayes на 14400 бит/с. Исходники Columbia University в WebAssembly."
+h1 = "MS-DOS Kermit"
+body = """
+MS-DOS Kermit — программа терминала и передачи файлов от Columbia University, разрабатывавшаяся с 1982 по 1997 год. Ее исходный код был опубликован под лицензией BSD 3-Clause в 2011 году. На этой странице работает версия 3.15, транслированная из кода 8086 в C и WebAssembly.
+
+Нажмите «Запустить», и Kermit позвонит на BBS notanemulator. Виртуальный модем Hayes отвечает на ATDT555-1992 строкой CONNECT 14400 и ведет обмен на скорости около 14400 бит в секунду. Собственный скрипт Kermit настраивает ANSI-терминал с цветами ПК и оригинальной таблицей символов. Нажатие Ctrl-], а затем C, возвращает к приглашению Kermit. HANGUP, а затем EXIT, возвращает в Volkov Commander.
+"""
+
+[[program]]
+slug = "bootlogo"
+schema_type = "SoftwareApplication"
+category = "EducationalApplication"
+name = "bootLogo"
+authors = ["Oscar Toledo G."]
+years = "2024"
+license = "BSD-2-Clause"
+license_path = "third_party/bootlogo/LICENSE"
+source_url = "https://github.com/evoleinik/vc-linux/tree/main/third_party/bootlogo"
+linux = "bootlogo"
+run = ["bootlogo"]
+modules = ["bootlogo"]
+
+[program.en]
+title = "bootLogo online: a Logo with turtle graphics in 512 bytes"
+description = "Run bootLogo, Oscar Toledo G.'s Logo interpreter that fits in 512 bytes, with CGA turtle graphics in your browser. Translated from 8086 code."
+h1 = "bootLogo"
+body = """
+bootLogo is a Logo interpreter with turtle graphics that fits in 512 bytes, the size of a disk's boot sector. Oscar Toledo G. wrote it in 8086 assembly in 2024 and released it under the BSD 2-Clause licence. This page runs it as a DOS program, translated to C and WebAssembly, drawing on a CGA screen.
+
+Type commands such as FD 50, RT 90 and REPEAT 4 [FD 50 RT 90] to move the turtle. Keep it simple, because the interpreter is tiny. Always close brackets, keep procedure definitions under 120 characters, and avoid zero distances or repeat counts. QUIT, then Enter, returns to Volkov Commander.
+"""
+
+[program.ru]
+title = "bootLogo онлайн: Logo в 512 байт с черепашьей графикой"
+description = "Запускайте в браузере bootLogo, интерпретатор Logo от Oscar Toledo G. в 512 байт, с черепашьей графикой CGA. Транслировано из кода 8086."
+h1 = "bootLogo"
+body = """
+bootLogo — это интерпретатор Logo с черепашьей графикой, который умещается в 512 байт, размер загрузочного сектора диска. Oscar Toledo G. написал его на ассемблере 8086 в 2024 году и выпустил под лицензией BSD 2-Clause. На этой странице он работает как DOS-программа, транслированная в C и WebAssembly, рисующая на экране CGA.
+
+Вводите команды, такие как FD 50, RT 90 и REPEAT 4 [FD 50 RT 90], чтобы двигать черепашку. Не усложняйте код, так как интерпретатор крошечный. Всегда закрывайте скобки, делайте определения процедур короче 120 символов и не используйте ноль для расстояния или количества повторов. QUIT, затем Enter, возвращает в Volkov Commander.
+"""

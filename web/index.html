@@ -4,8 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="description" content="Volkov Commander, translated from 8086 assembly to WebAssembly. Not an emulator.">
-  <title>Volkov Commander: not an emulator</title>
+  <meta name="description" content="Run Volkov Commander, GW-BASIC, Rogue, Hack, MS-DOS 2.0, VZ Editor, Kermit and bootLogo in your browser, translated from 8086 code to WebAssembly. No emulator.">
+  <title>Volkov Commander online: DOS programs, not an emulator</title>
+  <link rel="canonical" href="https://notanemulator.com/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="notanemulator">
+  <meta property="og:title" content="Volkov Commander online: DOS programs, not an emulator">
+  <meta property="og:description" content="Run Volkov Commander, GW-BASIC, Rogue, Hack, MS-DOS 2.0, VZ Editor, Kermit and bootLogo in your browser, translated from 8086 code to WebAssembly. No emulator.">
+  <meta property="og:url" content="https://notanemulator.com/">
+  <meta property="og:image" content="https://notanemulator.com/social-preview.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Volkov Commander online: DOS programs, not an emulator">
+  <meta name="twitter:description" content="Run Volkov Commander, GW-BASIC, Rogue, Hack, MS-DOS 2.0, VZ Editor, Kermit and bootLogo in your browser, translated from 8086 code to WebAssembly. No emulator.">
+  <meta name="twitter:image" content="https://notanemulator.com/social-preview.png">
+  <script type="application/ld+json">
+    {"@context":"https://schema.org","@graph":[{"@type":"WebSite","name":"notanemulator","url":"https://notanemulator.com/","inLanguage":"en"},{"@type":"SoftwareApplication","name":"Volkov Commander","softwareVersion":"4.99.09","author":{"@type":"Person","name":"Vsevolod Volkov"},"dateCreated":"1991","license":"https://github.com/evoleinik/vc-linux/blob/main/asm/LICENSE.TXT","isBasedOn":"https://github.com/evoleinik/vc-linux/tree/main/asm","applicationCategory":"UtilitiesApplication","operatingSystem":"MS-DOS, run in a web browser as WebAssembly","isAccessibleForFree":true,"inLanguage":"en","url":"https://notanemulator.com/"}]}
+  </script>
   <link rel="preload" href="./vendor/WebPlus_IBM_VGA_8x16.woff?v=__V__" as="font" type="font/woff" crossorigin>
   <link rel="preload" href="./vc.wasm?v=__V__" as="fetch" type="application/wasm" crossorigin>
   <link rel="modulepreload" href="./vc.mjs?v=__V__">
@@ -204,7 +220,7 @@
     <footer>
       <p id="exit-message" role="status" hidden></p>
       <p><span id="page-description">Volkov Commander 4.99, machine-translated from 8086 assembly to WebAssembly. Not an emulator. Files live in memory and vanish on reload. </span><a id="linux-version" href="https://github.com/evoleinik/vc-linux">Linux version on GitHub.</a></p>
-      <p class="font-credit"><span id="font-credit-label">IBM VGA font: </span><a href="https://int10h.org/oldschool-pc-fonts/">VileR, int10h.org</a> · <a href="./vendor/LICENSE-font.txt?v=__V__">CC BY-SA 4.0</a></p>
+      <p class="font-credit"><span id="font-credit-label">IBM VGA font: </span><a href="https://int10h.org/oldschool-pc-fonts/">VileR, int10h.org</a> · <a href="./vendor/LICENSE-font.txt?v=__V__">CC BY-SA 4.0</a> · <a id="programs-link" href="/programs/">Programs</a></p>
     </footer>
   </main>
   <button id="source-button" type="button" aria-controls="source-panel" aria-expanded="false" title="Show original source (Ctrl-Shift-F12)" disabled>Source</button>

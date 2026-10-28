@@ -15,6 +15,8 @@ Linux. Read `README.md` for what it is and `docs/plans/2026-09-30-native-port.md
 
 Use `.venv/bin/python`, never a global pip.
 
+Site-page Russian text in `site/pages.toml` comes from Gemini, never Claude or Codex; preserve supplied prose.
+
 ## Contracts
 
 `runtime/cpu.h`, `runtime/image.h` and `runtime/hle.h` are the contracts between the translator,

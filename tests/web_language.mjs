@@ -20,6 +20,8 @@ for (const tag of [undefined, null, '', 'en', 'en-US', 'en-GB', 'de-DE', 'fr',
   assert.equal(text.language, 'en', `${String(tag)} falls back to English`);
   assert.equal(text.quit, 'VC has quit. Press any key to start it again.');
   assert.equal(text.keyboard, 'Keyboard', 'the keyboard label falls back to English');
+  assert.equal(text.programs, 'Programs', 'the program-list label falls back to English');
+  assert.equal(text.programsPath, '/programs/', 'the program-list target falls back to English');
   assert.equal(text.footer + text.linux, 'Volkov Commander 4.99, machine-translated '
     + 'from 8086 assembly to WebAssembly. Not an emulator. Files live in memory '
     + 'and vanish on reload. Linux version on GitHub.');
@@ -45,6 +47,8 @@ for (const [language, tags, footer, quit, keyboard] of [
     assert.equal(text.quit, quit, 'quit uses the same language as the footer');
     assert.equal(text.keyboard, keyboard, 'the keyboard label uses the same language as the footer');
     assert.equal(text.fontCredit, 'Шрифт IBM VGA: ');
+    assert.equal(text.programs, language === 'ru' ? 'Программы' : 'Програми');
+    assert.equal(text.programsPath, language === 'ru' ? '/ru/' : '/programs/');
     assert.ok(Object.isFrozen(text), 'callers cannot corrupt another locale lookup');
   }
 }
@@ -118,6 +122,9 @@ for (const portraitTouch of [false, true]) for (const language of ['ru-RU', 'uk-
   assert.equal(document.documentElement.lang, text.language, 'the page updates its language');
   assert.equal(nodes.get('page-description')?.textContent, text.footer, 'the page uses the footer');
   assert.equal(nodes.get('linux-version')?.textContent, text.linux, 'the link text is translated');
+  assert.equal(nodes.get('programs-link')?.textContent, text.programs, 'the program-list link is translated');
+  assert.equal(nodes.get('programs-link')?.attributes.href, text.programsPath,
+    'only the Russian locale links to the Russian program list');
   assert.equal(nodes.get('font-credit-label')?.textContent, text.fontCredit, 'the credit is translated');
   assert.equal(nodes.get('keyboard-button')?.attributes['aria-label'], text.keyboard,
     'the real keyboard icon uses the translated accessible label');

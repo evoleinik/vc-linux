@@ -24,6 +24,8 @@ const strings = pageText(navigator.language);
 document.documentElement.lang = strings.language;
 document.getElementById("page-description").textContent = strings.footer;
 document.getElementById("linux-version").textContent = strings.linux;
+document.getElementById("programs-link").textContent = strings.programs;
+document.getElementById("programs-link").setAttribute("href", strings.programsPath);
 document.getElementById("font-credit-label").textContent = strings.fontCredit;
 document.getElementById("keyboard-button").setAttribute("aria-label", strings.keyboard);
 const encoder = new TextEncoder();
@@ -33,6 +35,8 @@ let keypad;
 let inputHead = 0;
 let inputOffset = 0;
 let inputBytes = 0;
+let programLauncher;
+let playReady = false;
 let exited = false;
 let terminal;
 const speaker = createSpeaker();
@@ -42,6 +46,21 @@ let vc, sourcePanel, sourceLoad, sourceSnapshot, sourceResolved;
 let sourceWasOpen = false, sourceScroll;
 let closedFit, sourceRootStyle;
 let portraitWidth = 0, portraitHeight = 0, mobileRenderStyle;
+
+// Ordinary visits fetch neither the program map nor the Play controller.
+if (window.location?.search) {
+  const parameters = new URLSearchParams(window.location.search);
+  if (parameters.has("run")) {
+    Promise.all([
+      import("./vc-programs.js?v=__V__"),
+      import("./vc-play.js?v=__V__"),
+    ]).then(([{ programs }, { createProgramLauncher }]) => {
+      // Once Play has typed its last line, quitting and reloading starts VC itself.
+      programLauncher = createProgramLauncher(programs, parameters.get("run"),
+        () => window.history?.replaceState(null, "", window.location.pathname));
+    }).catch(error => console.warn("Play commands could not load", error));
+  }
+}
 
 function layoutSource() {
   const opened = !!sourcePanel?.opened;
@@ -140,6 +159,8 @@ function enqueue(data, raw = false) {
 
 // C pulls bytes only from term_idle, where Asyncify may safely yield.
 function readInput(maxBytes) {
+  const command = playReady ? programLauncher?.poll(inputBytes) : null;
+  if (command) enqueue(command, true);
   if (!inputBytes || maxBytes <= 0) return null;
   const bytes = new Uint8Array(Math.min(maxBytes, inputBytes));
   let written = 0;
@@ -157,6 +178,7 @@ function readInput(maxBytes) {
   inputBytes -= written;
   if (inputHead) input.splice(0, inputHead);
   inputHead = 0;
+  programLauncher?.consumed(written);
   return bytes;
 }
 
@@ -438,6 +460,8 @@ async function start() {
     const text = screenText();
     if (!text.includes("10Quit") || !text.includes("README")) return;
     initialRender.dispose();
+    // Startup probes also call readInput; only the real panels arm Play.
+    playReady = true;
     // onRender has updated xterm's visible rows; allow that frame to paint
     // before recording the page-load-to-first-screen measurement.
     requestAnimationFrame(() => {
