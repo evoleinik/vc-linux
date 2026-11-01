@@ -1,0 +1,44 @@
+# Manual escape hatch: build the browser site and publish it without waiting for
+# the test suites. Use it only for content the site gate already passed locally,
+# such as a search-console verification file. Run: gh workflow run deploy-web.yml
+name: deploy-web
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - uses: actions/cache@v4
+        with:
+          path: build/openwatcom
+          key: openwatcom-e6aa1b1e40ac8bbf97658d2c70fff8a4242d6ca4a1c60806f2baa5317083d4fe
+      - name: OpenWatcom, pinned, for Rogue
+        run: |
+          tools/fetch-openwatcom.sh build/openwatcom
+          echo "WATCOM=$PWD/build/openwatcom" >> "$GITHUB_ENV"
+      - uses: mymindstorm/setup-emsdk@v16
+        with:
+          version: 4.0.2
+      - run: make web
+      - run: node tests/test_site.mjs build/web
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: build/web
+      - id: deploy
+        uses: actions/deploy-pages@v5
