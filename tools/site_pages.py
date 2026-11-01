@@ -309,6 +309,11 @@ def render(document: dict, goatcounter: str) -> dict[str, bytes]:
             files[path] = page(document, language, goatcounter, program).encode("utf-8")
     files["sitemap.xml"] = sitemap(document).encode("utf-8")
     files["llms.txt"] = llms(document).encode("utf-8")
+    # IndexNow proves ownership with a file named after the key that contains it.
+    key = document["indexnow_key"]
+    if not re.fullmatch(r"[0-9a-f]{32}", key):
+        raise ValueError("indexnow_key must be 32 lowercase hex digits")
+    files[f"{key}.txt"] = key.encode("ascii")
     files["robots.txt"] = (f"User-agent: *\nAllow: /\n\nSitemap: {document['site'].rstrip('/')}/sitemap.xml\n").encode("utf-8")
     files["vc-programs.js"] = programs_module(document).encode("utf-8")
     return files

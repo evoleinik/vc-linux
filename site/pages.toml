@@ -9,6 +9,8 @@
 site = "https://notanemulator.com"
 repo = "https://github.com/evoleinik/vc-linux"
 doi = "https://doi.org/10.5281/zenodo.23085585"
+# Public IndexNow key (indexnow.org): served as /<key>.txt so Bing and Yandex accept our URL pings.
+indexnow_key = "5faae8ed07eb4b4096406be415b77fb2"
 
 # Interface labels on every page.
 [labels.en]

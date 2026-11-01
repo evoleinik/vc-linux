@@ -466,6 +466,12 @@ export async function auditSite(outputPath = join(repository, 'build/web'), conf
   try {
     check((await readFile(join(output, 'social-preview.png'))).equals(await readFile(join(repository, 'docs/social-preview.png'))), '/social-preview.png', 'copy', 'must be an unchanged copy of docs/social-preview.png');
   } catch (error) { fail('/social-preview.png', 'file', error.message); }
+  // Bing and Yandex reject IndexNow pings unless this exact key file is served.
+  const indexNowPath = `/${config.indexnow_key}.txt`;
+  try {
+    check(/^[0-9a-f]{32}$/.test(config.indexnow_key ?? ''), indexNowPath, 'key', 'indexnow_key must be 32 lowercase hex digits');
+    check((await readFile(join(output, `${config.indexnow_key}.txt`), 'utf8')) === config.indexnow_key, indexNowPath, 'contents', 'must contain exactly the key');
+  } catch (error) { fail(indexNowPath, 'file', error.message); }
 
   // Stable diagnostics make isolated mutation assertions exact and readable.
   const unique = [...new Map(errors.map(error => [JSON.stringify(error), error])).values()];
