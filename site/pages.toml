@@ -16,6 +16,7 @@ indexnow_key = "5faae8ed07eb4b4096406be415b77fb2"
 # the console drops verification when its file disappears.
 [verification_files]
 "google187f1b4d5efca9ae.html" = "google-site-verification: google187f1b4d5efca9ae.html"
+"yandex_d0ae2a227b15f44e.html" = "<html>\n    <head>\n        <meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\">\n    </head>\n    <body>Verification: d0ae2a227b15f44e</body>\n</html>"
 
 # Interface labels on every page.
 [labels.en]
