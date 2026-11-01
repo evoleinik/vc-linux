@@ -50,7 +50,8 @@ class Scripts(HTMLParser):
 
 def test_all_pages_are_enumerated_reciprocally_without_build_dates(document):
     files = render(document, GOAT)
-    generated = {"/" + name.removesuffix("index.html") for name in files if name.endswith(".html")}
+    generated = {"/" + name.removesuffix("index.html") for name in files
+                 if name.endswith(".html") and name not in document.get("verification_files", {})}
     assert len(generated) == 2 + 2 * len(document["program"])
     namespaces = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9", "x": "http://www.w3.org/1999/xhtml"}
     sitemap = ET.fromstring(files["sitemap.xml"])

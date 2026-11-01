@@ -79,6 +79,9 @@ def inspect(output: Path, config: Path) -> dict:
         result["files"].append(relative)
         if path.suffix.lower() != ".html":
             continue
+        # Search-console ownership files are plain text, not pages.
+        if relative in result.get("config", {}).get("verification_files", {}):
+            continue
         try:
             page = Page()
             page.feed(path.read_text(encoding="utf-8"))

@@ -12,6 +12,11 @@ doi = "https://doi.org/10.5281/zenodo.23085585"
 # Public IndexNow key (indexnow.org): served as /<key>.txt so Bing and Yandex accept our URL pings.
 indexnow_key = "5faae8ed07eb4b4096406be415b77fb2"
 
+# Search-console ownership files, served at the site root exactly as given. Never remove one:
+# the console drops verification when its file disappears.
+[verification_files]
+"google187f1b4d5efca9ae.html" = "google-site-verification: google187f1b4d5efca9ae.html"
+
 # Interface labels on every page.
 [labels.en]
 play = "Play"

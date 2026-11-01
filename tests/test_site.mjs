@@ -472,6 +472,12 @@ export async function auditSite(outputPath = join(repository, 'build/web'), conf
     check(/^[0-9a-f]{32}$/.test(config.indexnow_key ?? ''), indexNowPath, 'key', 'indexnow_key must be 32 lowercase hex digits');
     check((await readFile(join(output, `${config.indexnow_key}.txt`), 'utf8')) === config.indexnow_key, indexNowPath, 'contents', 'must contain exactly the key');
   } catch (error) { fail(indexNowPath, 'file', error.message); }
+  // A search console drops ownership when its verification file stops being served.
+  for (const [name, contents] of Object.entries(config.verification_files ?? {})) {
+    try {
+      check((await readFile(join(output, name), 'utf8')) === contents, `/${name}`, 'contents', 'must be served exactly as site/pages.toml gives it');
+    } catch (error) { fail(`/${name}`, 'file', error.message); }
+  }
 
   // Stable diagnostics make isolated mutation assertions exact and readable.
   const unique = [...new Map(errors.map(error => [JSON.stringify(error), error])).values()];

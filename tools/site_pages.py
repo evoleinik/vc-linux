@@ -314,6 +314,10 @@ def render(document: dict, goatcounter: str) -> dict[str, bytes]:
     if not re.fullmatch(r"[0-9a-f]{32}", key):
         raise ValueError("indexnow_key must be 32 lowercase hex digits")
     files[f"{key}.txt"] = key.encode("ascii")
+    for name, contents in document.get("verification_files", {}).items():
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\.html", name) or name == "index.html":
+            raise ValueError(f"verification file name not allowed: {name}")
+        files[name] = contents.encode("utf-8")
     files["robots.txt"] = (f"User-agent: *\nAllow: /\n\nSitemap: {document['site'].rstrip('/')}/sitemap.xml\n").encode("utf-8")
     files["vc-programs.js"] = programs_module(document).encode("utf-8")
     return files
@@ -373,7 +377,8 @@ def publish(config: Path, destination: Path) -> int:
         update(retired, data)
         path.unlink()  # A recoverable copy has been published outside the site.
         print(f"site pages: retired {path} to {retired}")
-    return sum(name.endswith(".html") for name in files)
+    verification = document.get("verification_files", {})
+    return sum(name.endswith(".html") and name not in verification for name in files)
 
 
 def main() -> None:
